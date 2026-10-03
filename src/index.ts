@@ -10,7 +10,12 @@ export default Plugin.define({
 
   async setup(ctx) {
     const options = parseOptions(ctx.options)
-    if (!options.enabled) return
+    if (!options.enabled) {
+      const agentRegistration = await ctx.agent.transform((editor) => {
+        for (const tier of TIER_NAMES) editor.remove(tier)
+      })
+      return async () => agentRegistration.dispose()
+    }
     const log = options.logging
       ? (...values: unknown[]) => console.error("[tiered-dispatch]", ...values)
       : undefined
@@ -21,14 +26,14 @@ export default Plugin.define({
     assertModelsAvailable(options, models)
 
     const routingProtocol = buildRoutingProtocol(options)
-    let validation: Promise<readonly ReturnType<typeof toAgentCatalogEntry>[]> | undefined
+    let agentCatalogPromise: Promise<readonly ReturnType<typeof toAgentCatalogEntry>[]> | undefined
     const loadAgents = (): Promise<readonly ReturnType<typeof toAgentCatalogEntry>[]> => {
-      validation ??= ctx.agent.list().then((catalog) => {
+      agentCatalogPromise ??= ctx.agent.list().then((catalog) => {
         const agents = catalog.data.map(toAgentCatalogEntry)
         assertAgentsAvailable(agents, options)
         return agents
       })
-      return validation
+      return agentCatalogPromise
     }
     const contextRegistration = await ctx.session.hook("context", async (event) => {
       const agents = await loadAgents()

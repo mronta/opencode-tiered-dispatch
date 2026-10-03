@@ -3,9 +3,9 @@ import { parseModelReference, parseOptions } from "../src/options.js"
 
 const valid = {
   tiers: {
-    fast: { model: "openai/fast" },
-    medium: { model: "openai/medium", variant: "high" },
-    heavy: { model: "anthropic/heavy" },
+    fast: { model: "openai/gpt-5.6-luna-fast" },
+    medium: { model: "openai/gpt-5.6-luna", variant: "max" },
+    heavy: { model: "openai/gpt-5.6-sol", variant: "medium" },
   },
 }
 
@@ -15,12 +15,20 @@ describe("parseOptions", () => {
       enabled: true,
       directThreshold: "trivial",
       logging: false,
-      tiers: { medium: { modelRef: { providerID: "openai", id: "medium" } } },
+      tiers: { medium: { modelRef: { providerID: "openai", id: "gpt-5.6-luna" } } },
     })
   })
 
-  it("allows enabled false without tiers", () => {
+  it("allows enabled false without validating tier targets", () => {
     expect(parseOptions({ enabled: false })).toEqual({ enabled: false })
+    expect(parseOptions({
+      enabled: false,
+      tiers: {
+        fast: { model: "other/fast" },
+        medium: { model: "other/medium" },
+        heavy: { model: "other/heavy" },
+      },
+    })).toEqual({ enabled: false })
   })
 
   it("rejects unknown nested fields even when disabled", () => {
@@ -28,13 +36,13 @@ describe("parseOptions", () => {
       .toThrow(/unknown field/)
     expect(() => parseOptions({
       enabled: false,
-      tiers: { fast: { model: "openai/fast", cost: 1 } },
+      tiers: { fast: { model: "openai/gpt-5.6-luna-fast", cost: 1 } },
     })).toThrow(/unknown field: cost/)
   })
 
   it("rejects unknown fields", () => {
     expect(() => parseOptions({ ...valid, fallback: true })).toThrow(/unknown field: fallback/)
-    expect(() => parseOptions({ tiers: { ...valid.tiers, fast: { model: "openai/fast", cost: 1 } } }))
+    expect(() => parseOptions({ tiers: { ...valid.tiers, fast: { model: "openai/gpt-5.6-luna-fast", cost: 1 } } }))
       .toThrow(/unknown field: cost/)
   })
 
@@ -45,6 +53,13 @@ describe("parseOptions", () => {
   it("validates taxonomy values", () => {
     expect(() => parseOptions({ ...valid, taxonomy: { fast: [""] } })).toThrow(/non-empty string/)
     expect(() => parseOptions({ ...valid, taxonomy: { other: ["x"] } })).toThrow(/unknown field/)
+  })
+
+  it("requires the configured tier model mapping", () => {
+    expect(() => parseOptions({
+      ...valid,
+      tiers: { ...valid.tiers, fast: { model: "openai/gpt-5.6-luna", variant: "max" } },
+    })).toThrow(/options\.tiers\.fast must use model openai\/gpt-5\.6-luna-fast/)
   })
 })
 

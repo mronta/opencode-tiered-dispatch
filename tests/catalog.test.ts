@@ -4,26 +4,26 @@ import { parseOptions } from "../src/options.js"
 
 const parsed = parseOptions({
   tiers: {
-    fast: { model: "p/fast", variant: "low" },
-    medium: { model: "p/medium" },
-    heavy: { model: "p/heavy" },
+    fast: { model: "openai/gpt-5.6-luna-fast" },
+    medium: { model: "openai/gpt-5.6-luna", variant: "max" },
+    heavy: { model: "openai/gpt-5.6-sol", variant: "medium" },
   },
 })
 if (!parsed.enabled) throw new Error("test setup")
 
 const models = ["fast", "medium", "heavy"].map((id) => ({
-  providerID: "p",
-  id,
+  providerID: "openai",
+  id: id === "fast" ? "gpt-5.6-luna-fast" : id === "medium" ? "gpt-5.6-luna" : "gpt-5.6-sol",
   enabled: true,
   capabilities: { tools: true },
-  variants: id === "fast" ? [{ id: "low" }] : [],
+  variants: id === "fast" ? [] : [{ id: id === "medium" ? "max" : "medium" }],
 }))
 
 const agents = [
   {
     id: "fast",
     mode: "subagent",
-    model: { providerID: "p", id: "fast", variant: "low" },
+    model: { providerID: "openai", id: "gpt-5.6-luna-fast" },
     permissions: [
       { action: "*", resource: "*", effect: "deny" as const },
       { action: "read", resource: "*", effect: "allow" as const },
@@ -33,7 +33,7 @@ const agents = [
   {
     id: "medium",
     mode: "subagent",
-    model: { providerID: "p", id: "medium" },
+    model: { providerID: "openai", id: "gpt-5.6-luna", variant: "max" },
     permissions: [
       { action: "*", resource: "*", effect: "allow" as const },
       { action: "subagent", resource: "*", effect: "deny" as const },
@@ -42,7 +42,7 @@ const agents = [
   {
     id: "heavy",
     mode: "subagent",
-    model: { providerID: "p", id: "heavy" },
+    model: { providerID: "openai", id: "gpt-5.6-sol", variant: "medium" },
     permissions: [
       { action: "*", resource: "*", effect: "allow" as const },
       { action: "subagent", resource: "*", effect: "deny" as const },
@@ -63,14 +63,14 @@ describe("catalog validation", () => {
 
     const noVariantOptions = parseOptions({
       tiers: {
-        fast: { model: "p/fast" },
-        medium: { model: "p/medium" },
-        heavy: { model: "p/heavy" },
+        fast: { model: "openai/gpt-5.6-luna-fast" },
+        medium: { model: "openai/gpt-5.6-luna", variant: "max" },
+        heavy: { model: "openai/gpt-5.6-sol", variant: "medium" },
       },
     })
     if (!noVariantOptions.enabled) throw new Error("test setup")
     const nativeDefault = structuredClone(agents) as AgentCatalogEntry[]
-    nativeDefault[0]!.model = { providerID: "p", id: "fast", variant: "default" }
+    nativeDefault[0]!.model = { providerID: "openai", id: "gpt-5.6-luna-fast", variant: "default" }
     expect(() => assertAgentsAvailable(nativeDefault, noVariantOptions)).not.toThrow()
   })
 
@@ -89,6 +89,13 @@ describe("catalog validation", () => {
       { action: "subagent", resource: "heavy", effect: "allow" },
     ]
     expect(() => assertAgentsAvailable(resourceBypass, parsed)).toThrow(/enable subagent recursion/)
+
+    const noImplementation = structuredClone(agents) as AgentCatalogEntry[]
+    noImplementation[1]!.permissions = [
+      { action: "*", resource: "*", effect: "deny" },
+      { action: "subagent", resource: "*", effect: "deny" },
+    ]
+    expect(() => assertAgentsAvailable(noImplementation, parsed)).toThrow(/must allow the edit permission/)
   })
 
   it("rejects fast permissions that allow mutation after the deny-all rule", () => {
@@ -107,7 +114,7 @@ describe("catalog validation", () => {
   it("rejects an unavailable variant", () => {
     const invalid = structuredClone(parsed)
     invalid.tiers.fast.variant = "max"
-    expect(() => assertModelsAvailable(invalid, models)).toThrow(/available variants: low/)
+    expect(() => assertModelsAvailable(invalid, models)).toThrow(/must use model openai\/gpt-5\.6-luna-fast/)
   })
 
   it("rejects models without tools", () => {

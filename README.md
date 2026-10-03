@@ -22,7 +22,8 @@ agent file, fallback chain, or persistent routing state.
 
 V2 plugins can update and remove agents, but the `2.0.18` plugin API cannot add
 new agents. The three definitions therefore belong in `opencode.jsonc`; the
-plugin supplies the routing protocol and validates the configured models.
+plugin supplies the routing protocol and validates the required model mapping,
+permissions, and agent modes.
 
 ## Quick start
 
@@ -112,8 +113,9 @@ medium → openai/gpt-5.6-luna#max
 heavy  → openai/gpt-5.6-sol#medium
 ```
 
-`gpt-5.6-luna-fast` is a model ID, not a `medium-fast` variant. Model IDs and
-variants are workstation-specific; always confirm them with `/models`.
+`gpt-5.6-luna-fast` is a model ID, not a `medium-fast` variant. This mapping is
+required by the plugin; confirm that these exact models and variants are
+available with `/models` before connecting providers.
 
 ## Published or packed installation
 
@@ -150,16 +152,26 @@ interface TierOptions {
 }
 ```
 
-The plugin validates all three `options.tiers` model references against the
-active catalog. The native agent definitions are the execution interface, so
-their model and variant must match the corresponding plugin option.
+The plugin requires this exact mapping:
+
+```text
+fast   → openai/gpt-5.6-luna-fast
+medium → openai/gpt-5.6-luna#max
+heavy  → openai/gpt-5.6-sol#medium
+```
+
+It validates all three references against the active catalog. The native agent
+definitions are the execution interface, so their model and variant must match
+the corresponding plugin option. `medium` and `heavy` must retain `edit`,
+`write`, and `shell` permissions; `fast` must remain read-only.
 
 Custom taxonomy entries extend the defaults and are deduplicated
 case-insensitively. Unknown fields are rejected. With `enabled: false`, the
-plugin is a no-op: it does not inject routing guidance or validate model
-availability. Because the native tier agents are ordinary `opencode.jsonc`
-configuration, disable or remove those three entries separately when the tiers
-should disappear from the subagent catalog.
+plugin removes the reserved tier agents through the runtime transform and does
+not inject routing guidance or validate model availability. The reserved agent
+entries remain in `opencode.jsonc` so re-enabling restores them. If the plugin
+entry itself is removed, also remove the three reserved agent entries: a plugin
+that is no longer loaded cannot transform them away.
 
 ## Routing protocol
 
@@ -179,7 +191,8 @@ into another subagent call.
 ## Safety and lifecycle
 
 - `fast` is configured as read-only through native V2 permissions.
-- `medium` and `heavy` use normal implementation permissions.
+- `medium` and `heavy` must retain `edit`, `write`, and `shell` implementation
+  permissions.
 - All tier agents deny the `subagent` action, preventing recursion.
 - Native OpenCode owns child-session creation, foreground waiting, cancellation,
   provider errors, metadata, and inspectability.
@@ -216,7 +229,8 @@ npm run smoke:package
 The real OpenCode smoke uses the standard `opencode.jsonc` package entry. It
 starts a primary session and verifies native foreground calls to all three
 agents, their resolved models, the primary routing protocol, and the absence of
-that protocol from tier children:
+that protocol from tier children. It also verifies native cancellation and
+provider-error outcomes without fallback:
 
 ```bash
 TIERED_DISPATCH_FAST_MODEL=openai/gpt-5.6-luna-fast \

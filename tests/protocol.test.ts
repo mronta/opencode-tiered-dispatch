@@ -4,9 +4,9 @@ import { buildRoutingProtocol } from "../src/protocol.js"
 
 const options = parseOptions({
   tiers: {
-    fast: { model: "x/fast" },
-    medium: { model: "x/medium" },
-    heavy: { model: "x/heavy" },
+    fast: { model: "openai/gpt-5.6-luna-fast" },
+    medium: { model: "openai/gpt-5.6-luna", variant: "max" },
+    heavy: { model: "openai/gpt-5.6-sol", variant: "medium" },
   },
   taxonomy: { fast: ["schema lookup"] },
 })

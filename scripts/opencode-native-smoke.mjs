@@ -198,7 +198,9 @@ function observerSource(resultPaths, selectedRootModel, configuredTiers) {
     "            const rootMessages = await ctx.session.context({ sessionID: results[tier] })",
     "            outputs[tier] = { childSessionID: child?.sessionID, childText: messageText(childMessages), rootText: messageText(rootMessages) }",
     "          }",
-    "          writeFileSync(resultPath, JSON.stringify({ expected: expectedTiers, tiers: results, outputs, events }))",
+    "          const delegationEvents = events.slice()",
+    "          const lifecycle = await exerciseNativeLifecycle(ctx, tiers.fast, events)",
+    "          writeFileSync(resultPath, JSON.stringify({ expected: expectedTiers, tiers: results, outputs, lifecycle, delegationEvents, events }))",
     "        } catch (error) {",
     "          writeFileSync(failurePath, JSON.stringify({ message: error?.message ?? String(error), stack: error?.stack, events }))",
     "        }",
@@ -207,12 +209,31 @@ function observerSource(resultPaths, selectedRootModel, configuredTiers) {
     "  },",
     "}",
     "",
+    "async function exerciseNativeLifecycle(ctx, fastModel, events) {",
+    "  const cancellation = await ctx.session.create({ title: \"[native smoke] cancellation\", agent: \"fast\", model: fastModel, location: { directory: ctx.location.directory } })",
+    "  let cancellationError",
+    "  const cancellationPrompt = ctx.session.prompt({ sessionID: cancellation.id, text: \"Think through a long, detailed research answer. Do not finish quickly.\" }).catch((error) => { cancellationError = String(error) })",
+    "  await new Promise((resolve) => setTimeout(resolve, 50))",
+    "  await ctx.session.interrupt({ sessionID: cancellation.id, resume: false })",
+    "  await Promise.race([cancellationPrompt, new Promise((resolve) => setTimeout(resolve, 30_000))])",
+    "  const cancellationInfo = await ctx.session.get({ sessionID: cancellation.id })",
+    "  const providerFailure = {}",
+    "  try {",
+    "    const invalid = await ctx.session.create({ title: \"[native smoke] provider error\", agent: \"build\", model: { providerID: \"openai\", id: \"__tiered_dispatch_missing_model__\" }, location: { directory: ctx.location.directory } })",
+    "    await ctx.session.prompt({ sessionID: invalid.id, text: \"Return exactly PROVIDER_ERROR_SHOULD_NOT_SUCCEED.\" })",
+    "    await ctx.session.wait({ sessionID: invalid.id })",
+    "    providerFailure.outcome = (await ctx.session.get({ sessionID: invalid.id })).outcome",
+    "  } catch (error) {",
+    "    providerFailure.error = String(error)",
+    "  }",
+    "  return { cancellation: { outcome: cancellationInfo.outcome, error: cancellationError }, providerFailure, lifecycleEventCount: events.length }",
+    "}",
   ].join("\n")
 }
 
 function verify(result, agents) {
   for (const tier of ["fast", "medium", "heavy"]) {
-    const events = result.events.filter((event) => event.agent === tier)
+    const events = result.delegationEvents.filter((event) => event.agent === tier)
     if (events.length === 0) throw new Error(`native ${tier} agent was never invoked: ${JSON.stringify(result)}`)
     if (events.length !== 1 || new Set(events.map((event) => event.sessionID)).size !== 1) {
       throw new Error(`native ${tier} was invoked more than once: ${JSON.stringify(events)}`)
@@ -270,11 +291,26 @@ function verify(result, agents) {
       )) {
         throw new Error(`native fast is not read-only: ${JSON.stringify(agent)}`)
       }
+    } else {
+      for (const action of ["edit", "write", "shell"]) {
+        const rule = [...permissions].reverse().find(
+          (candidate) => candidate.resource === "*" && (candidate.action === action || candidate.action === "*"),
+        )
+        if (rule?.effect !== "allow") {
+          throw new Error(`native ${tier} cannot perform ${action}: ${JSON.stringify(agent)}`)
+        }
+      }
     }
   }
   const primary = result.events.find((event) => event.agent === "build" && event.hasProtocol)
   if (!primary) throw new Error(`primary routing protocol was not observed: ${JSON.stringify(result.events)}`)
   if (!primary.toolNames.includes("subagent")) throw new Error("primary session did not expose the native subagent tool")
+  if (result.lifecycle?.cancellation?.outcome !== "interrupted") {
+    throw new Error(`native cancellation was not preserved: ${JSON.stringify(result.lifecycle)}`)
+  }
+  if (result.lifecycle?.providerFailure?.outcome !== "failed" && !result.lifecycle?.providerFailure?.error) {
+    throw new Error(`native provider failure was not surfaced: ${JSON.stringify(result.lifecycle)}`)
+  }
 }
 
 function normalizedVariant(actual, expected) {

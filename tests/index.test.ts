@@ -3,16 +3,16 @@ import { describe, expect, it, vi } from "vitest"
 import plugin from "../src/index.js"
 
 const models = [
-  { providerID: "p", id: "fast", enabled: true, capabilities: { tools: true }, variants: [{ id: "low" }] },
-  { providerID: "p", id: "medium", enabled: true, capabilities: { tools: true }, variants: [] },
-  { providerID: "p", id: "heavy", enabled: true, capabilities: { tools: true }, variants: [] },
+  { providerID: "openai", id: "gpt-5.6-luna-fast", enabled: true, capabilities: { tools: true }, variants: [] },
+  { providerID: "openai", id: "gpt-5.6-luna", enabled: true, capabilities: { tools: true }, variants: [{ id: "max" }] },
+  { providerID: "openai", id: "gpt-5.6-sol", enabled: true, capabilities: { tools: true }, variants: [{ id: "medium" }] },
 ]
 
 const agents = [
   {
     id: "fast",
     mode: "subagent",
-    model: { providerID: "p", id: "fast", variant: "low" },
+    model: { providerID: "openai", id: "gpt-5.6-luna-fast" },
     permissions: [
       { action: "*", resource: "*", effect: "deny" as const },
       { action: "subagent", resource: "*", effect: "deny" as const },
@@ -21,7 +21,7 @@ const agents = [
   {
     id: "medium",
     mode: "subagent",
-    model: { providerID: "p", id: "medium" },
+    model: { providerID: "openai", id: "gpt-5.6-luna", variant: "max" },
     permissions: [
       { action: "*", resource: "*", effect: "allow" as const },
       { action: "subagent", resource: "*", effect: "deny" as const },
@@ -30,7 +30,7 @@ const agents = [
   {
     id: "heavy",
     mode: "subagent",
-    model: { providerID: "p", id: "heavy" },
+    model: { providerID: "openai", id: "gpt-5.6-sol", variant: "medium" },
     permissions: [
       { action: "*", resource: "*", effect: "allow" as const },
       { action: "subagent", resource: "*", effect: "deny" as const },
@@ -44,8 +44,10 @@ function makeContext(options: Record<string, unknown>): {
   context: Context
   hookCallbacks: Array<(event: { sessionID: string; agent: string; tools: Record<string, unknown>; system: unknown[] }) => void | Promise<void>>
   disposes: { hook: ReturnType<typeof vi.fn> }
+  removedAgents: string[]
 } {
   const hookCallbacks: Array<(event: { sessionID: string; agent: string; tools: Record<string, unknown>; system: unknown[] }) => void | Promise<void>> = []
+  const removedAgents: string[] = []
   const disposes = {
     hook: vi.fn(async () => undefined),
   }
@@ -56,7 +58,10 @@ function makeContext(options: Record<string, unknown>): {
     },
     agent: {
       list: vi.fn(async () => ({ data: agents })),
-      transform: vi.fn(async () => ({ dispose: vi.fn(async () => undefined) })),
+      transform: vi.fn(async (callback: (editor: { remove(id: string): void }) => void) => {
+        callback({ remove: (id) => removedAgents.push(id) })
+        return { dispose: vi.fn(async () => undefined) }
+      }),
     },
     session: {
       get: vi.fn(async ({ sessionID }: { sessionID: string }) => ({
@@ -73,14 +78,14 @@ function makeContext(options: Record<string, unknown>): {
       }),
     },
   } as unknown as Context
-  return { context, hookCallbacks, disposes }
+  return { context, hookCallbacks, disposes, removedAgents }
 }
 
 const options = {
   tiers: {
-    fast: { model: "p/fast", variant: "low" },
-    medium: { model: "p/medium" },
-    heavy: { model: "p/heavy" },
+    fast: { model: "openai/gpt-5.6-luna-fast" },
+    medium: { model: "openai/gpt-5.6-luna", variant: "max" },
+    heavy: { model: "openai/gpt-5.6-sol", variant: "medium" },
   },
 }
 
@@ -120,11 +125,13 @@ describe("plugin setup", () => {
 
     const cleanup = await plugin.setup(fixture.context)
 
-    expect(cleanup).toBeUndefined()
+    expect(cleanup).toBeTypeOf("function")
     expect(fixture.context.model.list).not.toHaveBeenCalled()
     expect(fixture.context.agent.list).not.toHaveBeenCalled()
-    expect(fixture.context.agent.transform).not.toHaveBeenCalled()
+    expect(fixture.context.agent.transform).toHaveBeenCalledOnce()
     expect(fixture.context.session.hook).not.toHaveBeenCalled()
+    expect(fixture.removedAgents).toEqual(["fast", "medium", "heavy"])
+    if (typeof cleanup === "function") await cleanup()
   })
 
   it("applies optional tier instructions without injecting routing recursively", async () => {
@@ -132,7 +139,7 @@ describe("plugin setup", () => {
       ...options,
       tiers: {
         ...options.tiers,
-        medium: { model: "p/medium", instructions: "Keep the patch minimal" },
+        medium: { model: "openai/gpt-5.6-luna", variant: "max", instructions: "Keep the patch minimal" },
       },
     })
     await plugin.setup(fixture.context)
