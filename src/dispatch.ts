@@ -1,0 +1,214 @@
+import { resolve } from "node:path"
+import { assertModelsAvailable, type ModelCatalogEntry } from "./catalog.js"
+import { DispatchError } from "./errors.js"
+import type { EnabledRouterOptions } from "./options.js"
+import { buildDelegatedPermissions, type PermissionRule } from "./permissions.js"
+import { assertSuccessfulOutcome, extractFinalText } from "./result.js"
+import { DEFAULT_TIER_INSTRUCTIONS, TIER_AGENTS, type TierName } from "./tiers.js"
+
+export interface DelegateInput {
+  tier: TierName
+  description: string
+  prompt: string
+}
+
+export interface DelegateOutput {
+  tier: TierName
+  model: string
+  sessionID: string
+  text: string
+}
+
+export interface ToolExecutionContext {
+  sessionID: string
+  agent: string
+  signal: AbortSignal
+  progress(update: Record<string, unknown>): Promise<void>
+}
+
+export interface SessionRecord {
+  id: string
+  location: { directory: string }
+  subpath?: string
+  permissions?: readonly PermissionRule[]
+  outcome?: "succeeded" | "failed" | "interrupted"
+}
+
+export interface AgentRecord {
+  id: string
+  permissions?: readonly PermissionRule[]
+}
+
+export interface DispatchRuntime {
+  listModels(): Promise<readonly ModelCatalogEntry[]>
+  getSession(sessionID: string): Promise<SessionRecord>
+  getAgent(agentID: string): Promise<AgentRecord>
+  createSession(input: {
+    title: string
+    agent: string
+    model: { providerID: string; id: string; variant?: string }
+    location: { directory: string }
+    metadata: Readonly<Record<string, string | boolean>>
+    permissions: readonly PermissionRule[]
+  }): Promise<SessionRecord>
+  prompt(sessionID: string, text: string): Promise<void>
+  wait(sessionID: string, signal: AbortSignal): Promise<void>
+  context(sessionID: string): Promise<readonly { type: string }[]>
+  interrupt(sessionID: string): Promise<void>
+}
+
+export interface Dispatcher {
+  execute(input: unknown, context: ToolExecutionContext): Promise<{
+    content: string
+    output: DelegateOutput
+    metadata: Omit<DelegateOutput, "text">
+  }>
+  cleanup(): Promise<void>
+}
+
+export function createDispatcher(
+  runtime: DispatchRuntime,
+  options: EnabledRouterOptions,
+  subagentIDs: ReadonlySet<string>,
+): Dispatcher {
+  const inFlight = new Set<string>()
+  let closing = false
+
+  const log = (message: string, metadata?: Record<string, unknown>): void => {
+    if (options.logging) console.info(`[tiered-dispatch] ${message}`, metadata ?? {})
+  }
+
+  return {
+    async execute(rawInput, context) {
+      const input = validateInput(rawInput)
+      if (closing) throw new DispatchError("Tiered Dispatch is unloading")
+      if (subagentIDs.has(context.agent)) {
+        throw new DispatchError("Nested tiered dispatch is not allowed from a subagent")
+      }
+      throwIfAborted(context.signal)
+
+      const tierOptions = options.tiers[input.tier]
+      assertModelsAvailable(options, await runtime.listModels(), "dispatch", input.tier)
+
+      const [callerSession, callerAgent] = await Promise.all([
+        runtime.getSession(context.sessionID),
+        runtime.getAgent(context.agent),
+      ])
+      throwIfAborted(context.signal)
+
+      const permissions = buildDelegatedPermissions(
+        input.tier,
+        callerAgent.permissions,
+        callerSession.permissions,
+      )
+      const directory = callerSession.subpath
+        ? resolve(callerSession.location.directory, callerSession.subpath)
+        : callerSession.location.directory
+      const model = {
+        ...tierOptions.modelRef,
+        ...(tierOptions.variant === undefined ? {} : { variant: tierOptions.variant }),
+      }
+
+      await context.progress({ status: `Starting ${input.tier} delegation` })
+      const child = await runtime.createSession({
+        title: `[${input.tier}] ${input.description.slice(0, 100)}`,
+        agent: TIER_AGENTS[input.tier],
+        model,
+        location: { directory },
+        metadata: {
+          plugin: "tiered-dispatch",
+          parentSessionID: context.sessionID,
+          parentAgent: context.agent,
+          tier: input.tier,
+        },
+        permissions,
+      })
+      inFlight.add(child.id)
+      log("delegation started", { tier: input.tier, model: tierOptions.model, sessionID: child.id })
+
+      const abort = (): void => {
+        void runtime.interrupt(child.id).catch(() => undefined)
+      }
+      context.signal.addEventListener("abort", abort, { once: true })
+
+      try {
+        if (closing || context.signal.aborted) {
+          abort()
+          throwIfAborted(context.signal)
+          throw new DispatchError("Tiered Dispatch is unloading")
+        }
+
+        await runtime.prompt(child.id, buildChildPrompt(input, tierOptions.instructions))
+        await runtime.wait(child.id, context.signal)
+        throwIfAborted(context.signal)
+
+        const [completed, messages] = await Promise.all([
+          runtime.getSession(child.id),
+          runtime.context(child.id),
+        ])
+        assertSuccessfulOutcome(completed.outcome, messages)
+        const text = extractFinalText(messages)
+        const output: DelegateOutput = {
+          tier: input.tier,
+          model: formatModel(tierOptions.model, tierOptions.variant),
+          sessionID: child.id,
+          text,
+        }
+        log("delegation completed", { tier: input.tier, model: output.model, sessionID: child.id })
+        return {
+          content: text,
+          output,
+          metadata: { tier: output.tier, model: output.model, sessionID: output.sessionID },
+        }
+      } finally {
+        context.signal.removeEventListener("abort", abort)
+        inFlight.delete(child.id)
+      }
+    },
+
+    async cleanup() {
+      closing = true
+      const sessions = [...inFlight]
+      await Promise.allSettled(sessions.map((sessionID) => runtime.interrupt(sessionID)))
+      inFlight.clear()
+    },
+  }
+}
+
+function validateInput(input: unknown): DelegateInput {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+    throw new DispatchError("Delegation input must be an object")
+  }
+  const value = input as Record<string, unknown>
+  if (!["fast", "medium", "heavy"].includes(value.tier as string)) {
+    throw new DispatchError(`Unknown tier: ${String(value.tier)}`)
+  }
+  const description = typeof value.description === "string" ? value.description.trim() : ""
+  const prompt = typeof value.prompt === "string" ? value.prompt.trim() : ""
+  if (!description) throw new DispatchError("Delegation description must not be empty")
+  if (!prompt) throw new DispatchError("Delegation prompt must not be empty")
+  return { tier: value.tier as TierName, description, prompt }
+}
+
+function buildChildPrompt(input: DelegateInput, additionalInstructions: string | undefined): string {
+  return [
+    `You are handling a ${input.tier} tier delegation.`,
+    DEFAULT_TIER_INSTRUCTIONS[input.tier],
+    ...(additionalInstructions ? [`Additional instructions: ${additionalInstructions}`] : []),
+    "",
+    "Delegated task:",
+    input.prompt,
+    "",
+    "Return the requested result directly and concisely to the orchestrator.",
+  ].join("\n")
+}
+
+function formatModel(model: string, variant: string | undefined): string {
+  return variant ? `${model}:${variant}` : model
+}
+
+function throwIfAborted(signal: AbortSignal): void {
+  if (!signal.aborted) return
+  if (signal.reason instanceof Error) throw signal.reason
+  throw new DOMException("Delegation was cancelled", "AbortError")
+}
