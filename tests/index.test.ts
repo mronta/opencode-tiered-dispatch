@@ -132,7 +132,7 @@ describe("plugin setup", () => {
     const hook = fixture.hookCallbacks[0]!
     const root = { sessionID: "root", agent: "build", tools: {}, system: [] as unknown[] }
     await hook(root)
-    expect((root.system[0] as { text: string }).text).toContain("native `subagent` tool")
+    expect((root.system[0] as { text: string }).text).toContain("native `subagent`")
     expect(fixture.context.agent.list).toHaveBeenCalledOnce()
 
     const child = { sessionID: "child", agent: "fast", tools: {}, system: [] as unknown[] }
@@ -142,7 +142,7 @@ describe("plugin setup", () => {
 
     const allRoot = { sessionID: "root-all", agent: "all", tools: {}, system: [] as unknown[] }
     await hook(allRoot)
-    expect((allRoot.system[0] as { text: string }).text).toContain("native `subagent` tool")
+    expect((allRoot.system[0] as { text: string }).text).toContain("native `subagent`")
 
     const allChild = { sessionID: "child", agent: "all", tools: {}, system: [] as unknown[] }
     await hook(allChild)
@@ -186,6 +186,20 @@ describe("plugin setup", () => {
     await hook(child)
 
     expect((child.system[0] as { text: string }).text).toBe("Keep the patch minimal")
+  })
+
+  it("gives tiers evidence handoff and stop contracts without automatic delegation", async () => {
+    const fixture = makeContext(options)
+    await plugin.setup(fixture.context)
+    const system = (tier: string) => (fixture.agents.find((agent) => agent.id === tier) as unknown as { system: string }).system
+
+    expect(system("fast")).toContain("unresolved questions")
+    expect(system("fast")).toContain("Do not repeat broad exploration")
+    expect(system("medium")).toContain("NEED CONTEXT:")
+    expect(system("medium")).toContain("two consecutive failures")
+    expect(system("heavy")).toContain("SCOPE GROWTH:")
+    expect(system("heavy")).toContain("implementation only when requested")
+    for (const tier of ["fast", "medium", "heavy"]) expect(system(tier)).toContain("Do not delegate")
   })
 
   it("retries agent catalog loading after a transient failure", async () => {

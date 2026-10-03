@@ -157,10 +157,29 @@ The primary is responsible for classification, decomposition, delegation,
 integration, and the final answer. Tier agents perform the delegated work.
 Independent delegations may run in parallel; dependent phases are serialized.
 
+The compact protocol treats discovery as execution: batch related questions in
+one `fast` request, then pass findings, file paths and unresolved questions to
+the implementation or analysis tier. Examples: trace auth then refactor is
+`fast → medium`; map trust boundaries then assess security is `fast → heavy`.
+Already-scoped work stays one delegation; splitting is not a goal by itself.
+
+Tier instructions provide model-facing handoffs:
+
+- `fast`: stop once the ask is satisfied; report evidence and unresolved questions,
+  or `NEED MORE:` with missing evidence.
+- `medium`: use supplied findings; return `NEED CONTEXT:` rather than doing broad
+  reconnaissance. Stop and report attempts after two consecutive failures.
+- `heavy`: use supplied evidence; return `SCOPE GROWTH:` when more discovery is
+  needed. Implement only when requested.
+
+The primary decides whether to send a focused `fast` follow-up and resume the
+original tier. These labels are instructions, not machine-parsed results or
+automatic escalation. Targeted local reads and verification remain allowed.
+
 The protocol tells the primary to:
 
 1. use the cheapest reliable tier;
-2. handle truly trivial work directly;
+2. handle truly trivial work directly when `directThreshold` is `"trivial"`;
 3. split separable exploration and implementation phases;
 4. serialize overlapping edits;
 5. avoid automatic escalation and provider fallback;
@@ -169,7 +188,8 @@ The protocol tells the primary to:
    verification, and the exact result to return.
 7. omit per-call model overrides because each tier owns its validated model and
    variant;
-8. integrate delegated results and remain responsible for the final answer.
+8. integrate delegated results and remain responsible for the final answer;
+9. keep direct discovery to two read-only calls and avoid repeated broad exploration.
 
 Tier agents do not receive this orchestration protocol. Their own `system`
 instructions and permissions remain focused on execution, so they cannot recurse
@@ -250,6 +270,45 @@ npm run smoke:opencode
 `npm run smoke:opencode:config` is an alias for the same standard-configuration
 test. The smoke consumes provider usage and requires credentials for the three
 configured models.
+
+### Spontaneous routing evaluation
+
+```bash
+npm run eval:routing
+```
+
+This optional, provider-consuming evaluation uses ordinary requests without
+asking the model to delegate: trivial arithmetic, a known-scope edit, discovery
+followed by implementation, and discovery followed by security analysis. It
+records native call order/completion, file-path handoff hints, primary read
+counts, exact repeated-read inputs across tiers, latency and reported token usage,
+and checks fixture behavior/tests. Repeated reads are diagnostic, not necessarily
+redundant (for example, rereading after an edit can be necessary).
+It exits nonzero when observed routing misses the expected route or read budget.
+It is intentionally separate from the smoke test: nondeterministic model
+compliance is not a structural plugin test. Passing examples do not guarantee
+general splitting or establish net cost savings. It inherits the host's global
+configuration and credentials; its files live in a temporary fixture workspace.
+
+Initial live evaluation with a medium-tier primary produced both composite
+routes (`fast → medium` and `fast → heavy`), but performed the known-scope edit
+directly and exceeded primary read budgets. This remains an advisory-routing
+limitation; the evaluator reports it rather than forcing a passing outcome.
+
+### Prompt token budgets
+
+```bash
+npm run measure:prompts
+```
+
+The default plugin-added primary protocol measures 361 tokens; tier instructions
+measure 62–71 tokens with `o200k_base`. The previous primary protocol was 440
+tokens with the same encoding (~18% reduction despite added handoff contracts).
+Tests budget 380 primary tokens and 85 per tier. Custom taxonomy/instructions
+can increase these sizes. The encoding is a reproducible proxy, not a verified
+tokenizer for every configured model, the full host prompt, or provider billing.
+No numeric subagent caps, runtime counters or provider-specific prompt overrides
+are added to the plugin.
 
 ## Updates and removal
 

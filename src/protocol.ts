@@ -5,33 +5,23 @@ import { TIER_NAMES } from "./tiers.js"
 export function buildRoutingProtocol(options: EnabledRouterOptions): string {
   const taxonomy = mergeTaxonomy(options.taxonomy)
   const directRule = options.directThreshold === "never"
-    ? "Delegate every executable task; do not bypass dispatch merely because it looks trivial."
-    : "Handle truly trivial one-step work directly when delegation would cost more than the work."
+    ? "Delegate every executable task, including trivial work."
+    : "Trivial (one step, no expected follow-up)→direct when delegation costs more."
 
   const tierLines = TIER_NAMES.map((tier) => `- ${tier}: ${taxonomy[tier].join("; ")}`)
 
   return [
     "## Tiered Dispatch Protocol",
-    "You are the orchestrator. For nontrivial work, classify, decompose, delegate, integrate, and then answer; do not silently become the executor.",
-    "",
-    "Tier guide:",
+    "Orchestrate: classify, decompose, delegate, integrate, answer. Discovery is execution, not orchestration.",
     ...tierLines,
-    "",
-    "Decision flow:",
-    "1. Classify the request as trivial, exploration, implementation, or difficult reasoning.",
-    "2. For nontrivial work, choose a tier before using normal execution tools. Use fast for missing context, medium for implementation, and heavy for difficult judgment or high-risk reasoning.",
-    "3. If implementation or reasoning depends on unknown repository context, delegate fast first, then pass its findings to medium or heavy. Do not split a well-scoped task merely for ceremony.",
-    "4. Run independent delegations in parallel; serialize phases when a later prompt depends on an earlier result.",
-    "5. Keep direct discovery to at most two read-only calls when deciding whether delegation is needed; delegate fast when more context is required.",
-    "",
-    "Rules:",
-    `1. ${directRule}`,
-    "2. Do not choose heavy because a task is large; choose it for difficult judgment, high risk, or repeated failed debugging.",
-    "3. Give each delegation a self-contained prompt with the goal, relevant paths or boundaries when known, constraints, required verification, and the exact result to return.",
-    "4. No tier escalates automatically. Inspect failures and decide what to do next.",
-    "5. Do not pass a per-call model override to a tier; its validated model and variant are owned by the tier. Choose a different tier when you need a different capability level.",
-    "6. You remain responsible for integrating delegated work and presenting the final answer.",
-    "",
-    "Use the native `subagent` tool with agent `fast`, `medium`, or `heavy`; provide a short description and the self-contained delegated prompt described above.",
+    directRule,
+    "Nontrivial→delegate cheapest adequate tier BEFORE execution; do not implement or perform broad analysis yourself. Heavy is for difficult judgment/high risk/repeated debugging failures, not task size.",
+    "Split: missing context + edits→fast then medium; missing context + difficult analysis→fast then heavy; known scope→one delegation, no ceremonial discovery.",
+    "Examples: trace auth then refactor→fast→medium; map trust boundaries then assess security→fast→heavy; supplied patch scope→medium.",
+    "Batch related discovery. Pass findings, paths and unresolved questions forward; do not repeat broad exploration. At most two direct read-only discovery calls; more→fast.",
+    "Parallelize independent work; serialize phases with dependencies and serialize overlapping edits.",
+    "Handoff: NEED CONTEXT / SCOPE GROWTH→inspect missing evidence, send a focused fast request, then resume medium/heavy with findings. No automatic escalation or fallback.",
+    "Use native `subagent` with agent `fast`, `medium` or `heavy`, short description and self-contained prompt: goal, paths/scope, constraints, verification, expected result. No per-call model override.",
+    "Integrate results, check verification, answer; you own the outcome.",
   ].join("\n")
 }

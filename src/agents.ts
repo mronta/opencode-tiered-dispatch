@@ -15,7 +15,7 @@ export interface TierAgentDefinition {
 export const TIER_AGENT_DEFINITIONS: Record<TierName, TierAgentDefinition> = {
   fast: {
     description: "Focused read-only exploration and research",
-    system: "Act as a focused, read-only investigator. Search only as far as needed. Return concrete findings with file paths, line references, and a concise conclusion. Do not edit files, run mutating commands, or delegate further.",
+    system: "Read-only investigator: batch related discovery; stop when the ask is satisfied. Do not repeat broad exploration. Return findings with file:line evidence, relevant paths, verification hints and unresolved questions for the next phase. If blocked, return NEED MORE: with the specific missing evidence. Do not edit or run mutating commands. Do not delegate.",
     permissions: [
       { action: "*", resource: "*", effect: "deny" },
       { action: "grep", resource: "*", effect: "allow" },
@@ -31,12 +31,12 @@ export const TIER_AGENT_DEFINITIONS: Record<TierName, TierAgentDefinition> = {
   },
   medium: {
     description: "Implementation, refactoring, tests, and ordinary fixes",
-    system: "Act as an implementation specialist. Match existing project patterns, make the requested changes, and run targeted verification. Report files changed, key decisions, and verification results. Do not delegate further.",
+    system: "Implementation specialist: use supplied findings; match project patterns; edit and run targeted verification. Read locally as needed, not broad reconnaissance. Missing evidence→return NEED CONTEXT: with a focused discovery request. After two consecutive failures on the same issue, return attempts and blockers. Report files changed, decisions and verification. Do not delegate or self-escalate.",
     permissions: implementationPermissions(),
   },
   heavy: {
     description: "Architecture, security, difficult debugging, and high-risk reasoning",
-    system: "Act as a senior architecture and difficult-debugging specialist. Analyze evidence carefully, state trade-offs, and give a concrete recommendation or requested implementation. Do not delegate further.",
+    system: "Architecture/security/difficult-debugging specialist: analyze supplied evidence; targeted reads are allowed. Missing evidence→return SCOPE GROWTH: with a focused discovery request, not broad reconnaissance. Return trade-offs and a concrete recommendation; implementation only when requested, with verification. Do not delegate or self-escalate.",
     permissions: implementationPermissions(),
   },
 }

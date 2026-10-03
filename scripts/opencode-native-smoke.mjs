@@ -2,10 +2,12 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
-import { spawn } from "node:child_process"
+import { spawn, spawnSync } from "node:child_process"
 import net from "node:net"
+import { assessRouting, routingObserverSource, scenarios, seedRoutingFixture } from "./routing-eval.mjs"
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)))
+const routingEval = process.argv.includes("--routing-eval")
 const workspace = mkdtempSync(join(tmpdir(), "opencode-tiered-dispatch-native-"))
 const control = mkdtempSync(join(tmpdir(), "opencode-tiered-dispatch-native-control-"))
 const paths = {
@@ -25,10 +27,13 @@ const rootModel = modelRef(tiers.medium)
 mkdirSync(join(workspace, ".opencode", "plugins"), { recursive: true })
 writeFileSync(join(workspace, "opencode.jsonc"), JSON.stringify({
   $schema: "https://opencode.ai/config.json",
-  agents: nativeAgents(providerErrorModel),
+  ...(routingEval ? {} : { agents: nativeAgents(providerErrorModel) }),
   plugins: [{ package: root }],
 }, null, 2) + "\n")
-writeFileSync(join(workspace, ".opencode", "plugins", "native-smoke-observer.js"), observerSource(paths, rootModel, tiers, providerErrorModel))
+if (routingEval) seedRoutingFixture(workspace)
+writeFileSync(join(workspace, ".opencode", "plugins", "native-smoke-observer.js"), routingEval
+  ? routingObserverSource(paths, rootModel)
+  : observerSource(paths, rootModel, tiers, providerErrorModel))
 
 const port = await freePort()
 const password = `native-smoke-${Date.now()}`
@@ -68,11 +73,12 @@ try {
   if (!agentResponse.ok) throw new Error(`could not read native agent catalog: HTTP ${agentResponse.status}`)
   const agentPayload = await agentResponse.json()
   try {
-    verify(result, agentPayload.data ?? agentPayload, workspace, providerErrorModel)
+    if (routingEval) verifyRoutingEvaluation(result, workspace)
+    else verify(result, agentPayload.data ?? agentPayload, workspace, providerErrorModel)
   } catch (error) {
     throw new Error(`${error?.message ?? String(error)}\nOpenCode logs:\n${logs}`)
   }
-  console.log(`OpenCode native-agent smoke passed: ${Object.keys(result.tiers).join(", ")}`)
+  console.log(routingEval ? "OpenCode spontaneous-routing evaluation passed" : `OpenCode native-agent smoke passed: ${Object.keys(result.tiers).join(", ")}`)
 } finally {
   await stopProcess(child)
   rmSync(workspace, { recursive: true, force: true })
@@ -81,6 +87,43 @@ try {
 
 function formatFailure(failure, logs) {
   return `${failure}\nOpenCode logs:\n${logs}`
+}
+
+function verifyRoutingEvaluation(results, workspace) {
+  const reports = scenarios.map(scenario => {
+    const result = results.find(candidate => candidate.id === scenario.id)
+    if (!result) throw new Error(`routing evaluation missing scenario ${scenario.id}`)
+    return assessRouting(result, scenario.route)
+  })
+  const trivial = results.find(result => result.id === "trivial")
+  if (trivial.sessions.find(session => session.sessionID === trivial.rootSessionID)?.text.trim() !== "4") {
+    reports[0].problems.push("trivial answer was incorrect")
+  }
+  const analysis = results.find(result => result.id === "discover-analyze")
+  const answer = analysis.sessions.find(session => session.sessionID === analysis.rootSessionID)?.text ?? ""
+  if (!/replay/i.test(answer) || !/forg|unauthenticated|signature/i.test(answer) || !/src\/auth\//.test(answer)) {
+    reports.at(-1).problems.push("security answer omitted replay, identity forgery or file evidence")
+  }
+  if (analysis.changedFiles.length > 0) {
+    reports.at(-1).problems.push("analysis modified fixture files despite no-edit request")
+  }
+  const check = spawnSync(process.execPath, ["--input-type=module", "-e", `
+    import assert from 'node:assert/strict'
+    import { banner } from './src/banner.js'
+    import { saveName } from './src/controller.js'
+    assert.equal(banner('Ada'), 'Hello, Ada!')
+    assert.equal(saveName('   ').ok, false)
+    assert.equal(saveName(' abcdefghijklm ').ok, false)
+    assert.deepEqual(saveName(' abcdefghijkl '), { ok: true, name: 'abcdefghijkl', limit: 12 })
+  `], { cwd: workspace, encoding: "utf8" })
+  const tests = spawnSync("npm", ["test"], { cwd: workspace, encoding: "utf8" })
+  if (check.status !== 0 || tests.status !== 0) {
+    reports[2].problems.push(`fixture verification failed: ${check.stderr}\n${tests.stdout}\n${tests.stderr}`)
+  }
+  console.log(JSON.stringify(reports, null, 2))
+  if (reports.some(report => report.problems.length > 0)) {
+    throw new Error("spontaneous-routing evaluation failed; see observed routes above")
+  }
 }
 
 function verifyMaterializedAgents(agents, expectedTiers) {
