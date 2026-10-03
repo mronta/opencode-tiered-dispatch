@@ -1,5 +1,6 @@
 import type { Context } from "@opencode/plugin/promise/plugin"
 import type { AgentPermissionRule } from "./agents.js"
+import { TIER_NAMES } from "./tiers.js"
 
 export const PLAN_READONLY_TOOLS: ReadonlySet<string> = new Set([
   "read",
@@ -7,8 +8,9 @@ export const PLAN_READONLY_TOOLS: ReadonlySet<string> = new Set([
   "grep",
   "webfetch",
   "websearch",
-  "subagent",
 ])
+
+export const PLAN_ORCHESTRATION_TIERS: ReadonlySet<string> = new Set(TIER_NAMES)
 
 export const PLAN_READONLY_INSTRUCTION =
   "This is a Plan-originated child. Read-only policy is enforced: use only read/search tools or safe tier orchestration; do not edit, write, patch, run shell commands, or otherwise mutate the workspace. Return findings and verification guidance instead of making changes."
@@ -26,12 +28,10 @@ const PLAN_READONLY_RULES = [
   { action: "read", resource: "*.env", effect: "ask" },
   { action: "read", resource: "*.env.*", effect: "ask" },
   { action: "read", resource: "*.env.example", effect: "allow" },
-  { action: "subagent", resource: "fast", effect: "allow" },
-  { action: "subagent", resource: "medium", effect: "allow" },
-  { action: "subagent", resource: "heavy", effect: "allow" },
+  ...TIER_NAMES.map((tier) => ({ action: "subagent", resource: tier, effect: "allow" as const })),
 ] as const satisfies readonly AgentPermissionRule[]
 
-const PLAN_SAFE_ACTIONS = PLAN_READONLY_TOOLS
+const PLAN_SAFE_ACTIONS = new Set([...PLAN_READONLY_TOOLS, "subagent"])
 
 export interface PlanSessionLookup {
   readonly owned: boolean

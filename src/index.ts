@@ -8,6 +8,7 @@ import { parseOptions, type TierOptions } from "./options.js"
 import {
   enforcePlanSessionPermissions,
   findPlanSession,
+  PLAN_ORCHESTRATION_TIERS,
   PLAN_READONLY_INSTRUCTION,
   PLAN_READONLY_TOOLS,
 } from "./plan-safety.js"
@@ -65,7 +66,7 @@ export default Plugin.define({
         const planSession = event.sessionID === undefined
           ? undefined
           : await findPlanSession(ctx, event.sessionID, event.agent, planSessionIDs)
-        if (planSession?.owned && !PLAN_READONLY_TOOLS.has(event.tool)) {
+        if (planSession?.owned && event.tool !== "subagent" && !PLAN_READONLY_TOOLS.has(event.tool)) {
           throw new Error(`Plan-originated sessions are read-only; tool ${event.tool} is not permitted`)
         }
 
@@ -77,11 +78,23 @@ export default Plugin.define({
         await enforcePlanSessionPermissions(ctx, event.sessionID, planSession.session)
 
         const input = asRecord(event.input)
+        const targetAgent = input?.agent
         const continuedSessionID = input?.sessionID
-        if (typeof continuedSessionID !== "string" || continuedSessionID === event.sessionID) return
+        if (targetAgent !== undefined) {
+          if (typeof targetAgent !== "string" || !PLAN_ORCHESTRATION_TIERS.has(targetAgent)) {
+            throw new Error("Plan can orchestrate only the fast, medium, and heavy plugin tiers")
+          }
+        } else if (typeof continuedSessionID !== "string") {
+          throw new Error("Plan subagent calls must target a plugin tier or continue a verified tier session")
+        }
+
+        if (typeof continuedSessionID !== "string") return
         const continued = await findPlanSession(ctx, continuedSessionID, undefined, planSessionIDs)
         if (!continued.owned) {
           throw new Error("Plan can continue only a session whose read-only ancestry can be verified")
+        }
+        if (targetAgent === undefined && !isTierName(continued.session.agent)) {
+          throw new Error("Plan can continue only a verified fast, medium, or heavy tier session")
         }
         await enforcePlanSessionPermissions(ctx, continuedSessionID, continued.session)
       }))

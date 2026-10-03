@@ -288,6 +288,12 @@ describe("plugin setup", () => {
       .resolves.toBeUndefined()
     await expect(guard({ tool: "subagent", sessionID: "plan-child", agent: "medium", input: { agent: "fast" } }))
       .resolves.toBeUndefined()
+    await expect(guard({
+      tool: "subagent",
+      sessionID: "plan-root",
+      agent: "plan",
+      input: { agent: "medium", sessionID: "plan-child" },
+    })).resolves.toBeUndefined()
     for (const tool of ["edit", "write", "shell", "patch"]) {
       await expect(guard({ tool, sessionID: "plan-child", agent: "medium", input: {} }))
         .rejects.toThrow(/sessions are read-only/)
@@ -299,6 +305,31 @@ describe("plugin setup", () => {
       agent: "plan",
       input: { sessionID: "plan-child", agent: "heavy" },
     })).resolves.toBeUndefined()
+
+    if (typeof cleanup === "function") await cleanup()
+  })
+
+  it("rejects Plan continuation into non-Plan or unverifiable sessions", async () => {
+    const fixture = makeContext(options)
+    const cleanup = await plugin.setup(fixture.context)
+    const guard = fixture.toolHookCallbacks[0]!
+    fixture.setSession("custom-child", { parentID: "plan-root", agent: "custom" })
+
+    for (const sessionID of ["root", "unverified-session"]) {
+      await expect(guard({
+        tool: "subagent",
+        sessionID: "plan-root",
+        agent: "plan",
+        input: { sessionID },
+      })).rejects.toThrow(/read-only ancestry can be verified/)
+    }
+
+    await expect(guard({
+      tool: "subagent",
+      sessionID: "plan-root",
+      agent: "plan",
+      input: { agent: "custom", sessionID: "custom-child" },
+    })).rejects.toThrow(/only the fast, medium, and heavy plugin tiers/)
 
     if (typeof cleanup === "function") await cleanup()
   })
