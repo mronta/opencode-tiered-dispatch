@@ -14,7 +14,7 @@ export interface RequiredTierModel {
 }
 
 export const REQUIRED_TIER_MODELS: Record<TierName, RequiredTierModel> = {
-  fast: { model: "openai/gpt-6-luna" },
+  fast: { model: "openai/gpt-6-luna", variant: "medium" },
   medium: { model: "openai/gpt-5.6-luna", variant: "max" },
   heavy: { model: "openai/gpt-5.6-sol", variant: "medium" },
 }

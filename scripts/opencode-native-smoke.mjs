@@ -4,6 +4,8 @@ import { join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { spawn } from "node:child_process"
 import net from "node:net"
+import { modelSelection } from "../dist/options.js"
+import { REQUIRED_TIER_MODELS } from "../dist/tiers.js"
 import { assessRouting, routingObserverSource, scenarios, seedRoutingFixture } from "./routing-eval.mjs"
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)))
@@ -16,13 +18,9 @@ const paths = {
   failure: join(control, "scenario.failure"),
 }
 
-const tiers = {
-  fast: { model: "openai/gpt-6-luna" },
-  medium: { model: "openai/gpt-5.6-luna", variant: "max" },
-  heavy: { model: "openai/gpt-5.6-sol", variant: "medium" },
-}
+const requiredTierModels = REQUIRED_TIER_MODELS
 const providerErrorModel = "openai/__tiered_dispatch_missing_model__"
-const rootModel = modelRef(tiers.medium)
+const rootModel = modelSelection(requiredTierModels.medium.model, requiredTierModels.medium.variant)
 
 mkdirSync(join(workspace, ".opencode", "plugins"), { recursive: true })
 writeFileSync(join(workspace, "opencode.jsonc"), JSON.stringify({
@@ -33,7 +31,7 @@ writeFileSync(join(workspace, "opencode.jsonc"), JSON.stringify({
 if (routingEval) seedRoutingFixture(workspace)
 writeFileSync(join(workspace, ".opencode", "plugins", "native-smoke-observer.js"), routingEval
   ? routingObserverSource(paths, rootModel)
-  : observerSource(paths, rootModel, tiers, providerErrorModel))
+  : observerSource(paths, rootModel, requiredTierModels, providerErrorModel))
 
 const port = await freePort()
 const password = `native-smoke-${Date.now()}`
@@ -64,7 +62,7 @@ try {
   if (existsSync(paths.failure)) throw new Error(formatFailure(readFileSync(paths.failure, "utf8"), logs))
   const initialAgentResponse = await fetch(`http://127.0.0.1:${port}/api/agent`, { headers: { authorization } })
   if (!initialAgentResponse.ok) throw new Error(`could not read initial native agent catalog: HTTP ${initialAgentResponse.status}`)
-  verifyMaterializedAgents((await initialAgentResponse.json()).data ?? [], tiers)
+  verifyMaterializedAgents((await initialAgentResponse.json()).data ?? [], requiredTierModels)
 
   await waitFor(() => existsSync(paths.result) || existsSync(paths.failure), 600_000, () => logs)
   if (existsSync(paths.failure)) throw new Error(formatFailure(readFileSync(paths.failure, "utf8"), logs))
@@ -120,15 +118,6 @@ function verifyMaterializedAgents(agents, expectedTiers) {
   }
 }
 
-function modelRef(config) {
-  const separator = config.model.indexOf("/")
-  return {
-    providerID: config.model.slice(0, separator),
-    id: config.model.slice(separator + 1),
-    ...(config.variant === undefined ? {} : { variant: config.variant }),
-  }
-}
-
 function nativeAgents(providerErrorModel) {
   return {
     "provider-error": {
@@ -142,7 +131,7 @@ function nativeAgents(providerErrorModel) {
 
 function matchesExpectedModel(actual, expected) {
   if (!actual) return false
-  const configured = modelRef(expected)
+  const configured = modelSelection(expected.model, expected.variant)
   return actual.providerID === configured.providerID
     && actual.id === configured.id
     && normalizedVariant(actual.variant, expected.variant) === (expected.variant ?? undefined)
@@ -161,7 +150,7 @@ function verifyTierAgent(agents, tier, expected, phase) {
 
 function observerSource(resultPaths, selectedRootModel, configuredTiers, configuredProviderErrorModel) {
   const directModels = Object.fromEntries(
-    Object.entries(configuredTiers).map(([tier, config]) => [tier, modelRef(config)]),
+    Object.entries(configuredTiers).map(([tier, config]) => [tier, modelSelection(config.model, config.variant)]),
   )
   return [
     `import { writeFileSync } from "node:fs"`,

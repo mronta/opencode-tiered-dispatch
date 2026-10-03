@@ -1,12 +1,9 @@
 import type { Context } from "@opencode/plugin/promise/plugin"
 import { describe, expect, it, vi } from "vitest"
 import plugin from "../src/index.js"
+import { modelCatalog, requiredTierOptions, tierModel } from "./tier-fixtures.js"
 
-const models = [
-  { providerID: "openai", id: "gpt-6-luna", enabled: true, capabilities: { tools: true }, variants: [{ id: "low" }, { id: "medium" }, { id: "high" }, { id: "xhigh" }, { id: "max" }] },
-  { providerID: "openai", id: "gpt-5.6-luna", enabled: true, capabilities: { tools: true }, variants: [{ id: "max" }] },
-  { providerID: "openai", id: "gpt-5.6-sol", enabled: true, capabilities: { tools: true }, variants: [{ id: "medium" }] },
-]
+const models = modelCatalog()
 
 type ContextEvent = { sessionID: string; agent: string; tools: Record<string, unknown>; system: unknown[] }
 type ToolEvent = { tool: string; input: unknown }
@@ -101,11 +98,7 @@ function makeContext(options: Record<string, unknown>, failures: FixtureFailures
 }
 
 const options = {
-  tiers: {
-    fast: { model: "openai/gpt-6-luna" },
-    medium: { model: "openai/gpt-5.6-luna", variant: "max" },
-    heavy: { model: "openai/gpt-5.6-sol", variant: "medium" },
-  },
+  tiers: requiredTierOptions(),
 }
 
 describe("plugin setup", () => {
@@ -119,15 +112,15 @@ describe("plugin setup", () => {
     expect(fixture.agents.find((agent) => agent.id === "fast")).toMatchObject({
       mode: "subagent",
       description: "Focused read-only exploration and research",
-      model: { providerID: "openai", id: "gpt-6-luna" },
+      model: tierModel("fast"),
     })
     expect(fixture.agents.find((agent) => agent.id === "medium")).toMatchObject({
       mode: "subagent",
-      model: { providerID: "openai", id: "gpt-5.6-luna", variant: "max" },
+      model: tierModel("medium"),
     })
     expect(fixture.agents.find((agent) => agent.id === "heavy")).toMatchObject({
       mode: "subagent",
-      model: { providerID: "openai", id: "gpt-5.6-sol", variant: "medium" },
+      model: tierModel("heavy"),
     })
     const hook = fixture.hookCallbacks[0]!
     const root = { sessionID: "root", agent: "build", tools: {}, system: [] as unknown[] }
@@ -176,7 +169,7 @@ describe("plugin setup", () => {
       ...options,
       tiers: {
         ...options.tiers,
-        medium: { model: "openai/gpt-5.6-luna", variant: "max", instructions: "Keep the patch minimal" },
+        medium: { ...requiredTierOptions().medium, instructions: "Keep the patch minimal" },
       },
     })
     await plugin.setup(fixture.context)

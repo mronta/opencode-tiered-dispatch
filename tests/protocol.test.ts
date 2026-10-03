@@ -3,12 +3,9 @@ import { getEncoding } from "js-tiktoken"
 import { TIER_AGENT_DEFINITIONS } from "../src/agents.js"
 import { parseOptions } from "../src/options.js"
 import { buildRoutingProtocol } from "../src/protocol.js"
+import { requiredTierOptions } from "./tier-fixtures.js"
 
-const tierConfig = {
-  fast: { model: "openai/gpt-6-luna" },
-  medium: { model: "openai/gpt-5.6-luna", variant: "max" },
-  heavy: { model: "openai/gpt-5.6-sol", variant: "medium" },
-}
+const tierConfig = requiredTierOptions()
 
 const options = parseOptions({
   tiers: tierConfig,

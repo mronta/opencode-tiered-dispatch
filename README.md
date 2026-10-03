@@ -67,13 +67,13 @@ permission policies at runtime.
 The plugin's default OpenAI mapping is:
 
 ```text
-fast   → openai/gpt-6-luna
+fast   → openai/gpt-6-luna#medium
 medium → openai/gpt-5.6-luna#max
 heavy  → openai/gpt-5.6-sol#medium
 ```
 
-GPT-6 Luna's model ID is `gpt-6-luna`; its default reasoning effort is medium.
-There is no `medium-fast` model variant. This mapping is required by the plugin;
+GPT-6 Luna's model ID is `gpt-6-luna` with explicit `medium` reasoning effort.
+There is no `medium-fast` model variant. This exact mapping is required by the plugin;
 confirm that these exact models and variants are available with `/models` before
 connecting providers.
 
@@ -111,7 +111,7 @@ interface TierOptions {
 When omitted, the plugin uses this exact mapping:
 
 ```text
-fast   → openai/gpt-6-luna
+fast   → openai/gpt-6-luna#medium
 medium → openai/gpt-5.6-luna#max
 heavy  → openai/gpt-5.6-sol#medium
 ```

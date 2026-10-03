@@ -1,12 +1,9 @@
 import { describe, expect, it } from "vitest"
-import { parseModelReference, parseOptions } from "../src/options.js"
+import { modelSelection, parseModelReference, parseOptions } from "../src/options.js"
+import { requiredTierOptions } from "./tier-fixtures.js"
 
 const valid = {
-  tiers: {
-    fast: { model: "openai/gpt-6-luna" },
-    medium: { model: "openai/gpt-5.6-luna", variant: "max" },
-    heavy: { model: "openai/gpt-5.6-sol", variant: "medium" },
-  },
+  tiers: requiredTierOptions(),
 }
 
 describe("parseOptions", () => {
@@ -15,7 +12,7 @@ describe("parseOptions", () => {
       enabled: true,
       directThreshold: "trivial",
       logging: false,
-      tiers: { medium: { modelRef: { providerID: "openai", id: "gpt-5.6-luna" } } },
+      tiers: { medium: { modelRef: parseModelReference(requiredTierOptions().medium.model) } },
     })
   })
 
@@ -36,27 +33,23 @@ describe("parseOptions", () => {
       .toThrow(/unknown field/)
     expect(() => parseOptions({
       enabled: false,
-      tiers: { fast: { model: "openai/gpt-6-luna", cost: 1 } },
+      tiers: { fast: { ...requiredTierOptions().fast, cost: 1 } },
     })).toThrow(/unknown field: cost/)
   })
 
   it("rejects unknown fields", () => {
     expect(() => parseOptions({ ...valid, fallback: true })).toThrow(/unknown field: fallback/)
-    expect(() => parseOptions({ tiers: { ...valid.tiers, fast: { model: "openai/gpt-6-luna", cost: 1 } } }))
+    expect(() => parseOptions({ tiers: { ...valid.tiers, fast: { ...requiredTierOptions().fast, cost: 1 } } }))
       .toThrow(/unknown field: cost/)
   })
 
   it("defaults the packaged tier models when tiers are omitted", () => {
     expect(parseOptions({})).toMatchObject({
       enabled: true,
-      tiers: {
-        fast: { model: "openai/gpt-6-luna" },
-        medium: { model: "openai/gpt-5.6-luna", variant: "max" },
-        heavy: { model: "openai/gpt-5.6-sol", variant: "medium" },
-      },
+      tiers: requiredTierOptions(),
     })
     expect(parseOptions({ tiers: { medium: { instructions: "Keep the patch small" } } }))
-      .toMatchObject({ tiers: { medium: { instructions: "Keep the patch small", model: "openai/gpt-5.6-luna", variant: "max" } } })
+      .toMatchObject({ tiers: { medium: { instructions: "Keep the patch small", ...requiredTierOptions().medium } } })
   })
 
   it("validates taxonomy values", () => {
@@ -67,8 +60,8 @@ describe("parseOptions", () => {
   it("requires the configured tier model mapping", () => {
     expect(() => parseOptions({
       ...valid,
-      tiers: { ...valid.tiers, fast: { model: "openai/gpt-5.6-luna-fast" } },
-    })).toThrow(/options\.tiers\.fast must use model openai\/gpt-6-luna/)
+      tiers: { ...valid.tiers, fast: { model: "openai/other" } },
+    })).toThrow(/options\.tiers\.fast must use model/)
   })
 })
 
@@ -79,5 +72,13 @@ describe("parseModelReference", () => {
 
   it.each(["provider", "/model", "provider/"])("rejects %s", (value) => {
     expect(() => parseModelReference(value)).toThrow(/provider\/model/)
+  })
+
+  it("adds an explicit variant to a model selection", () => {
+    expect(modelSelection("provider/model", "medium")).toEqual({
+      providerID: "provider",
+      id: "model",
+      variant: "medium",
+    })
   })
 })

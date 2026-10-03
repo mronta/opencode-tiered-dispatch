@@ -6,6 +6,10 @@ export interface ModelReference {
   id: string
 }
 
+export interface ModelSelection extends ModelReference {
+  variant?: string
+}
+
 export interface TierOptions {
   model: string
   modelRef: ModelReference
@@ -62,6 +66,13 @@ export function parseModelReference(value: string, path = "model"): ModelReferen
     throw new ConfigurationError(`${path} must use the form provider/model`)
   }
   return { providerID, id }
+}
+
+export function modelSelection(model: string, variant?: string): ModelSelection {
+  return {
+    ...parseModelReference(model),
+    ...(variant === undefined ? {} : { variant }),
+  }
 }
 
 function parseTier(value: unknown, tier: TierName, enforceRequiredModel = true): TierOptions {
