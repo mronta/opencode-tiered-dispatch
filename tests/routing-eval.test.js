@@ -45,6 +45,14 @@ describe("spontaneous routing assessment", () => {
     expect(assessRouting(trace([discovery, complete, implement, implemented, followup, followed, resume, resumed]), ["fast", "medium"]).problems).toEqual([])
   })
 
+  it("rejects recovery and overlapping edits before the originating tier returns", () => {
+    const followup = { ...discovery, id: "c" }
+    const followed = { ...complete, id: "c" }
+    const resume = { ...implement, id: "d" }
+    const resumed = { ...implemented, id: "d" }
+    expect(assessRouting(trace([discovery, complete, implement, followup, followed, resume, implemented, resumed]), ["fast", "medium"]).problems).toContain("recovery or execution began before the previous execution returned")
+  })
+
   it("preserves per-scenario verification failures", () => {
     const result = { ...trace([discovery, complete, implement, implemented]), fixtureProblems: ["validation failed"] }
     expect(assessRouting(result, ["fast", "medium"]).problems).toEqual(["validation failed"])

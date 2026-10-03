@@ -143,18 +143,22 @@ export function assessRouting(result, expectedRoute) {
   if (!matchesRoute) problems.push(`expected ${expectedRoute.join("→") || "direct"} (focused discovery/resume cycles allowed); observed ${route.join("→") || "direct"}`)
   if (result.sessions.some(session => session.outcome !== "succeeded")) problems.push("one or more sessions did not succeed")
   if (result.contexts && !result.contexts.some(event => event.sessionID === result.rootSessionID && event.hasProtocol)) problems.push("primary routing protocol was not observed")
+  const completions = new Map(result.tools.flatMap((event, index) => event.phase === "after" && event.status === "completed" ? [[event.id, { event, index }]] : []))
+  let previousExecution
   for (const dispatch of dispatches) {
-    const completion = result.tools.find(event => event.phase === "after" && event.id === dispatch.id && event.status === "completed")
-    if (!completion || result.tools.indexOf(completion) <= result.tools.indexOf(dispatch)) problems.push("native delegation did not complete")
+    const dispatchIndex = result.tools.indexOf(dispatch)
+    const completion = completions.get(dispatch.id)
+    if (!completion || completion.index <= dispatchIndex) problems.push("native delegation did not complete")
+    if (previousExecution && (completions.get(previousExecution.id)?.index ?? Infinity) >= dispatchIndex) problems.push("recovery or execution began before the previous execution returned")
     if (dispatch.input?.agent === "fast") continue
+    previousExecution = dispatch
     const discoveryCalls = dispatches.filter(previous => previous.input?.agent === "fast" && result.tools.indexOf(previous) < result.tools.indexOf(dispatch))
     for (const discovery of discoveryCalls) {
-      const completed = result.tools.findIndex(event => event.phase === "after" && event.id === discovery.id && event.status === "completed")
-      if (completed < 0 || completed >= result.tools.indexOf(dispatch)) problems.push("dependent phases overlapped or discovery failed")
+      if ((completions.get(discovery.id)?.index ?? Infinity) >= dispatchIndex) problems.push("dependent phases overlapped or discovery failed")
     }
     const discovery = discoveryCalls.at(-1)
     if (discovery) {
-      const evidence = result.tools.find(event => event.phase === "after" && event.id === discovery.id)?.resultText ?? ""
+      const evidence = completions.get(discovery.id)?.event.resultText ?? ""
       const paths = (evidence.match(/src\/[\w./-]+/g) ?? []).map(path => path.replace(/\.+$/, ""))
       if (!paths.some(path => dispatch.input?.prompt?.includes(path))) problems.push("execution prompt did not carry discovered file evidence")
     }
