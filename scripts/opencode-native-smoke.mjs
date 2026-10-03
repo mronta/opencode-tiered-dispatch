@@ -15,23 +15,18 @@ const paths = {
 }
 
 const tiers = {
-  fast: tier("TIERED_DISPATCH_FAST_MODEL", "TIERED_DISPATCH_FAST_VARIANT"),
-  medium: tier("TIERED_DISPATCH_MEDIUM_MODEL", "TIERED_DISPATCH_MEDIUM_VARIANT"),
-  heavy: tier("TIERED_DISPATCH_HEAVY_MODEL", "TIERED_DISPATCH_HEAVY_VARIANT"),
+  fast: { model: "openai/gpt-5.6-luna-fast" },
+  medium: { model: "openai/gpt-5.6-luna", variant: "max" },
+  heavy: { model: "openai/gpt-5.6-sol", variant: "medium" },
 }
 const providerErrorModel = "openai/__tiered_dispatch_missing_model__"
 const rootModel = modelRef(tiers.medium)
-const options = {
-  enabled: true,
-  tiers,
-}
 
 mkdirSync(join(workspace, ".opencode", "plugins"), { recursive: true })
 writeFileSync(join(workspace, "opencode.jsonc"), JSON.stringify({
   $schema: "https://opencode.ai/config.json",
-  model: modelString(tiers.medium),
-  agents: nativeAgents(tiers, providerErrorModel),
-  plugins: [{ package: root, options }],
+  agents: nativeAgents(providerErrorModel),
+  plugins: [{ package: root }],
 }, null, 2) + "\n")
 writeFileSync(join(workspace, ".opencode", "plugins", "native-smoke-observer.js"), observerSource(paths, rootModel, tiers, providerErrorModel))
 
@@ -69,19 +64,16 @@ try {
   const agentResponse = await fetch(`http://127.0.0.1:${port}/api/agent`, { headers: { authorization } })
   if (!agentResponse.ok) throw new Error(`could not read native agent catalog: HTTP ${agentResponse.status}`)
   const agentPayload = await agentResponse.json()
-  verify(result, agentPayload.data ?? agentPayload, workspace, providerErrorModel)
+  try {
+    verify(result, agentPayload.data ?? agentPayload, workspace, providerErrorModel)
+  } catch (error) {
+    throw new Error(`${error?.message ?? String(error)}\nOpenCode logs:\n${logs}`)
+  }
   console.log(`OpenCode native-agent smoke passed: ${Object.keys(result.tiers).join(", ")}`)
 } finally {
   await stopProcess(child)
   rmSync(workspace, { recursive: true, force: true })
   rmSync(control, { recursive: true, force: true })
-}
-
-function tier(modelVariable, variantVariable) {
-  const model = process.env[modelVariable]
-  if (!model) throw new Error(`${modelVariable} is required for the native-agent smoke test`)
-  const variant = process.env[variantVariable]
-  return variant ? { model, variant } : { model }
 }
 
 function formatFailure(failure, logs) {
@@ -97,68 +89,24 @@ function modelRef(config) {
   }
 }
 
-function modelString(config) {
-  return config.variant === undefined ? config.model : `${config.model}#${config.variant}`
-}
-
-function nativeAgents(configured, providerErrorModel) {
+function nativeAgents(providerErrorModel) {
   return {
     fast: {
       mode: "subagent",
-      description: "Focused read-only exploration and research",
-      model: modelString(configured.fast),
-      system: "Act as a focused, read-only investigator. Search only as far as needed. Return concrete findings with file paths, line references, and a concise conclusion. Do not edit files, run mutating commands, or delegate further.",
-      permissions: fastPermissions(),
     },
     medium: {
       mode: "subagent",
-      description: "Implementation, refactoring, tests, and ordinary fixes",
-      model: modelString(configured.medium),
-      system: "Act as an implementation specialist. Match existing project patterns, make the requested changes, and run targeted verification. Report files changed, key decisions, and verification results. Do not delegate further.",
-      permissions: implementationPermissions(),
     },
     heavy: {
       mode: "subagent",
-      description: "Architecture, security, difficult debugging, and high-risk reasoning",
-      model: modelString(configured.heavy),
-      system: "Act as a senior architecture and difficult-debugging specialist. Analyze evidence carefully, state trade-offs, and give a concrete recommendation or requested implementation. Do not delegate further.",
-      permissions: implementationPermissions(),
     },
     "provider-error": {
       mode: "subagent",
       description: "Native provider-error smoke agent",
       model: providerErrorModel,
       system: "Return the requested result if possible. Do not delegate further.",
-      permissions: implementationPermissions(),
     },
   }
-}
-
-function fastPermissions() {
-  return [
-    { action: "*", resource: "*", effect: "deny" },
-    { action: "grep", resource: "*", effect: "allow" },
-    { action: "glob", resource: "*", effect: "allow" },
-    { action: "webfetch", resource: "*", effect: "allow" },
-    { action: "websearch", resource: "*", effect: "allow" },
-    { action: "read", resource: "*", effect: "allow" },
-    { action: "read", resource: "*.env", effect: "ask" },
-    { action: "read", resource: "*.env.*", effect: "ask" },
-    { action: "read", resource: "*.env.example", effect: "allow" },
-    { action: "subagent", resource: "*", effect: "deny" },
-  ]
-}
-
-function implementationPermissions() {
-  return [
-    { action: "*", resource: "*", effect: "allow" },
-    { action: "external_directory", resource: "*", effect: "ask" },
-    { action: "read", resource: "*.env", effect: "ask" },
-    { action: "read", resource: "*.env.*", effect: "ask" },
-    { action: "read", resource: "*.env.example", effect: "allow" },
-    { action: "question", resource: "*", effect: "deny" },
-    { action: "subagent", resource: "*", effect: "deny" },
-  ]
 }
 
 function observerSource(resultPaths, selectedRootModel, configuredTiers, configuredProviderErrorModel) {

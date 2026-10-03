@@ -29,8 +29,8 @@ permissions, and agent modes.
 
 1. Build or install the plugin.
 2. Authenticate providers with `/connect`.
-3. Copy exact model and variant IDs from `/models`.
-4. Add the plugin and native tier agents to `opencode.jsonc`.
+3. Confirm the required model IDs and variants are available in `/models`.
+4. Add the plugin and three minimal native tier-agent stubs to `opencode.jsonc`.
 5. Restart OpenCode and start a new session.
 6. Ask the primary agent to delegate a small task and verify that the child is
    shown as `fast`, `medium`, or `heavy` rather than as `explore` or `general`.
@@ -45,58 +45,18 @@ npm install
 npm run build
 ```
 
-Then configure the package directory and the three native agents:
+Then configure the package directory and the three native agent stubs:
 
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
   "agents": {
-    "fast": {
-      "mode": "subagent",
-      "description": "Focused read-only exploration and research",
-      "model": "openai/gpt-5.6-luna-fast",
-      "system": "Act as a focused, read-only investigator. Return concrete findings with file paths and line references. Do not edit files, run mutating commands, or delegate further.",
-      "permissions": [
-        { "action": "*", "resource": "*", "effect": "deny" },
-        { "action": "grep", "resource": "*", "effect": "allow" },
-        { "action": "glob", "resource": "*", "effect": "allow" },
-        { "action": "read", "resource": "*", "effect": "allow" },
-        { "action": "webfetch", "resource": "*", "effect": "allow" },
-        { "action": "websearch", "resource": "*", "effect": "allow" },
-        { "action": "subagent", "resource": "*", "effect": "deny" }
-      ]
-    },
-    "medium": {
-      "mode": "subagent",
-      "description": "Implementation, refactoring, tests, and ordinary fixes",
-      "model": "openai/gpt-5.6-luna#max",
-      "system": "Act as an implementation specialist. Match existing patterns, make the requested changes, run targeted verification, and report the result. Do not delegate further.",
-      "permissions": [
-        { "action": "subagent", "resource": "*", "effect": "deny" }
-      ]
-    },
-    "heavy": {
-      "mode": "subagent",
-      "description": "Architecture, security, difficult debugging, and high-risk reasoning",
-      "model": "openai/gpt-5.6-sol#medium",
-      "system": "Act as a senior architecture and difficult-debugging specialist. Analyze evidence, state trade-offs, and give a concrete recommendation. Do not delegate further.",
-      "permissions": [
-        { "action": "subagent", "resource": "*", "effect": "deny" }
-      ]
-    }
+    "fast": { "mode": "subagent" },
+    "medium": { "mode": "subagent" },
+    "heavy": { "mode": "subagent" }
   },
   "plugins": [
-    {
-      "package": "/home/me/Workspace/opencode-tiered-dispatch",
-      "options": {
-        "enabled": true,
-        "tiers": {
-          "fast": { "model": "openai/gpt-5.6-luna-fast" },
-          "medium": { "model": "openai/gpt-5.6-luna", "variant": "max" },
-          "heavy": { "model": "openai/gpt-5.6-sol", "variant": "medium" }
-        }
-      }
-    }
+    { "package": "/home/me/Workspace/opencode-tiered-dispatch" }
   ]
 }
 ```
@@ -104,8 +64,10 @@ Then configure the package directory and the three native agents:
 The checkout is a local plugin directory. Its root `index.js` is the required
 OpenCode directory entrypoint and re-exports compiled `dist/`; do not point
 `package` at `dist/index.js`.
+The plugin fills the three stubs with their model, system instructions,
+descriptions, and permission policies at runtime.
 
-The verified OpenAI mapping is:
+The plugin's default OpenAI mapping is:
 
 ```text
 fast   → openai/gpt-5.6-luna-fast
@@ -126,33 +88,29 @@ opencode plugin add opencode-tiered-dispatch
 ```
 
 Use `"package": "opencode-tiered-dispatch"` in the same plugin object and
-keep the native agent definitions. For a local package archive, use the archive
-or installed package directory as the `package` value. Credentials and provider
-subscriptions are never bundled.
+keep only the three native agent stubs. For a local package archive, use the
+archive or installed package directory as the `package` value. Credentials and
+provider subscriptions are never bundled.
 
 ## Configuration
 
 ```ts
 interface RouterOptions {
   enabled?: boolean
-  tiers: {
-    fast: TierOptions
-    medium: TierOptions
-    heavy: TierOptions
-  }
+  tiers?: Partial<Record<"fast" | "medium" | "heavy", TierOptions>>
   taxonomy?: Partial<Record<"fast" | "medium" | "heavy", string[]>>
   directThreshold?: "never" | "trivial"
   logging?: boolean
 }
 
 interface TierOptions {
-  model: string // provider/model
+  model?: string // optional; defaults to the required mapping
   variant?: string
   instructions?: string
 }
 ```
 
-The plugin requires this exact mapping:
+When omitted, the plugin uses this exact mapping:
 
 ```text
 fast   → openai/gpt-5.6-luna-fast
@@ -164,6 +122,10 @@ It validates all three references against the active catalog. The native agent
 definitions are the execution interface, so their model and variant must match
 the corresponding plugin option. `medium` and `heavy` must retain `edit`,
 `write`, and `shell` permissions; `fast` must remain read-only.
+
+The optional `tiers` entries are mainly useful for adding tier-specific
+`instructions`; explicit `model` and `variant` values must still match the
+required mapping.
 
 Custom taxonomy entries extend the defaults and are deduplicated
 case-insensitively. Unknown fields are rejected. With `enabled: false`, the
@@ -196,8 +158,8 @@ into another subagent call.
 - All tier agents deny the `subagent` action, preventing recursion.
 - Native OpenCode owns child-session creation, foreground waiting, cancellation,
   provider errors, metadata, and inspectability.
-- The plugin only owns the routing context-hook registration; unloading it
-  disposes that hook.
+- The plugin owns the routing context-hook and native tier-agent transform;
+  unloading it disposes both registrations.
 - There is no tier escalation or provider fallback.
 
 ## Troubleshooting
@@ -233,11 +195,6 @@ that protocol from tier children. It also verifies native cancellation and
 provider-error outcomes without fallback:
 
 ```bash
-TIERED_DISPATCH_FAST_MODEL=openai/gpt-5.6-luna-fast \
-TIERED_DISPATCH_MEDIUM_MODEL=openai/gpt-5.6-luna \
-TIERED_DISPATCH_MEDIUM_VARIANT=max \
-TIERED_DISPATCH_HEAVY_MODEL=openai/gpt-5.6-sol \
-TIERED_DISPATCH_HEAVY_VARIANT=medium \
 npm run smoke:opencode
 ```
 

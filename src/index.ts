@@ -1,5 +1,6 @@
 import { Plugin } from "@opencode/plugin"
 import type { Context } from "@opencode/plugin/promise/plugin"
+import { TIER_AGENT_DEFINITIONS } from "./agents.js"
 import { assertAgentsAvailable, assertModelsAvailable } from "./catalog.js"
 import { parseOptions } from "./options.js"
 import { buildRoutingProtocol } from "./protocol.js"
@@ -24,6 +25,23 @@ export default Plugin.define({
     const models = modelCatalog.data.map(toModelCatalogEntry)
 
     assertModelsAvailable(options, models)
+
+    const agentRegistration = await ctx.agent.transform((editor) => {
+      for (const tier of TIER_NAMES) {
+        const definition = TIER_AGENT_DEFINITIONS[tier]
+        const configured = options.tiers[tier]
+        editor.update(tier, (agent) => {
+          agent.description = definition.description
+          agent.system = definition.system
+          agent.model = {
+            providerID: configured.modelRef.providerID,
+            id: configured.modelRef.id,
+            ...(configured.variant === undefined ? {} : { variant: configured.variant }),
+          } as unknown as NonNullable<typeof agent.model>
+          agent.permissions = definition.permissions.map((rule) => ({ ...rule }))
+        })
+      }
+    })
 
     const routingProtocol = buildRoutingProtocol(options)
     let agentCatalogPromise: Promise<readonly ReturnType<typeof toAgentCatalogEntry>[]> | undefined
@@ -61,7 +79,7 @@ export default Plugin.define({
     log?.("native tier routing enabled")
 
     return async () => {
-      await disposeAll([contextRegistration.dispose()])
+      await disposeAll([contextRegistration.dispose(), agentRegistration.dispose()])
       log?.("native tier routing disabled")
     }
   },

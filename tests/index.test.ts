@@ -9,33 +9,9 @@ const models = [
 ]
 
 const agents = [
-  {
-    id: "fast",
-    mode: "subagent",
-    model: { providerID: "openai", id: "gpt-5.6-luna-fast" },
-    permissions: [
-      { action: "*", resource: "*", effect: "deny" as const },
-      { action: "subagent", resource: "*", effect: "deny" as const },
-    ],
-  },
-  {
-    id: "medium",
-    mode: "subagent",
-    model: { providerID: "openai", id: "gpt-5.6-luna", variant: "max" },
-    permissions: [
-      { action: "*", resource: "*", effect: "allow" as const },
-      { action: "subagent", resource: "*", effect: "deny" as const },
-    ],
-  },
-  {
-    id: "heavy",
-    mode: "subagent",
-    model: { providerID: "openai", id: "gpt-5.6-sol", variant: "medium" },
-    permissions: [
-      { action: "*", resource: "*", effect: "allow" as const },
-      { action: "subagent", resource: "*", effect: "deny" as const },
-    ],
-  },
+  { id: "fast", mode: "subagent" },
+  { id: "medium", mode: "subagent" },
+  { id: "heavy", mode: "subagent" },
   { id: "build", mode: "primary", permissions: [] },
   { id: "all", mode: "all", permissions: [] },
 ]
@@ -58,8 +34,18 @@ function makeContext(options: Record<string, unknown>): {
     },
     agent: {
       list: vi.fn(async () => ({ data: agents })),
-      transform: vi.fn(async (callback: (editor: { remove(id: string): void }) => void) => {
-        callback({ remove: (id) => removedAgents.push(id) })
+      transform: vi.fn(async (callback: (editor: any) => void) => {
+        callback({
+          list: () => agents,
+          get: (id: string) => agents.find((agent) => agent.id === id),
+          default: () => undefined,
+          update: (id: string, update: (agent: any) => void) => {
+            const agent = agents.find((candidate) => candidate.id === id)
+            if (!agent) throw new Error(`missing agent ${id}`)
+            update(agent)
+          },
+          remove: (id: string) => removedAgents.push(id),
+        })
         return { dispose: vi.fn(async () => undefined) }
       }),
     },
@@ -96,6 +82,11 @@ describe("plugin setup", () => {
     const cleanup = await plugin.setup(fixture.context)
 
     expect(fixture.hookCallbacks).toHaveLength(1)
+    expect(fixture.context.agent.transform).toHaveBeenCalledOnce()
+    expect(agents[0]).toMatchObject({
+      description: "Focused read-only exploration and research",
+      model: { providerID: "openai", id: "gpt-5.6-luna-fast" },
+    })
     const hook = fixture.hookCallbacks[0]!
     const root = { sessionID: "root", agent: "build", tools: {}, system: [] as unknown[] }
     await hook(root)

@@ -46,8 +46,17 @@ describe("parseOptions", () => {
       .toThrow(/unknown field: cost/)
   })
 
-  it("requires all tiers when enabled", () => {
-    expect(() => parseOptions({ tiers: { fast: {}, medium: {}, heavy: undefined } })).toThrow()
+  it("defaults the packaged tier models when tiers are omitted", () => {
+    expect(parseOptions({})).toMatchObject({
+      enabled: true,
+      tiers: {
+        fast: { model: "openai/gpt-5.6-luna-fast" },
+        medium: { model: "openai/gpt-5.6-luna", variant: "max" },
+        heavy: { model: "openai/gpt-5.6-sol", variant: "medium" },
+      },
+    })
+    expect(parseOptions({ tiers: { medium: { instructions: "Keep the patch small" } } }))
+      .toMatchObject({ tiers: { medium: { instructions: "Keep the patch small", model: "openai/gpt-5.6-luna", variant: "max" } } })
   })
 
   it("validates taxonomy values", () => {

@@ -1,5 +1,5 @@
 import { ConfigurationError } from "./errors.js"
-import { assertRequiredTierModel, TIER_NAMES, type TierName } from "./tiers.js"
+import { assertRequiredTierModel, REQUIRED_TIER_MODELS, TIER_NAMES, type TierName } from "./tiers.js"
 
 export interface ModelReference {
   providerID: string
@@ -66,10 +66,15 @@ export function parseModelReference(value: string, path = "model"): ModelReferen
 
 function parseTier(value: unknown, tier: TierName, enforceRequiredModel = true): TierOptions {
   const path = `options.tiers.${tier}`
-  const input = objectAt(value, path)
+  const input = value === undefined ? {} : objectAt(value, path)
   rejectUnknownFields(input, TIER_FIELDS, path)
-  const model = nonEmptyString(input.model, `${path}.model`)
-  const variant = input.variant === undefined ? undefined : nonEmptyString(input.variant, `${path}.variant`)
+  const required = REQUIRED_TIER_MODELS[tier]
+  const model = input.model === undefined
+    ? required.model
+    : nonEmptyString(input.model, `${path}.model`)
+  const variant = input.variant === undefined
+    ? required.variant
+    : nonEmptyString(input.variant, `${path}.variant`)
   const instructions = input.instructions === undefined
     ? undefined
     : nonEmptyString(input.instructions, `${path}.instructions`)
@@ -133,7 +138,7 @@ export function parseOptions(value: unknown): RouterOptions {
     return { enabled: false }
   }
 
-  const tiersInput = objectAt(input.tiers, "options.tiers")
+  const tiersInput = input.tiers === undefined ? {} : objectAt(input.tiers, "options.tiers")
   rejectUnknownFields(tiersInput, new Set(TIER_NAMES), "options.tiers")
 
   return {

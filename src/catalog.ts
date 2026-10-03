@@ -1,4 +1,5 @@
 import { ConfigurationError } from "./errors.js"
+import type { AgentPermissionRule } from "./agents.js"
 import type { EnabledRouterOptions, TierOptions } from "./options.js"
 import { assertRequiredTierModel, TIER_NAMES, type TierName } from "./tiers.js"
 
@@ -17,7 +18,7 @@ export interface AgentCatalogEntry {
   id: string
   mode?: string
   model?: { providerID: string; id: string; variant?: string } | null
-  permissions?: readonly { action: string; resource: string; effect: "allow" | "deny" | "ask" }[]
+  permissions?: readonly AgentPermissionRule[]
 }
 
 export function assertModelsAvailable(
@@ -70,8 +71,6 @@ export function assertAgentsAvailable(
     else assertImplementationPermissions(agentID, permissions)
   }
 }
-
-type AgentPermissionRule = NonNullable<AgentCatalogEntry["permissions"]>[number]
 
 function assertAgentIdentity(agentID: TierName, agent: AgentCatalogEntry | undefined): asserts agent is AgentCatalogEntry {
   if (!agent) throw new ConfigurationError(`Required tier agent ${agentID} is unavailable`)
