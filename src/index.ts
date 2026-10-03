@@ -6,11 +6,10 @@ import { assertAgentsAvailable, assertModelsAvailable } from "./catalog.js"
 import { tierModelOverrideError } from "./invocation.js"
 import { parseOptions, type TierOptions } from "./options.js"
 import {
-  enforcePlanSessionPermissions,
-  findPlanSession,
   PLAN_ORCHESTRATION_TIERS,
   PLAN_READONLY_INSTRUCTION,
   PLAN_READONLY_TOOLS,
+  StatefulPlanSafety,
 } from "./plan-safety.js"
 import { buildRoutingProtocol } from "./protocol.js"
 import { isTierName, TIER_NAMES, type TierName } from "./tiers.js"
@@ -35,7 +34,7 @@ export default Plugin.define({
     assertModelsAvailable(options, models)
 
     const routingProtocol = buildRoutingProtocol(options)
-    const planSessionIDs = new Set<string>()
+    const planSafety = new StatefulPlanSafety(ctx)
     const loadAgents = async (): Promise<readonly ReturnType<typeof toAgentCatalogEntry>[]> => {
       const catalog = await ctx.agent.list()
       const agents = catalog.data.map(toAgentCatalogEntry)
@@ -63,9 +62,15 @@ export default Plugin.define({
       }))
 
       registrations.push(await ctx.tool.hook("execute.before", async (event) => {
-        const planSession = event.sessionID === undefined
-          ? undefined
-          : await findPlanSession(ctx, event.sessionID, event.agent, planSessionIDs)
+        let planSession: Awaited<ReturnType<StatefulPlanSafety["inspect"]>> | undefined
+        if (event.sessionID !== undefined) {
+          try {
+            planSession = await planSafety.inspect(event.sessionID, event.agent)
+          } catch (error) {
+            if (event.agent === "plan" || isTierName(event.agent)) throw error
+            log?.("could not inspect session ancestry; normal tool execution continues", error)
+          }
+        }
         if (planSession?.owned && event.tool !== "subagent" && !PLAN_READONLY_TOOLS.has(event.tool)) {
           throw new Error(`Plan-originated sessions are read-only; tool ${event.tool} is not permitted`)
         }
@@ -74,45 +79,72 @@ export default Plugin.define({
         const violation = tierModelOverrideError(event.input)
         if (violation !== undefined) throw new Error(violation)
 
-        if (!planSession?.owned || event.sessionID === undefined) return
-        await enforcePlanSessionPermissions(ctx, event.sessionID, planSession.session)
-
         const input = asRecord(event.input)
         const targetAgent = input?.agent
         const continuedSessionID = input?.sessionID
-        if (targetAgent !== undefined) {
-          if (typeof targetAgent !== "string" || !PLAN_ORCHESTRATION_TIERS.has(targetAgent)) {
-            throw new Error("Plan can orchestrate only the fast, medium, and heavy plugin tiers")
+        if (planSession?.owned && event.sessionID !== undefined) {
+          if (targetAgent !== undefined) {
+            if (typeof targetAgent !== "string" || !PLAN_ORCHESTRATION_TIERS.has(targetAgent)) {
+              throw new Error("Plan can orchestrate only the fast, medium, and heavy plugin tiers")
+            }
+          } else if (typeof continuedSessionID !== "string") {
+            throw new Error("Plan subagent calls must target a plugin tier or continue a verified tier session")
           }
-        } else if (typeof continuedSessionID !== "string") {
-          throw new Error("Plan subagent calls must target a plugin tier or continue a verified tier session")
+
+          if (typeof continuedSessionID === "string") {
+            if (continuedSessionID === event.sessionID) {
+              throw new Error("Plan cannot continue its own session")
+            }
+            const continued = await planSafety.inspect(continuedSessionID)
+            if (!continued.owned) {
+              throw new Error("Plan can continue only a session whose read-only ancestry can be verified")
+            }
+            if (
+              targetAgent === undefined
+              && !isTierName(continued.effectiveAgent ?? continued.session.agent)
+            ) {
+              throw new Error("Plan can continue only a verified fast, medium, or heavy tier session")
+            }
+          }
+
+          // The root marker is the inheritance handoff. It contains no real
+          // tool deny rule, so keeping it on the root does not poison the
+          // host's pre-context tool snapshot. If an external edit removed it,
+          // do not overwrite that edit here: the child still becomes owned by
+          // the current Plan ancestry when its context is inspected.
+          return
         }
 
-        if (typeof continuedSessionID !== "string") return
-        const continued = await findPlanSession(ctx, continuedSessionID, undefined, planSessionIDs)
-        if (!continued.owned) {
-          throw new Error("Plan can continue only a session whose read-only ancestry can be verified")
+        // Native subagent calls made by ordinary sessions must use the native
+        // agent input. Continuation-only calls are reserved for verified Plan
+        // orchestration above.
+        if (typeof targetAgent !== "string" || targetAgent.trim() === "") {
+          throw new Error("Native subagent calls must provide input.agent")
         }
-        if (targetAgent === undefined && !isTierName(continued.session.agent)) {
-          throw new Error("Plan can continue only a verified fast, medium, or heavy tier session")
-        }
-        await enforcePlanSessionPermissions(ctx, continuedSessionID, continued.session)
+      }))
+
+      registrations.push(await ctx.session.hook("prompt", async (event) => {
+        await planSafety.preflight(event.sessionID)
       }))
 
       registrations.push(await ctx.session.hook("context", async (event) => {
-        let planSession: Awaited<ReturnType<typeof findPlanSession>> | undefined
+        let planSession: Awaited<ReturnType<StatefulPlanSafety["inspect"]>> | undefined
         try {
-          planSession = await findPlanSession(ctx, event.sessionID, event.agent, planSessionIDs)
+          planSession = await planSafety.inspect(event.sessionID, event.agent)
         } catch (error) {
           if (event.agent === "plan" || isTierName(event.agent)) throw error
           log?.("could not inspect session ancestry; routing guidance omitted", error)
           return
         }
         if (planSession.owned) {
-          await enforcePlanSessionPermissions(ctx, event.sessionID, planSession.session)
-          if (isTierName(event.agent)) {
-            const instructions = options.tiers[event.agent as TierName].instructions
-            if (instructions !== undefined) event.system.push({ type: "text", text: instructions })
+          for (const tool of Object.keys(event.tools)) {
+            if (tool !== "subagent" && !PLAN_READONLY_TOOLS.has(tool)) delete event.tools[tool]
+          }
+          if (planSession.kind === "descendant") {
+            if (isTierName(event.agent)) {
+              const instructions = options.tiers[event.agent as TierName].instructions
+              if (instructions !== undefined) event.system.push({ type: "text", text: instructions })
+            }
             event.system.push({ type: "text", text: PLAN_READONLY_INSTRUCTION })
           }
           return
@@ -136,13 +168,13 @@ export default Plugin.define({
         event.system.push({ type: "text", text: routingProtocol })
       }))
     } catch (error) {
-      await rollbackRegistrations(registrations, error)
+      await rollbackRegistrations(registrations, planSafety, error)
     }
 
     log?.("native tier routing enabled")
 
     return async () => {
-      await disposeRegistrations(registrations)
+      await disposePlugin(registrations, planSafety)
       log?.("native tier routing disabled")
     }
   },
@@ -197,9 +229,13 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined
 }
 
-async function rollbackRegistrations(registrations: readonly Registration[], setupError: unknown): Promise<never> {
+async function rollbackRegistrations(
+  registrations: readonly Registration[],
+  planSafety: StatefulPlanSafety,
+  setupError: unknown,
+): Promise<never> {
   try {
-    await disposeRegistrations(registrations)
+    await disposePlugin(registrations, planSafety)
   } catch (cleanupError) {
     throw new AggregateError(
       [setupError, cleanupError],
@@ -207,6 +243,28 @@ async function rollbackRegistrations(registrations: readonly Registration[], set
     )
   }
   throw setupError
+}
+
+async function disposePlugin(
+  registrations: readonly Registration[],
+  planSafety: StatefulPlanSafety,
+): Promise<void> {
+  const failures: unknown[] = []
+  try {
+    // Unregister hooks first. A still-live hook must not race a permission
+    // restoration and observe a half-reconciled session.
+    await disposeRegistrations(registrations)
+  } catch (error) {
+    failures.push(error)
+  }
+  try {
+    await planSafety.dispose()
+  } catch (error) {
+    failures.push(error)
+  }
+  if (failures.length === 0) return
+  if (failures.length === 1) throw failures[0]
+  throw new AggregateError(failures, "Tiered Dispatch cleanup failed")
 }
 
 async function disposeRegistrations(registrations: readonly Registration[]): Promise<void> {

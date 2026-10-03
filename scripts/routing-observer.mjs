@@ -1,3 +1,5 @@
+import { routingLinkageHelperSource } from "./routing-linkage.mjs"
+
 /**
  * Generate the plugin used by the routing evaluator.  The generated code is
  * intentionally an observer: it records native events and runs the fixture's
@@ -14,9 +16,11 @@ import {
   resolveRoutingCommandDirectory,
   restoreRoutingFixture,
   fingerprintRoutingWorkspace,
+  snapshotRoutingCommandDirectory,
   snapshotInfrastructure,
   snapshotRoutingWorkspace,
 } from ${JSON.stringify(fixtureModule)}
+ ${routingLinkageHelperSource()}
 
 const markerPath = ${JSON.stringify(paths.marker)}
 const resultPath = ${JSON.stringify(paths.result)}
@@ -28,7 +32,7 @@ const nodeBinary = ${JSON.stringify(nodeBinary)}
 const scenarios = ${JSON.stringify(scenarios)}
 const arm = ${JSON.stringify(arm)}
 const hideRootSubagent = ${JSON.stringify(hideRootSubagent)}
-const fixtureRootPermission = [{ permission: "external_directory", pattern: "*", action: "deny" }]
+const fixtureRootPermissions = [{ action: "external_directory", resource: "*", effect: "deny" }]
 
 function clone(value) {
   if (value === undefined) return undefined
@@ -87,10 +91,6 @@ function writeProgress(entry) {
   } catch (error) {
     process.stderr.write("routing observer progress journal unavailable: " + (error?.message ?? String(error)) + "\\n")
   }
-}
-
-function toolIdentity(event) {
-  return String(event.sessionID) + "/" + String(event.messageID) + "/" + String(event.id) + "/" + String(event.tool)
 }
 
 function fingerprintChanges(before, after) {
@@ -160,10 +160,6 @@ function absoluteChangedFiles(workspace, before, after) {
   return diffRoutingSnapshots(before, after).map((path) => join(workspace, path))
 }
 
-function commandSnapshotDirectory(input, workspace) {
-  return resolveRoutingCommandDirectory(input, workspace).directory ?? workspace
-}
-
 function changedConstraintProblems(scenario, workspace, changedFiles) {
   const changedRelative = changedFiles.map((path) => path.slice(workspace.length + 1))
   if (scenario.id === "known-scope") {
@@ -219,12 +215,16 @@ async function inspectSessions(ctx, sessionIDs, contextRecords, shouldStop = () 
   return sessions
 }
 
-async function waitForTerminalSessions(ctx, sessionIDs, shouldStop = () => false) {
+async function waitForTerminalSessions(ctx, sessionIDs, shouldStop = () => false, additionalSessionIDs = () => []) {
+  const observed = new Set([...sessionIDs].filter((sessionID) => typeof sessionID === "string" && sessionID.length > 0))
   const deadline = Date.now() + 5_000
   let latest = []
   while (Date.now() < deadline) {
+    for (const sessionID of additionalSessionIDs()) {
+      if (typeof sessionID === "string" && sessionID.length > 0) observed.add(sessionID)
+    }
     latest = []
-    for (const sessionID of [...new Set(sessionIDs)]) {
+    for (const sessionID of observed) {
       if (shouldStop()) throw new Error("routing observer cleanup was requested during terminal-session checks")
       const remaining = deadline - Date.now()
       if (remaining <= 0) {
@@ -240,7 +240,18 @@ async function waitForTerminalSessions(ctx, sessionIDs, shouldStop = () => false
         latest.push(sessionID)
       }
     }
-    if (latest.length === 0) return
+    if (latest.length === 0) {
+      // Allow synchronous context hooks and one queued native event to land
+      // before declaring the set terminal.  A child observed in this quiet
+      // window must be included before verifier work or fixture reset.
+      await flushObserver()
+      const beforeSize = observed.size
+      for (const sessionID of additionalSessionIDs()) {
+        if (typeof sessionID === "string" && sessionID.length > 0) observed.add(sessionID)
+      }
+      if (observed.size === beforeSize) return
+      continue
+    }
     await new Promise((resolve) => setTimeout(resolve, 50))
   }
   throw new Error("background native sessions remained alive before verifier checks: " + resultText(latest))
@@ -287,11 +298,11 @@ function toolErrorMetrics(toolEvents, workspace, rootSessionID) {
     byTool,
     deniedExternalReadCount: deniedExternalReads.length,
     otherErrorCount: errors.length - deniedExternalReads.length,
-    deniedExternalReadIdentities: deniedExternalReads.map(toolIdentity),
+    deniedExternalReadIdentities: deniedExternalReads.map(toolIdentity).filter((identity) => identity !== undefined),
     nonzeroShellExitCount: nonzeroShellExits.length,
     nonzeroShellExitBySession,
     nonzeroShellExitByRole,
-    nonzeroShellExitIdentities: nonzeroShellExits.map(toolIdentity),
+    nonzeroShellExitIdentities: nonzeroShellExits.map(toolIdentity).filter((identity) => identity !== undefined),
   }
 }
 
@@ -304,6 +315,7 @@ export default {
     const verificationSnapshots = []
     const activeSessions = new Set()
     const inspectedSessions = []
+    let currentScenarioSessionIDs
     let progressState = {
       phase: "setup",
       scenarioID: null,
@@ -315,6 +327,36 @@ export default {
     let sequence = 0
     let stopping = false
     let continuation
+    let cleanupPromise
+
+    function cleanupActiveSessions() {
+      cleanupPromise ??= (async () => {
+        const attempted = new Set()
+        const errors = []
+        while (true) {
+          const pending = [...activeSessions].filter((sessionID) => !attempted.has(sessionID))
+          if (pending.length === 0) {
+            // A native interrupt can synchronously flush one last context or
+            // completion event.  Give that event a turn before declaring
+            // cleanup complete, otherwise a late child could survive into
+            // the next scenario.
+            await flushObserver()
+            if ([...activeSessions].some((sessionID) => !attempted.has(sessionID))) continue
+            break
+          }
+          for (const sessionID of pending) {
+            attempted.add(sessionID)
+            try {
+              await requestWithTimeout(() => ctx.session.interrupt({ sessionID, resume: false }), 5_000, "session interrupt timed out during observer cleanup")
+            } catch (error) {
+              errors.push({ sessionID, message: error?.message ?? String(error) })
+            }
+          }
+        }
+        return errors
+      })()
+      return cleanupPromise
+    }
 
     function checkpoint(phase, fields = {}) {
       progressState = {
@@ -333,6 +375,10 @@ export default {
         // This observer remains an independent .opencode/plugins plugin; it
         // does not change the tiered arm or the plugin under measurement.
         delete event.tools.subagent
+      }
+      if (typeof event.sessionID === "string" && event.sessionID.length > 0) {
+        activeSessions.add(event.sessionID)
+        currentScenarioSessionIDs?.add(event.sessionID)
       }
       const record = { seq: sequence++, observedAt: Date.now(), sessionID: event.sessionID, finalized: false }
       contexts.push(record)
@@ -363,20 +409,36 @@ export default {
     }))
     for (const phase of ["before", "after"]) {
       registrations.push(await ctx.tool.hook("execute." + phase, (event) => {
+        if (typeof event.sessionID === "string" && event.sessionID.length > 0) {
+          activeSessions.add(event.sessionID)
+          currentScenarioSessionIDs?.add(event.sessionID)
+        }
+        const structuredChildID = event.result?.output?.sessionID
+        if (phase === "after" && typeof structuredChildID === "string" && structuredChildID.length > 0) {
+          activeSessions.add(structuredChildID)
+          currentScenarioSessionIDs?.add(structuredChildID)
+        }
         if (event.tool === "shell") {
           const identity = toolIdentity(event)
-          if (phase === "before") {
+          if (identity !== undefined && phase === "before") {
+            const observation = snapshotRoutingCommandDirectory(event.input, ctx.location.directory)
             verificationSnapshots.push({
               identity,
               sessionID: event.sessionID,
               command: clone(event.input?.command),
-               before: fingerprintRoutingWorkspace(commandSnapshotDirectory(event.input, ctx.location.directory)),
+              before: observation.fingerprint,
+              beforeProblems: observation.problems,
             })
-          } else {
+          } else if (identity !== undefined) {
             const snapshot = [...verificationSnapshots].reverse().find((candidate) => candidate.identity === identity && candidate.after === undefined)
             if (snapshot !== undefined) {
-               snapshot.after = fingerprintRoutingWorkspace(commandSnapshotDirectory(event.input, ctx.location.directory))
-              snapshot.changedFiles = fingerprintChanges(snapshot.before, snapshot.after)
+              const observation = snapshotRoutingCommandDirectory(event.input, ctx.location.directory)
+              snapshot.after = observation.fingerprint
+              snapshot.afterProblems = observation.problems
+              snapshot.snapshotProblems = [...(snapshot.beforeProblems ?? []), ...(snapshot.afterProblems ?? [])]
+              if (snapshot.before !== undefined && snapshot.after !== undefined) {
+                snapshot.changedFiles = fingerprintChanges(snapshot.before, snapshot.after)
+              }
             }
           }
         }
@@ -428,6 +490,15 @@ export default {
         for (const scenario of scenarios) {
           if (stopping) throw new Error("routing observer cleanup was requested before scenario start")
           checkpoint("scenario-start", { scenarioID: scenario.id, rootSessionID: null, contextSeq: null, toolSeq: null })
+          // A context observed after the previous result was written is an
+          // orphan until proven terminal.  Settle it before touching the
+          // fixture for the next scenario; never reset underneath a live
+          // native session.
+          if (activeSessions.size > 0) {
+            checkpoint("pre-reset-session-check", { scenarioID: scenario.id })
+            await waitForTerminalSessions(ctx, [...activeSessions], () => stopping, () => [...activeSessions])
+            activeSessions.clear()
+          }
           checkpoint("fixture-reset", { scenarioID: scenario.id })
           // Never restore while a detached child could still be reading or
           // writing the fixture. A pending result stops the run below.
@@ -440,14 +511,17 @@ export default {
           const totalStart = Date.now()
           const executionStart = Date.now()
           checkpoint("session-create", { scenarioID: scenario.id })
+          const scenarioSessionIDs = new Set()
+          currentScenarioSessionIDs = scenarioSessionIDs
           const root = await ctx.session.create({
             title: "[routing eval] " + scenario.id,
             agent: "build",
             model: rootModel,
             location: { directory: ctx.location.directory },
-            permission: fixtureRootPermission,
+            permissions: fixtureRootPermissions,
           })
           activeSessions.add(root.id)
+          scenarioSessionIDs.add(root.id)
           checkpoint("prompt", { scenarioID: scenario.id, rootSessionID: root.id })
           await ctx.session.prompt({ sessionID: root.id, text: scenario.text })
           if (stopping) throw new Error("routing observer cleanup was requested after root prompt")
@@ -464,13 +538,48 @@ export default {
             .filter((event) => event.phase === "after" && event.tool === "subagent" && event.resultOutput?.sessionID)
             .map((event) => event.resultOutput.sessionID)
           for (const sessionID of outputSessionIDs) activeSessions.add(sessionID)
+          for (const sessionID of outputSessionIDs) scenarioSessionIDs.add(sessionID)
           const pending = pendingDispatches(scenarioTools)
           if (pending.length > 0) {
             throw new Error("pending/background native delegation is unverifiable; stopping before fixture reset: " + resultText(pending))
           }
           checkpoint("terminal-session-check", { scenarioID: scenario.id, rootSessionID: root.id })
-          await waitForTerminalSessions(ctx, [root.id, ...outputSessionIDs], () => stopping)
+          await waitForTerminalSessions(ctx, [root.id, ...outputSessionIDs], () => stopping, () => [...scenarioSessionIDs])
           if (stopping) throw new Error("routing observer cleanup was requested after terminal-session checks")
+
+          const scenarioContextRecords = contexts.slice(contextStart)
+          const sessionIDs = [root.id, ...outputSessionIDs, ...scenarioSessionIDs, ...scenarioContextRecords.map((event) => event.sessionID)]
+          checkpoint("session-inspection", { scenarioID: scenario.id, rootSessionID: root.id })
+          const sessions = await inspectSessions(ctx, sessionIDs, scenarioContextRecords, () => stopping)
+          inspectedSessions.push(...clone(sessions))
+          if (stopping) throw new Error("routing observer cleanup was requested during session inspection")
+          const inspectionProblems = sessions
+            .filter((session) => session.inspectionError !== undefined && session.inspectionError !== null)
+            .map((session) => "session " + session.sessionID + " has inspectionError: " + session.inspectionError)
+          const unresolvedSessions = sessions.filter((session) => !session.outcome)
+          if (inspectionProblems.length > 0) {
+            throw new Error("native session inspection failed before fixture verification: " + resultText(inspectionProblems))
+          }
+          if (unresolvedSessions.length > 0) {
+            throw new Error("native sessions did not reach a terminal outcome before fixture verification: " + resultText(unresolvedSessions.map((session) => session.sessionID)))
+          }
+          const nativeDispatches = scenarioTools
+            .filter((event) => event.phase === "before" && event.sessionID === root.id && event.tool === "subagent")
+            .sort((left, right) => (sequenceOf(left) ?? Number.POSITIVE_INFINITY) - (sequenceOf(right) ?? Number.POSITIVE_INFINITY))
+          const linkageGate = validateNativeLinkage({
+            dispatches: nativeDispatches,
+            tools: scenarioTools,
+            sessions,
+            contexts: scenarioContextRecords,
+            rootSessionID: root.id,
+            requireCompleted: true,
+            validateTierModels: false,
+          })
+          const nativeToolProblems = validateNativeToolEvidence(scenarioTools, root.id)
+          const nativeGateProblems = [...new Set([...linkageGate.problems, ...nativeToolProblems])]
+          if (nativeGateProblems.length > 0) {
+            throw new Error("native linkage gate failed before fixture verification: " + resultText(nativeGateProblems))
+          }
 
           const afterExecution = snapshotRoutingWorkspace(ctx.location.directory)
           const executionFingerprint = fingerprintRoutingWorkspace(ctx.location.directory)
@@ -502,6 +611,9 @@ export default {
             command: snapshot.command,
             before: snapshot.before,
             after: snapshot.after,
+            beforeProblems: snapshot.beforeProblems,
+            afterProblems: snapshot.afterProblems,
+            snapshotProblems: snapshot.snapshotProblems,
             changedFiles: snapshot.changedFiles,
           }))
           for (const snapshot of scenarioVerificationSnapshots) {
@@ -524,20 +636,7 @@ export default {
             controlUnchanged: verifierControlChanges.length === 0,
           }
 
-          const rootEvent = contexts.slice(contextStart).find((event) => event.sessionID === root.id)
-          const sessionIDs = [root.id, ...outputSessionIDs, ...contexts.slice(contextStart).map((event) => event.sessionID)]
-          checkpoint("session-inspection", { scenarioID: scenario.id, rootSessionID: root.id })
-          const sessions = await inspectSessions(ctx, sessionIDs, contexts.slice(contextStart), () => stopping)
-          inspectedSessions.push(...clone(sessions))
-          if (stopping) throw new Error("routing observer cleanup was requested during session inspection")
-          const unresolvedRoot = sessions.find((session) => session.sessionID === root.id && !session.outcome)
-          if (unresolvedRoot !== undefined) {
-            throw new Error("root session did not reach a terminal outcome before fixture reset: " + resultText(unresolvedRoot))
-          }
-          const unresolvedSessions = sessions.filter((session) => session.sessionID !== root.id && !session.outcome)
-          if (unresolvedSessions.length > 0) {
-            throw new Error("background native sessions remained alive before reset; stopping evaluation: " + resultText(unresolvedSessions.map((session) => session.sessionID)))
-          }
+           const rootEvent = scenarioContextRecords.find((event) => event.sessionID === root.id)
           const elapsedMs = Date.now() - totalStart
           const harnessOverheadMs = Math.max(0, elapsedMs - executionElapsedMs - verifierElapsedMs)
           const scenarioResult = {
@@ -553,7 +652,7 @@ export default {
             tools: clone(scenarioTools),
             contexts: clone(contexts.slice(contextStart)),
             sessions,
-            rootSessionPermissions: clone(fixtureRootPermission),
+            rootSessionPermissions: clone(fixtureRootPermissions),
             toolErrorMetrics: toolErrorMetrics(scenarioTools, ctx.location.directory, root.id),
             changedFiles,
             verifierChangedFiles,
@@ -567,7 +666,7 @@ export default {
               tools: clone(scenarioTools),
               contexts: clone(contexts.slice(contextStart)),
               sessions: clone(sessions),
-              rootSessionPermissions: clone(fixtureRootPermission),
+              rootSessionPermissions: clone(fixtureRootPermissions),
               toolErrorMetrics: clone(toolErrorMetrics(scenarioTools, ctx.location.directory, root.id)),
               fixtureProblems: clone(fixtureProblems),
               fixtureVerification: clone(fixtureVerification),
@@ -592,13 +691,15 @@ export default {
             result: clone(scenarioResult),
           })
           activeSessions.delete(root.id)
-          for (const sessionID of outputSessionIDs) activeSessions.delete(sessionID)
+          for (const sessionID of scenarioSessionIDs) activeSessions.delete(sessionID)
+          if (currentScenarioSessionIDs === scenarioSessionIDs) currentScenarioSessionIDs = undefined
         }
         if (stopping) throw new Error("routing observer cleanup was requested before result write")
         checkpoint("complete", { scenarioID: null, rootSessionID: null, completedScenarioCount: results.length })
         writeFileSync(resultPath, JSON.stringify(results))
       } catch (error) {
         const failedFrom = { ...progressState }
+        stopping = true
         checkpoint("failure", {
           error: compactText(error?.message ?? String(error)),
           failedFromPhase: failedFrom.phase,
@@ -616,6 +717,7 @@ export default {
           tools: clone(tools),
           contexts: clone(contexts),
           sessions: clone(inspectedSessions),
+          cleanupErrors: await cleanupActiveSessions(),
         }))
       } finally {
         resolveContinuation()
@@ -624,11 +726,7 @@ export default {
 
     return async () => {
       stopping = true
-      for (const sessionID of [...activeSessions]) {
-        try {
-          await requestWithTimeout(() => ctx.session.interrupt({ sessionID, resume: false }), 5_000, "session interrupt timed out during observer cleanup")
-        } catch {}
-      }
+      await cleanupActiveSessions()
       if (continuation !== undefined) {
         try { await Promise.race([continuation, new Promise((resolve) => setTimeout(resolve, 5_000))]) } catch {}
       }

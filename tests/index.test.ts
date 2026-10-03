@@ -8,6 +8,7 @@ import { modelCatalog, requiredTierOptions, tierModel } from "./tier-fixtures.js
 const models = modelCatalog()
 
 type ContextEvent = { sessionID: string; agent: string; tools: Record<string, unknown>; system: unknown[] }
+type PromptEvent = { sessionID: string }
 type ToolEvent = { tool: string; sessionID?: string; agent?: string; input: unknown }
 type FixtureAgent = AgentCatalogEntry & {
   permissions: NonNullable<AgentCatalogEntry["permissions"]>
@@ -21,7 +22,7 @@ type FixtureAgent = AgentCatalogEntry & {
 interface FixtureFailures {
   toolHook?: Error
   contextHook?: Error
-  dispose?: Partial<Record<"agent" | "tool" | "context", Error>>
+  dispose?: Partial<Record<"agent" | "tool" | "prompt" | "context", Error>>
 }
 
 function makeContext(options: Record<string, unknown>, failures: FixtureFailures = {}): {
@@ -30,9 +31,16 @@ function makeContext(options: Record<string, unknown>, failures: FixtureFailures
   setAgentCatalog: (agents: FixtureAgent[]) => void
   setSession: (sessionID: string, session: { parentID?: string; agent?: string }) => void
   setSessionPermissions: (sessionID: string, permissions: FixtureAgent["permissions"]) => void
+  getSessionPermissions: (sessionID: string) => FixtureAgent["permissions"] | undefined
   hookCallbacks: Array<(event: ContextEvent) => void | Promise<void>>
+  promptHookCallbacks: Array<(event: PromptEvent) => void | Promise<void>>
   toolHookCallbacks: Array<(event: ToolEvent) => void | Promise<void>>
-  disposes: { agent: ReturnType<typeof vi.fn>; tool: ReturnType<typeof vi.fn>; context: ReturnType<typeof vi.fn> }
+  disposes: {
+    agent: ReturnType<typeof vi.fn>
+    tool: ReturnType<typeof vi.fn>
+    prompt: ReturnType<typeof vi.fn>
+    context: ReturnType<typeof vi.fn>
+  }
   disposalOrder: string[]
   removedAgents: string[]
 } {
@@ -55,6 +63,7 @@ function makeContext(options: Record<string, unknown>, failures: FixtureFailures
   ])
   const sessionPermissions = new Map<string, FixtureAgent["permissions"]>()
   const hookCallbacks: Array<(event: ContextEvent) => void | Promise<void>> = []
+  const promptHookCallbacks: Array<(event: PromptEvent) => void | Promise<void>> = []
   const toolHookCallbacks: Array<(event: ToolEvent) => void | Promise<void>> = []
   const removedAgents: string[] = []
   const disposalOrder: string[] = []
@@ -66,6 +75,10 @@ function makeContext(options: Record<string, unknown>, failures: FixtureFailures
     tool: vi.fn(async () => {
       disposalOrder.push("tool")
       if (failures.dispose?.tool) throw failures.dispose.tool
+    }),
+    prompt: vi.fn(async () => {
+      disposalOrder.push("prompt")
+      if (failures.dispose?.prompt) throw failures.dispose.prompt
     }),
     context: vi.fn(async () => {
       disposalOrder.push("context")
@@ -121,12 +134,15 @@ function makeContext(options: Record<string, unknown>, failures: FixtureFailures
         sessionPermissions.set(sessionID, permissions)
       }),
       hook: vi.fn(async (
-        name: "context",
-        callback: (event: ContextEvent) => void | Promise<void>,
+        name: "prompt" | "context",
+        callback: ((event: ContextEvent) => void | Promise<void>) | ((event: PromptEvent) => void | Promise<void>),
       ) => {
-        expect(name).toBe("context")
+        if (name === "prompt") {
+          promptHookCallbacks.push(callback as (event: PromptEvent) => void | Promise<void>)
+          return { dispose: disposes.prompt }
+        }
         if (failures.contextHook) throw failures.contextHook
-        hookCallbacks.push(callback)
+        hookCallbacks.push(callback as (event: ContextEvent) => void | Promise<void>)
         return { dispose: disposes.context }
       }),
     },
@@ -137,7 +153,9 @@ function makeContext(options: Record<string, unknown>, failures: FixtureFailures
     setAgentCatalog: (next) => { agentCatalog = next },
     setSession: (sessionID, session) => { sessionInfo.set(sessionID, session) },
     setSessionPermissions: (sessionID, permissions) => { sessionPermissions.set(sessionID, permissions) },
+    getSessionPermissions: (sessionID) => sessionPermissions.get(sessionID),
     hookCallbacks,
+    promptHookCallbacks,
     toolHookCallbacks,
     disposes,
     disposalOrder,
@@ -177,6 +195,8 @@ describe("plugin setup", () => {
     expect(fixture.context.agent.list).toHaveBeenCalledOnce()
 
     const child = { sessionID: "child", agent: "fast", tools: {}, system: [] as unknown[] }
+    await fixture.promptHookCallbacks[0]!({ sessionID: "child" })
+    expect(fixture.getSessionPermissions("child")).toBeUndefined()
     await hook(child)
     expect(child.system).toEqual([])
     expect(fixture.context.agent.list).toHaveBeenCalledTimes(2)
@@ -193,8 +213,9 @@ describe("plugin setup", () => {
 
     expect(cleanup).toBeTypeOf("function")
     if (typeof cleanup === "function") await cleanup()
-    expect(fixture.disposalOrder).toEqual(["context", "tool", "agent"])
+    expect(fixture.disposalOrder).toEqual(["context", "prompt", "tool", "agent"])
     expect(fixture.disposes.context).toHaveBeenCalledOnce()
+    expect(fixture.disposes.prompt).toHaveBeenCalledOnce()
     expect(fixture.disposes.tool).toHaveBeenCalledOnce()
     expect(fixture.disposes.agent).toHaveBeenCalledOnce()
   })
@@ -234,7 +255,7 @@ describe("plugin setup", () => {
     expect(fixture.disposalOrder).toEqual([])
   })
 
-  it("lets Plan dispatch every tier while making its sessions read-only", async () => {
+  it("lets Plan dispatch every tier while marking roots and hardening descendants", async () => {
     const fixture = makeContext(options)
     const cleanup = await plugin.setup(fixture.context)
     const plan = fixture.agents.find((agent) => agent.id === "plan")
@@ -247,39 +268,71 @@ describe("plugin setup", () => {
     ])
 
     const hook = fixture.hookCallbacks[0]!
-    const planContext = { sessionID: "plan-root", agent: "plan", tools: {}, system: [] as unknown[] }
+    const planContext = {
+      sessionID: "plan-root",
+      agent: "plan",
+      tools: {
+        read: {},
+        question: {},
+        skill: {},
+        subagent: {},
+        edit: {},
+        unknown: {},
+      },
+      system: [] as unknown[],
+    }
     await hook(planContext)
     expect(planContext.system).toEqual([])
+    expect(Object.keys(planContext.tools).sort()).toEqual(["question", "read", "skill", "subagent"])
     expect(fixture.context.agent.list).not.toHaveBeenCalled()
 
     const planRules = vi.mocked(fixture.context.session.update).mock.calls[0]?.[0].permissions
-    expect(planRules).toEqual(expect.arrayContaining([
+    expect(planRules).toEqual([
       { action: "read", resource: "private.txt", effect: "deny" },
       { action: "edit", resource: "*", effect: "allow" },
-      { action: "*", resource: "*", effect: "deny" },
-      { action: "read", resource: "*", effect: "allow" },
+      { action: "subagent", resource: "tiered-dispatch.plan-origin/v1/start", effect: "deny" },
+      { action: "subagent", resource: "tiered-dispatch.plan-origin/v1/end", effect: "deny" },
+    ])
+    if (!planRules) throw new Error("Plan session permissions were not updated")
+
+    // The host snapshots child tools before the context hook. Prompt
+    // preflight must therefore replace the inherited root marker first.
+    fixture.setSessionPermissions("plan-child", planRules)
+    await fixture.promptHookCallbacks[0]!({ sessionID: "plan-child" })
+    const childSnapshotRules = fixture.getSessionPermissions("plan-child")
+    expect(childSnapshotRules).toEqual(expect.arrayContaining([
+      { action: "question", resource: "*", effect: "allow" },
+      { action: "skill", resource: "*", effect: "allow" },
+      { action: "subagent", resource: "*", effect: "ask" },
+      { action: "subagent", resource: "fast", effect: "allow" },
       { action: "subagent", resource: "medium", effect: "allow" },
       { action: "subagent", resource: "heavy", effect: "allow" },
     ]))
-    if (!planRules) throw new Error("Plan session permissions were not updated")
-    expect([...planRules].reverse().find((rule) => rule.action === "edit" || rule.action === "*")?.effect)
-      .toBe("deny")
-    expect([...planRules].reverse().find(
-      (rule) => rule.action === "read" && (rule.resource === "private.txt" || rule.resource === "*"),
-    )?.effect).toBe("deny")
 
     const guard = fixture.toolHookCallbacks[0]!
     for (const agent of ["fast", "medium", "heavy"]) {
       await expect(guard({ tool: "subagent", sessionID: "plan-root", agent: "plan", input: { agent } }))
         .resolves.toBeUndefined()
     }
+    for (const tool of ["question", "skill"]) {
+      await expect(guard({ tool, sessionID: "plan-root", agent: "plan", input: {} }))
+        .resolves.toBeUndefined()
+    }
+    await expect(guard({ tool: "unknown", sessionID: "plan-root", agent: "plan", input: {} }))
+      .rejects.toThrow(/sessions are read-only/)
     await expect(guard({ tool: "subagent", sessionID: "root", agent: "build", input: { agent: "medium" } }))
       .resolves.toBeUndefined()
     await expect(guard({ tool: "subagent", sessionID: "root", agent: "customactor", input: { agent: "medium" } }))
       .resolves.toBeUndefined()
 
-    const childContext = { sessionID: "plan-child", agent: "medium", tools: {}, system: [] as unknown[] }
+    const childContext = {
+      sessionID: "plan-child",
+      agent: "medium",
+      tools: { read: {}, question: {}, skill: {}, subagent: {}, edit: {}, unknown: {} },
+      system: [] as unknown[],
+    }
     await hook(childContext)
+    expect(Object.keys(childContext.tools).sort()).toEqual(["question", "read", "skill", "subagent"])
     expect(childContext.system).toEqual([{
       type: "text",
       text: PLAN_READONLY_INSTRUCTION,
@@ -288,6 +341,19 @@ describe("plugin setup", () => {
       .resolves.toBeUndefined()
     await expect(guard({ tool: "subagent", sessionID: "plan-child", agent: "medium", input: { agent: "fast" } }))
       .resolves.toBeUndefined()
+    fixture.setSession("plan-child", { parentID: "plan-root", agent: "custom" })
+    await expect(guard({
+      tool: "subagent",
+      sessionID: "plan-root",
+      agent: "plan",
+      input: { sessionID: "plan-child" },
+    })).rejects.toThrow(/verified fast, medium, or heavy tier/)
+    await expect(guard({
+      tool: "subagent",
+      sessionID: "plan-root",
+      agent: "plan",
+      input: { agent: "heavy", sessionID: "plan-child" },
+    })).resolves.toBeUndefined()
     await expect(guard({
       tool: "subagent",
       sessionID: "plan-root",
@@ -305,6 +371,30 @@ describe("plugin setup", () => {
       agent: "plan",
       input: { sessionID: "plan-child", agent: "heavy" },
     })).resolves.toBeUndefined()
+
+    const buildTools = {
+      read: {},
+      question: {},
+      skill: {},
+      subagent: {},
+      edit: {},
+      shell: {},
+      unknown: {},
+    }
+    await hook({ sessionID: "plan-root", agent: "build", tools: buildTools, system: [] })
+    expect(Object.keys(buildTools).sort()).toEqual([
+      "edit",
+      "question",
+      "read",
+      "shell",
+      "skill",
+      "subagent",
+      "unknown",
+    ])
+    expect(fixture.getSessionPermissions("plan-root")).toEqual([
+      { action: "read", resource: "private.txt", effect: "deny" },
+      { action: "edit", resource: "*", effect: "allow" },
+    ])
 
     if (typeof cleanup === "function") await cleanup()
   })
@@ -334,6 +424,50 @@ describe("plugin setup", () => {
     if (typeof cleanup === "function") await cleanup()
   })
 
+  it("aborts prompt preflight on permission restore failure and succeeds on retry", async () => {
+    const fixture = makeContext(options)
+    const cleanup = await plugin.setup(fixture.context)
+    await fixture.hookCallbacks[0]!({ sessionID: "plan-root", agent: "plan", tools: {}, system: [] })
+    fixture.setSessionPermissions("plan-root", [
+      { action: "read", resource: "private.txt", effect: "deny" },
+      { action: "subagent", resource: "tiered-dispatch.plan-origin/v1/start", effect: "deny" },
+      { action: "subagent", resource: "tiered-dispatch.plan-origin/v1/end", effect: "deny" },
+    ])
+    vi.mocked(fixture.context.session.update).mockRejectedValueOnce(
+      Object.assign(new Error("restore write failed"), { status: 404 }),
+    )
+
+    await expect(fixture.promptHookCallbacks[0]!({ sessionID: "plan-root" }))
+      .rejects.toThrow("restore write failed")
+    await expect(fixture.promptHookCallbacks[0]!({ sessionID: "plan-root" }))
+      .resolves.toBeUndefined()
+
+    const buildTools = { read: {}, edit: {}, shell: {}, unknown: {} }
+    await fixture.hookCallbacks[0]!({ sessionID: "plan-root", agent: "build", tools: buildTools, system: [] })
+    expect(Object.keys(buildTools).sort()).toEqual(["edit", "read", "shell", "unknown"])
+    expect(fixture.getSessionPermissions("plan-root")).toEqual([
+      { action: "read", resource: "private.txt", effect: "deny" },
+    ])
+    if (typeof cleanup === "function") await cleanup()
+  })
+
+  it("only suppresses a structured missing-session preflight error", async () => {
+    const fixture = makeContext(options)
+    const cleanup = await plugin.setup(fixture.context)
+    vi.mocked(fixture.context.session.get).mockRejectedValueOnce(new Error("session not found"))
+    await expect(fixture.promptHookCallbacks[0]!({ sessionID: "missing" }))
+      .rejects.toThrow("session not found")
+    vi.mocked(fixture.context.session.get).mockRejectedValueOnce(
+      Object.assign(new Error("server deleted session"), {
+        reason: "UnexpectedStatus",
+        cause: { status: 404 },
+      }),
+    )
+    await expect(fixture.promptHookCallbacks[0]!({ sessionID: "missing" }))
+      .resolves.toBeUndefined()
+    if (typeof cleanup === "function") await cleanup()
+  })
+
   it("uses the native permission rule setter when the host exposes it", async () => {
     const fixture = makeContext(options)
     const rules = vi.fn(async () => {})
@@ -344,6 +478,31 @@ describe("plugin setup", () => {
 
     expect(rules).toHaveBeenCalledOnce()
     expect(fixture.context.session.update).not.toHaveBeenCalled()
+    await expect(fixture.toolHookCallbacks[0]!({
+      tool: "subagent",
+      sessionID: "plan-root",
+      agent: "plan",
+      input: { agent: "fast" },
+    })).resolves.toBeUndefined()
+    expect(rules).toHaveBeenCalledOnce()
+    if (typeof cleanup === "function") await cleanup()
+  })
+
+  it("does not suppress a native 404 while preflighting a root", async () => {
+    const fixture = makeContext(options)
+    const rules = vi.fn(async ({ sessionID, permissions }: {
+      sessionID: string
+      permissions: FixtureAgent["permissions"]
+    }) => {
+      fixture.setSessionPermissions(sessionID, permissions)
+    })
+    ;(fixture.context as unknown as { permission: { rules: typeof rules } }).permission = { rules }
+    const cleanup = await plugin.setup(fixture.context)
+
+    await fixture.hookCallbacks[0]!({ sessionID: "plan-root", agent: "plan", tools: {}, system: [] })
+    rules.mockRejectedValueOnce(Object.assign(new Error("native restore failed"), { status: 404 }))
+    await expect(fixture.promptHookCallbacks[0]!({ sessionID: "plan-root" }))
+      .rejects.toThrow("native restore failed")
     if (typeof cleanup === "function") await cleanup()
   })
 
@@ -416,9 +575,15 @@ describe("plugin setup", () => {
     expect(system("fast")).toContain("Do not repeat broad exploration")
     expect(system("medium")).toContain("NEED CONTEXT:")
     expect(system("medium")).toContain("blocked by repeated failures")
+    expect(system("medium")).toContain("Supplied paths scope; optional/conventional paths not handed off: confirm via glob/search before read; never probe guessed paths.")
     expect(system("heavy")).toContain("SCOPE GROWTH:")
     expect(system("heavy")).toContain("implementation only when requested")
-    for (const tier of ["fast", "medium", "heavy"]) expect(system(tier)).toContain("Do not delegate")
+    const delegationContract = "Do not delegate unless the Plan-origin read-only instruction explicitly permits tier orchestration; never self-escalate."
+    for (const tier of ["fast", "medium", "heavy"]) {
+      expect(system(tier)).toContain(delegationContract)
+      expect(system(tier)).not.toContain("Do not delegate.")
+      expect(system(tier)).not.toContain("Do not delegate or self-escalate.")
+    }
   })
 
   it("refreshes effective-agent routing for each context", async () => {
@@ -533,7 +698,7 @@ describe("plugin setup", () => {
     const fixture = makeContext(options, { contextHook: new Error("context hook failed") })
 
     await expect(plugin.setup(fixture.context)).rejects.toThrow("context hook failed")
-    expect(fixture.disposalOrder).toEqual(["tool", "agent"])
+    expect(fixture.disposalOrder).toEqual(["prompt", "tool", "agent"])
   })
 
   it("preserves setup and rollback failures", async () => {
@@ -557,7 +722,7 @@ describe("plugin setup", () => {
     expect(errors[1]).toBeInstanceOf(AggregateError)
     expect((errors[1] as AggregateError).errors[0]).toBeInstanceOf(Error)
     expect(((errors[1] as AggregateError).errors[0] as Error).message).toBe("tool cleanup failed")
-    expect(fixture.disposalOrder).toEqual(["tool", "agent"])
+    expect(fixture.disposalOrder).toEqual(["prompt", "tool", "agent"])
   })
 
   it("attempts every registration when cleanup fails", async () => {
@@ -566,7 +731,7 @@ describe("plugin setup", () => {
 
     if (typeof cleanup !== "function") throw new Error("test setup did not return cleanup")
     await expect(cleanup()).rejects.toThrow("could not dispose every registration")
-    expect(fixture.disposalOrder).toEqual(["context", "tool", "agent"])
+    expect(fixture.disposalOrder).toEqual(["context", "prompt", "tool", "agent"])
   })
 
   it("aggregates every cleanup failure without losing reverse order", async () => {
@@ -593,6 +758,6 @@ describe("plugin setup", () => {
       "tool cleanup failed",
       "agent cleanup failed",
     ])
-    expect(fixture.disposalOrder).toEqual(["context", "tool", "agent"])
+    expect(fixture.disposalOrder).toEqual(["context", "prompt", "tool", "agent"])
   })
 })

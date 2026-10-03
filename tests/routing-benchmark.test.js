@@ -20,6 +20,22 @@ describe("routing benchmark arguments", () => {
     expect(options).toMatchObject({ runs: 2, output: "/tmp/routing-result.json", help: false })
   })
 
+  it("bounds each native evaluator process and requests graceful termination", () => {
+    const directory = mkdtempSync(join("/tmp", "routing-benchmark-timeout-"))
+    let spawnOptions
+    try {
+      runBenchmark({ runs: 1, output: join(directory, "benchmark.json") }, {
+        spawnSync: (_command, _args, options) => {
+          spawnOptions = options
+          return { status: 1, signal: "SIGTERM" }
+        },
+      })
+      expect(spawnOptions).toMatchObject({ timeout: 610_000, killSignal: "SIGTERM" })
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
   it("rejects zero, fractional, unsafe, and non-numeric run counts", () => {
     for (const value of ["0", "1.5", "nope", "9007199254740992"]) {
       expect(() => parsePositiveRuns(value)).toThrow(/positive integer/u)

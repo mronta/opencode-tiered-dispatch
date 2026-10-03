@@ -31,6 +31,11 @@ describe("buildRoutingProtocol", () => {
     expect(protocol).toContain("expected result")
     expect(protocol).toContain("No per-call model override")
     expect(protocol).toContain("Classify→decompose→delegate→integrate→answer")
+    expect(protocol).toContain("Reuse same child for execution follow-ups")
+    expect(protocol).toContain("integrate returned evidence")
+    expect(protocol).toContain("ONLY requested root verification ONCE")
+    expect(protocol).toContain("children may run tests")
+    expect(protocol).toContain("read/search, not arbitrary shell")
   })
 
   it("makes never-direct mode explicit", () => {

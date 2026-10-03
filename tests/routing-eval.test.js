@@ -1,7 +1,9 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { Permission } from "@opencode/schema"
+import { Schema } from "effect"
 import { describe, expect, it } from "vitest"
 import {
   assessDirect,
@@ -13,6 +15,7 @@ import {
   routingObserverSource,
   scenarios,
   seedRoutingFixture,
+  snapshotRoutingCommandDirectory,
   snapshotInfrastructure,
   snapshotRoutingWorkspace,
   validateScenarioResultSet,
@@ -197,6 +200,59 @@ describe("spontaneous routing assessment", () => {
     expect(assessRouting(implementationTrace(), ["fast", "medium"], MODELS).problems).toEqual([])
   })
 
+  it("requires discovered paths in the first fresh execution prompt", () => {
+    const report = assessRouting(implementationTrace({ prompt: "Implement the requested validation." }), ["fast", "medium"], MODELS)
+    expect(report.problems).toContain("execution prompt did not carry discovered file evidence")
+  })
+
+  it("does not require paths again for a validated same-child continuation", () => {
+    const discovery = delegation("discover", "fast", "fast-child", 1, "Validation belongs in src/controller.js and src/names/validate.js.", { completionSeq: 3 })
+    const firstExecution = delegation("implement", "medium", "medium-child", 4, "Implemented validation.", {
+      completionSeq: 6,
+      prompt: "Change src/controller.js and test/names.test.js using src/names/validate.js.",
+    })
+    const continuation = delegation("continue", "medium", "medium-child", 7, "Ran the requested tests.", {
+      completionSeq: 9,
+      prompt: "Continue from the implementation context and report the verification.",
+      sessionID: "medium-child",
+    })
+    const result = trace("discover-implement", [
+      ...discovery,
+      ...firstExecution,
+      ...continuation,
+      ...shellCall("npm test", 11),
+    ], [
+      { id: "fast-child", agent: "fast", contextSeq: 2 },
+      { id: "medium-child", agent: "medium", contexts: [{ seq: 5 }, { seq: 8 }] },
+    ])
+
+    expect(assessRouting(result, ["fast", "medium"], MODELS).problems).toEqual([])
+  })
+
+  it("requires discovered paths for a second fresh execution", () => {
+    const discovery = delegation("discover", "fast", "fast-child", 1, "Validation belongs in src/controller.js and src/names/validate.js.", { completionSeq: 3 })
+    const firstExecution = delegation("first", "medium", "first-medium", 4, "Implemented validation.", {
+      completionSeq: 6,
+      prompt: "Change src/controller.js and test/names.test.js using src/names/validate.js.",
+    })
+    const secondExecution = delegation("second", "medium", "second-medium", 7, "Continued implementation.", {
+      completionSeq: 9,
+      prompt: "Continue the implementation without rediscovery.",
+    })
+    const result = trace("discover-implement", [
+      ...discovery,
+      ...firstExecution,
+      ...secondExecution,
+      ...shellCall("npm test", 11),
+    ], [
+      { id: "fast-child", agent: "fast", contextSeq: 2 },
+      { id: "first-medium", agent: "medium", contextSeq: 5 },
+      { id: "second-medium", agent: "medium", contextSeq: 8 },
+    ])
+
+    expect(assessRouting(result, ["fast", "medium"], MODELS).problems).toContain("execution prompt did not carry discovered file evidence")
+  })
+
   it("derives problem classes after legacy callers append objective checks", () => {
     const report = assessRouting(trace("trivial", []), [], MODELS)
     report.problems.push("trivial answer was incorrect")
@@ -289,6 +345,40 @@ describe("spontaneous routing assessment", () => {
     expect(report.problems).toContain("verification command \"node --test test/banner.test.js\" cwd and workdir resolve to different directories: /tmp/routing-fixture and /tmp/routing-fixture/src")
   })
 
+  it("fingerprints only existing directories physically contained by the fixture", () => {
+    const workspace = mkdtempSync(join(tmpdir(), "routing-command-directory-"))
+    const outside = mkdtempSync(join(tmpdir(), "routing-command-outside-"))
+    try {
+      seedRoutingFixture(workspace)
+      writeFileSync(join(outside, "should-not-be-read.txt"), "outside evidence")
+      symlinkSync(outside, join(workspace, "external-link"), "dir")
+
+      expect(snapshotRoutingCommandDirectory({ cwd: "." }, workspace).fingerprint["package.json"]).toMatch(/^sha256:/u)
+      expect(snapshotRoutingCommandDirectory({ cwd: "src" }, workspace).fingerprint["settings.js"]).toMatch(/^sha256:/u)
+      expect(snapshotRoutingCommandDirectory({ cwd: "src", workdir: "src/.." }, workspace).fingerprint).toBeUndefined()
+      expect(snapshotRoutingCommandDirectory({ cwd: "/" }, workspace).fingerprint).toBeUndefined()
+      expect(snapshotRoutingCommandDirectory({ cwd: "../" }, workspace).fingerprint).toBeUndefined()
+      const external = snapshotRoutingCommandDirectory({ cwd: "external-link" }, workspace)
+      expect(external.fingerprint).toBeUndefined()
+      expect(external.problems).toContain("cwd resolves outside the fixture workspace")
+      expect(external.problems).toContain("command directory resolves outside the fixture workspace")
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+      rmSync(outside, { recursive: true, force: true })
+    }
+  })
+
+  it("requires an exact verification command to run at the fixture root", () => {
+    const report = assessRouting(knownScopeTrace({ cwd: "src" }), ["medium"], MODELS)
+    expect(report.problems).toContain('verification command "node --test test/banner.test.js" used cwd "src" instead of result workspace "/tmp/routing-fixture"')
+  })
+
+  it("fails closed when exact verification has no fixture workspace", () => {
+    const result = knownScopeTrace()
+    delete result.workspace
+    expect(assessRouting(result, ["medium"], MODELS).problems).toContain("verification command \"node --test test/banner.test.js\" cannot resolve the fixture workspace")
+  })
+
   it("rejects primary mutation tools even when they appear after delegation", () => {
     const delegationEvents = delegation("delegate-medium", "medium", "medium-child", 1, "Changed files.")
     const patch = {
@@ -318,6 +408,36 @@ describe("spontaneous routing assessment", () => {
     expect(report.problems.some((problem) => problem.startsWith("duplicate after tool call identity:"))).toBe(true)
     expect(report.problems.some((problem) => problem.startsWith("orphan tool completion:"))).toBe(true)
     expect(report.problems.some((problem) => problem.startsWith("failed tool completion:"))).toBe(true)
+  })
+
+  it.each([
+    ["child workspace file-not-found", "/tmp/routing-fixture/optional-notes.md", "Tool.Error: file-not-found"],
+    ["child permission-denied read", "/tmp/routing-fixture/private.txt", "Tool.Error: permission denied"],
+  ])("keeps %s as an evidence failure", (_label, filePath, errorText) => {
+    const result = knownScopeTrace()
+    const shellEvents = result.tools.filter((event) => event.tool === "shell")
+    shellEvents[0].seq = 6
+    shellEvents[1].seq = 7
+    const before = {
+      phase: "before",
+      seq: 4,
+      sessionID: "medium-child",
+      messageID: "child-message",
+      id: "child-read",
+      tool: "read",
+      agent: "medium",
+      input: { filePath },
+    }
+    result.tools.push(before, {
+      ...before,
+      phase: "after",
+      seq: 5,
+      status: "error",
+      errorText,
+    })
+
+    const report = assessRouting(result, ["medium"], MODELS)
+    expect(report.evidenceProblems).toContain("failed tool completion: medium-child/child-message/child-read/read (error)")
   })
 
   it("does not let session info model mask an invalid child execution context", () => {
@@ -444,6 +564,17 @@ describe("spontaneous routing assessment", () => {
     expect(assessRouting(missingSecondContext, ["medium"], MODELS).problems).toContain("native delegation medium returned child medium-child without an execution context between dispatch 4 and completion 6")
   })
 
+  it("rejects two fresh medium executions when the route promises one medium dispatch", () => {
+    const first = delegation("first", "medium", "first-child", 1, "first", { completionSeq: 3 })
+    const second = delegation("second", "medium", "second-child", 4, "second", { completionSeq: 6 })
+    const result = trace("known-scope", [...first, ...second, ...shellCall("node --test test/banner.test.js", 8)], [
+      { id: "first-child", agent: "medium", contextSeq: 2 },
+      { id: "second-child", agent: "medium", contextSeq: 5 },
+    ])
+    const report = assessRouting(result, ["medium"], MODELS)
+    expect(report.problems).toContain("expected medium (focused discovery/resume cycles allowed); observed medium→medium")
+  })
+
   it("rejects nested and uncorrelated child sessions", () => {
     const events = delegation("delegate-medium", "medium", "nested-child", 1, "Changed files.")
     const result = trace("known-scope", [...events, ...shellCall("node --test test/banner.test.js", 3)], [{ id: "nested-child", agent: "medium", parentID: "other" }])
@@ -458,6 +589,31 @@ describe("spontaneous routing assessment", () => {
     result.sessions[0].usage = [{ tokens: { input: 1, output: 2, reasoning: 3, cache: { read: 4 } }, cost: 0.5, model: { providerID: "provider", id: "root" } }]
     const report = assessRouting(result, ["medium"], MODELS)
     expect(report).toMatchObject({ executionElapsedMs: 42, verifierElapsedMs: 8, harnessOverheadMs: 3, tokens: { input: 1, output: 2, reasoning: 3, cachedRead: 4 } })
+  })
+
+  it("keeps missing token components unknown while preserving observed zeroes", () => {
+    const result = knownScopeTrace()
+    result.sessions[0].usage = [
+      { tokens: { input: 0, output: 2, reasoning: 0, cache: { read: 0, write: 0 } } },
+      { tokens: { input: 3, reasoning: 1, cache: { read: 4 } } },
+    ]
+    expect(assessRouting(result, ["medium"], MODELS).tokens).toEqual({
+      input: 3,
+      output: null,
+      reasoning: 1,
+      cachedRead: 4,
+      cachedWrite: null,
+    })
+
+    result.sessions[0].usage = []
+    result.sessions[0].tokens = { input: 0, output: 1, reasoning: 0, cache: { read: 2, write: 0 } }
+    expect(assessRouting(result, ["medium"], MODELS).tokens).toEqual({
+      input: 0,
+      output: 1,
+      reasoning: 0,
+      cachedRead: 2,
+      cachedWrite: 0,
+    })
   })
 
   it("preserves recorded fixture validation problems", () => {
@@ -499,6 +655,27 @@ describe("spontaneous routing assessment", () => {
     result.verificationSnapshots[0].changedFiles = ["fixture/file.js"]
     const report = assessRouting(result, ["medium"], MODELS)
     expect(report.problems).toContain('verification command "node --test test/banner.test.js" changed fixture files: fixture/file.js')
+  })
+
+  it("classifies verifier control corruption and missing snapshot footprints as evidence failures", () => {
+    const result = knownScopeTrace()
+    result.fixtureProblems = ["fixture verifier changed control files: routing-limit-loader.mjs"]
+    result.fixtureVerification = {
+      performed: true,
+      clean: false,
+      problems: [...result.fixtureProblems],
+      controlUnchanged: false,
+    }
+    result.snapshotEvidence.controlPostVerifier = {
+      ...result.snapshotEvidence.controlBaseline,
+      "routing-limit-loader.mjs": "sha256:" + "b".repeat(64),
+    }
+    result.snapshotEvidence.controlUnchanged = false
+    delete result.verificationSnapshots[0].before
+    const report = assessRouting(result, ["medium"], MODELS)
+    expect(report.evidenceProblems).toContain("fixture verifier changed control files: routing-limit-loader.mjs")
+    expect(report.evidenceProblems).toContain('verification command "node --test test/banner.test.js" is missing before/after snapshot evidence')
+    expect(report.policyProblems).not.toContain("fixture verifier changed control files: routing-limit-loader.mjs")
   })
 
   it.each([
@@ -546,6 +723,8 @@ describe("routing result and observer seams", () => {
     expect(source).toContain("nonzeroShellExitCount")
     expect(source).toContain("toolErrorMetrics(scenarioTools, ctx.location.directory, root.id)")
     expect(source).toContain("sessions: clone(inspectedSessions)")
+    expect(source).toContain("const routingLinkageHelpers = (function createRoutingLinkageHelpers()")
+    expect(source).not.toContain("routing-linkage.mjs")
     const directory = mkdtempSync(join(tmpdir(), "routing-observer-source-"))
     const filename = join(directory, "observer.mjs")
     try {
@@ -557,7 +736,7 @@ describe("routing result and observer seams", () => {
     }
   })
 
-  it.each(["tiered", "direct"])("adds the session-scoped external-directory deny to the %s fixture root", (arm) => {
+  it.each(["tiered", "direct"])("adds the SDK-shaped external-directory deny to the %s fixture root", (arm) => {
     const source = routingObserverSource({
       marker: "/tmp/routing-marker",
       result: "/tmp/routing-result",
@@ -565,8 +744,13 @@ describe("routing result and observer seams", () => {
       controlDirectory: "/tmp/routing-control",
     }, { providerID: "provider", id: "root" }, { arm })
     expect(source).toContain(`const arm = "${arm}"`)
-    expect(source).toContain("const fixtureRootPermission = [{ permission: \"external_directory\", pattern: \"*\", action: \"deny\" }]")
-    expect(source).toContain("permission: fixtureRootPermission")
+    const literal = source.match(/const fixtureRootPermissions = (\[[^\n]+\])/u)?.[1]
+    expect(literal).toBeDefined()
+    const permissions = JSON.parse(literal.replace(/([{,]\s*)([A-Za-z_$][\w$]*):/gu, '$1"$2":'))
+    expect(Schema.decodeUnknownSync(Permission.Ruleset)(permissions)).toEqual(permissions)
+    expect(permissions).toEqual([{ action: "external_directory", resource: "*", effect: "deny" }])
+    expect(source).toContain("permissions: fixtureRootPermissions")
+    expect(source).not.toContain("permission: fixtureRootPermission")
   })
 
   it("retains completed scenarios and active native facts in a bounded timeout journal", () => {
@@ -644,6 +828,7 @@ describe("routing result and observer seams", () => {
     try {
       seedRoutingFixture(workspace)
       writeFileSync(join(workspace, "src", "names", "validate.js"), "import { nameLimit } from '../settings.js'\nexport function validateName(name) { return { ok: name.length > 0 && name.length <= nameLimit, name, limit: nameLimit } }\n")
+      installNameRegressionTests(workspace)
       const previousNpmExecPath = process.env.npm_execpath
       process.env.npm_execpath = join(workspace, "arbitrary-npm-execpath.js")
       try {
@@ -659,12 +844,73 @@ describe("routing result and observer seams", () => {
     }
   })
 
+  it("requires executable blank and over-limit regressions, not just passing test names", { timeout: 30_000 }, () => {
+    const cases = [
+      {
+        label: "original validation with no regression tests",
+        prepare(workspace) {},
+      },
+      {
+        label: "deleted regression test file",
+        prepare(workspace) {
+          writeFileSync(join(workspace, "src", "names", "validate.js"), "import { nameLimit } from '../settings.js'\nexport function validateName(name) { return { ok: name.length > 0 && name.length <= nameLimit, name, limit: nameLimit } }\n")
+          installNameRegressionTests(workspace)
+          rmSync(join(workspace, "test", "names.test.js"))
+        },
+      },
+      {
+        label: "unrelated-only tests",
+        prepare(workspace) {
+          writeFileSync(join(workspace, "src", "names", "validate.js"), "import { nameLimit } from '../settings.js'\nexport function validateName(name) { return { ok: name.length > 0 && name.length <= nameLimit, name, limit: nameLimit } }\n")
+          rmSync(join(workspace, "test", "names.test.js"))
+          writeFileSync(join(workspace, "test", "unrelated.test.js"), "import { test } from 'node:test'\nimport assert from 'node:assert/strict'\ntest('unrelated fixture behavior', () => assert.equal(2 + 2, 4))\n")
+        },
+      },
+    ]
+
+    for (const { label, prepare } of cases) {
+      const workspace = mkdtempSync(join(tmpdir(), "routing-regression-evidence-"))
+      const control = mkdtempSync(join(tmpdir(), "routing-regression-control-"))
+      try {
+        seedRoutingFixture(workspace)
+        prepare(workspace)
+        const before = snapshotRoutingWorkspace(workspace)
+        const problems = checkFixture(workspace, "discover-implement", process.execPath, { verifierDirectory: control })
+        expect(problems.filter((problem) => problem.startsWith("regression test evidence did not fail")), label).toHaveLength(2)
+        expect(diffRoutingSnapshots(before, snapshotRoutingWorkspace(workspace)), label).toEqual([])
+      } finally {
+        rmSync(workspace, { recursive: true, force: true })
+        rmSync(control, { recursive: true, force: true })
+      }
+    }
+  })
+
+  it("records control-file tampering as verifier evidence corruption", () => {
+    const workspace = mkdtempSync(join(tmpdir(), "routing-verifier-control-tamper-"))
+    const control = mkdtempSync(join(tmpdir(), "routing-verifier-control-tamper-dir-"))
+    try {
+      seedRoutingFixture(workspace)
+      writeFileSync(join(workspace, "src", "names", "validate.js"), "import { nameLimit } from '../settings.js'\nexport function validateName(name) { return { ok: name.length > 0 && name.length <= nameLimit, name, limit: nameLimit } }\n")
+      installNameRegressionTests(workspace)
+      writeFileSync(join(workspace, "test", "tamper-control.test.js"), `import { test } from 'node:test'
+import { writeFileSync } from 'node:fs'
+test('cannot alter verifier control files unnoticed', () => writeFileSync(${JSON.stringify(join(control, "tampered.txt"))}, 'tampered'))
+`)
+      const problems = checkFixture(workspace, "discover-implement", process.execPath, { verifierDirectory: control })
+      expect(problems).toContain("fixture verifier changed control files: tampered.txt")
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+      rmSync(control, { recursive: true, force: true })
+    }
+  })
+
   it("reports a hardcoded configured limit only in the changed-limit run", () => {
     const workspace = mkdtempSync(join(tmpdir(), "routing-verifier-isolation-"))
     const control = mkdtempSync(join(tmpdir(), "routing-verifier-control-"))
     try {
       seedRoutingFixture(workspace)
       writeFileSync(join(workspace, "src", "names", "validate.js"), "import { nameLimit } from '../settings.js'\nexport function validateName(name) { return { ok: name.length > 0 && name.length <= 12, name, limit: nameLimit } }\n")
+      installNameRegressionTests(workspace)
       const before = snapshotRoutingWorkspace(workspace)
       const problems = checkFixture(workspace, "discover-implement", process.execPath, { verifierDirectory: control })
       const after = snapshotRoutingWorkspace(workspace)
@@ -697,4 +943,19 @@ describe("routing result and observer seams", () => {
 
 function knownScopeTraceWith(events) {
   return trace("known-scope", events, [{ id: "medium-child", agent: "medium" }])
+}
+
+function installNameRegressionTests(workspace) {
+  writeFileSync(join(workspace, "test", "names.test.js"), `import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { nameLimit } from '../src/settings.js'
+import { saveName } from '../src/controller.js'
+
+test('normalizes names', () => assert.deepEqual(saveName(' Ada '), { ok: true, name: 'Ada', limit: 12 }))
+test('rejects blank names after trimming', () => assert.deepEqual(saveName('   '), { ok: false, name: '', limit: nameLimit }))
+test('rejects names over the configured limit after trimming', () => {
+  const name = 'x'.repeat(nameLimit + 1)
+  assert.deepEqual(saveName('  ' + name + '  '), { ok: false, name, limit: nameLimit })
+})
+`)
 }

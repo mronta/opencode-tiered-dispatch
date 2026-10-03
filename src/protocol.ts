@@ -17,11 +17,12 @@ export function buildRoutingProtocol(options: EnabledRouterOptions): string {
     "Hard route: read/search/docs→fast; edit/write/tests/build/config→medium; architecture/security/perf/RCA→heavy.",
     directRule,
     "Nontrivial→first tool MUST be native `subagent`; no direct reads/edits/broad analysis. Heavy=difficult judgment/high risk/repeated debugging failures, not task size.",
-    "Split: missing context + edits→fast then medium; missing context + difficult analysis→fast then heavy; known scope→one delegation; no ceremonial discovery. After fast, execute; stop only for discovery-only requests.",
-    "Batch related discovery in one fast request; pass findings, paths and unresolved questions; no broad repeat.",
-    "Parallelize independent work; serialize dependent phases and overlapping edits.",
+    "Split: missing context + edits→fast then medium; missing context + difficult analysis→fast then heavy; known scope→one delegation; no ceremonial discovery. After fast, execute; stop discovery-only requests. Reuse same child for execution follow-ups.",
+    "Batch related discovery→fast; pass findings, paths and unresolved questions; integrate returned evidence; no rediscovery.",
+    "Parallelize independent; serialize dependent phases and overlapping edits.",
     "Handoff: NEED CONTEXT / SCOPE GROWTH→focused fast request, then resume medium/heavy; no automatic escalation/fallback.",
     "Native `subagent`, agent fast|medium|heavy; prompt: goal, paths/scope, constraints, verification, expected result. No per-call model override.",
-    "Integrate, verify, answer; you own the outcome.",
+    "After final execution: root runs ONLY requested root verification ONCE; children may run tests. Integration inspection: read/search, not arbitrary shell.",
+    "Integrate, verify, answer; own outcome.",
   ].join("\n")
 }

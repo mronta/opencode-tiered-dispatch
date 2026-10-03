@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto"
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, writeFileSync } from "node:fs"
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
-import { dirname, join, relative, resolve } from "node:path"
+import { dirname, join, relative, resolve, sep } from "node:path"
 
 /**
  * The fixture is deliberately small and boring.  Keeping its manifest here
@@ -120,7 +120,7 @@ export function fixtureRelativeFiles() {
  * resolve to the same directory.
  */
 export function resolveRoutingCommandDirectory(input, workspace) {
-  const root = typeof workspace === "string" ? resolve(workspace) : undefined
+  const root = typeof workspace === "string" && workspace.length > 0 ? resolve(workspace) : undefined
   const problems = []
   const aliases = []
 
@@ -135,14 +135,74 @@ export function resolveRoutingCommandDirectory(input, workspace) {
       problems.push("fixture workspace is missing while resolving command directory")
       continue
     }
-    aliases.push({ name, value, directory: resolve(root, value) })
+    const directory = resolve(root, value)
+    aliases.push({ name, value, directory, realDirectory: realpathOrUndefined(directory) })
   }
 
   const directory = aliases[0]?.directory ?? root
-  if (aliases.length > 1 && aliases[0].directory !== aliases[1].directory) {
+  const realDirectory = realpathOrUndefined(directory)
+  const rootReal = realpathOrUndefined(root)
+  const comparableAliases = aliases.map((alias) => alias.realDirectory ?? alias.directory)
+  if (aliases.length > 1 && comparableAliases[0] !== comparableAliases[1]) {
     problems.push(`cwd and workdir resolve to different directories: ${aliases[0].directory} and ${aliases[1].directory}`)
   }
-  return { root, directory, aliases, problems }
+  const filesystemProblems = []
+  if (rootReal !== undefined) {
+    for (const alias of aliases) {
+      if (alias.realDirectory === undefined) {
+        filesystemProblems.push(`${alias.name} does not resolve to an existing directory`)
+      } else if (!isContainedPath(rootReal, alias.realDirectory)) {
+        filesystemProblems.push(`${alias.name} resolves outside the fixture workspace`)
+      } else {
+        try {
+          if (!statSync(alias.realDirectory).isDirectory()) filesystemProblems.push(`${alias.name} does not resolve to a directory`)
+        } catch {
+          filesystemProblems.push(`${alias.name} does not resolve to an existing directory`)
+        }
+      }
+    }
+  }
+  return {
+    root,
+    directory,
+    aliases,
+    problems: [...problems, ...filesystemProblems],
+    rootReal,
+    realDirectory,
+    filesystemProblems,
+  }
+}
+
+/**
+ * Capture a shell command's working directory only when its physical path is
+ * inside the fixture root.  Resolving real paths before walking is important:
+ * a lexical path such as `fixture/link-to-tmp` is inside the root while its
+ * symlink target is not.  Invalid and external directories deliberately
+ * return no fingerprint so an observer cannot walk untrusted data; callers
+ * retain `problems` as fail-closed evidence instead.
+ */
+export function snapshotRoutingCommandDirectory(input, workspace) {
+  const resolution = resolveRoutingCommandDirectory(input, workspace)
+  const problems = [...resolution.problems]
+  if (resolution.rootReal === undefined) problems.push("fixture workspace does not resolve to an existing directory")
+  if (resolution.realDirectory === undefined) problems.push("command directory does not resolve to an existing directory")
+  if (resolution.rootReal !== undefined && resolution.realDirectory !== undefined && !isContainedPath(resolution.rootReal, resolution.realDirectory)) {
+    problems.push("command directory resolves outside the fixture workspace")
+  }
+  if (problems.length > 0) return { ...resolution, fingerprint: undefined, problems: [...new Set(problems)] }
+
+  try {
+    // Walk the canonical path rather than the user-supplied lexical path so
+    // an accepted in-root symlink cannot turn the recursive walk into an
+    // external traversal after validation.
+    return { ...resolution, fingerprint: fingerprintRoutingWorkspace(resolution.realDirectory), problems: [] }
+  } catch (error) {
+    return {
+      ...resolution,
+      fingerprint: undefined,
+      problems: [`command directory snapshot failed: ${error?.message ?? String(error)}`],
+    }
+  }
 }
 
 /**
@@ -158,8 +218,19 @@ export function checkFixture(workspace, scenarioID, nodeBinary = process.execPat
   const verifierDirectory = options.verifierDirectory ?? mkdtempSync(join(tmpdir(), "opencode-routing-verifier-"))
   const loaderPath = join(verifierDirectory, "routing-limit-loader.mjs")
   const problems = []
+  let controlBaseline
 
   try {
+    controlBaseline = snapshotRoutingWorkspace(verifierDirectory)
+  } catch (error) {
+    problems.push(`fixture verifier control baseline could not be captured: ${error?.message ?? String(error)}`)
+  }
+
+  try {
+    if (existsSync(loaderPath)) {
+      problems.push("fixture verifier control file already exists: routing-limit-loader.mjs")
+      rmSync(loaderPath, { recursive: true, force: true })
+    }
     if (scenarioID === "known-scope") {
       const banner = spawnSync(nodeBinary, [
         "--input-type=module",
@@ -174,11 +245,18 @@ export function checkFixture(workspace, scenarioID, nodeBinary = process.execPat
       }
       const baseline = runBehaviorCheck({ workspace, nodeBinary })
       problems.push(...formatCheckFailure("fixture behavior", baseline, { expectedLimit: configuredLimit }))
+      if (existsSync(loaderPath)) {
+        problems.push("fixture verifier changed control files: routing-limit-loader.mjs")
+        rmSync(loaderPath, { recursive: true, force: true })
+      }
 
       const changedLimit = changedLimitFor(configuredLimit)
-      writeFileSync(loaderPath, changedLimitLoader(changedLimit))
+      const expectedLoader = changedLimitLoader(changedLimit)
+      writeFileSync(loaderPath, expectedLoader)
       const changed = runBehaviorCheck({ workspace, nodeBinary, loaderPath })
       problems.push(...formatCheckFailure(`changed-limit behavior (limit ${changedLimit})`, changed, { expectedLimit: changedLimit }))
+      problems.push(...verifyLoaderIntegrity(loaderPath, expectedLoader))
+      problems.push(...checkRegressionTestEvidence(workspace, nodeBinary))
     }
 
     const test = scenarioID === "known-scope"
@@ -190,11 +268,82 @@ export function checkFixture(workspace, scenarioID, nodeBinary = process.execPat
       : spawnSync(nodeBinary, ["--test", "test/*.test.js"], processOptions(workspace))
     problems.push(...formatCheckFailure("fixture tests", test))
   } finally {
-    rmSync(loaderPath, { force: true })
+    rmSync(loaderPath, { recursive: true, force: true })
+    if (controlBaseline !== undefined) {
+      try {
+        const controlChanges = diffRoutingSnapshots(controlBaseline, snapshotRoutingWorkspace(verifierDirectory))
+        if (controlChanges.length > 0) problems.push("fixture verifier changed control files: " + controlChanges.join(", "))
+      } catch (error) {
+        problems.push(`fixture verifier control snapshot failed after verification: ${error?.message ?? String(error)}`)
+      }
+    }
     if (ownedControl) rmSync(verifierDirectory, { recursive: true, force: true })
   }
 
   return problems
+}
+
+function verifyLoaderIntegrity(loaderPath, expectedLoader) {
+  try {
+    return readFileSync(loaderPath, "utf8") === expectedLoader
+      ? []
+      : ["fixture verifier changed control files: routing-limit-loader.mjs"]
+  } catch {
+    return ["fixture verifier changed control files: routing-limit-loader.mjs"]
+  }
+}
+
+/**
+ * A passing suite is not enough for discover-implement: the scenario asks for
+ * regression tests, not merely tests whose existing assertions still pass.
+ * Run the submitted suite in isolated copies against two single-bug mutants.
+ * The suite must fail when only blank-name validation is missing and when only
+ * over-limit validation is missing.  This executes tests rather than
+ * inspecting their names or source text, so a renamed or differently-structured
+ * regression test remains valid evidence.
+ */
+function checkRegressionTestEvidence(workspace, nodeBinary) {
+  const mutants = [
+    {
+      label: "blank-name",
+      source: validationSource("name.length <= nameLimit"),
+    },
+    {
+      label: "over-limit-name",
+      source: validationSource("name.length > 0"),
+    },
+  ]
+  const problems = []
+  const isolated = mkdtempSync(join(tmpdir(), "opencode-routing-regression-"))
+  try {
+    cpSync(workspace, isolated, { recursive: true, force: true, verbatimSymlinks: true })
+    for (const mutant of mutants) {
+      writeFileSync(join(isolated, "src", "names", "validate.js"), mutant.source)
+      const result = runFixtureTests(isolated, nodeBinary)
+      if (result.error !== undefined) {
+        problems.push(`regression test evidence could not run the ${mutant.label} validation mutant: ${result.error.message ?? String(result.error)}`)
+      } else if (result.status === null) {
+        problems.push(`regression test evidence could not determine the ${mutant.label} validation mutant result: ${formatProcessDetail(result)}`)
+      } else if (result.status === 0) {
+        problems.push(`regression test evidence did not fail the ${mutant.label} validation mutant`)
+      }
+    }
+  } catch (error) {
+    problems.push(`regression test evidence could not run validation mutants: ${error?.message ?? String(error)}`)
+  } finally {
+    rmSync(isolated, { recursive: true, force: true })
+  }
+  return problems
+}
+
+function validationSource(predicate) {
+  return `import { nameLimit } from '../settings.js'\nexport function validateName(name) { return { ok: ${predicate}, name, limit: nameLimit } }\n`
+}
+
+function runFixtureTests(workspace, nodeBinary) {
+  // Do not use npm or an inherited npm_execpath here.  This is the pinned
+  // verifier command and is intentionally independent of provider tooling.
+  return spawnSync(nodeBinary, ["--test", "test/*.test.js"], processOptions(workspace))
 }
 
 function runBehaviorCheck({ workspace, nodeBinary, loaderPath }) {
@@ -257,6 +406,15 @@ export async function load(url, context, nextLoad) {
 
 function processOptions(workspace) {
   return { cwd: workspace, encoding: "utf8", timeout: 30_000 }
+}
+
+function realpathOrUndefined(pathname) {
+  if (typeof pathname !== "string") return undefined
+  try { return realpathSync(pathname) } catch { return undefined }
+}
+
+function isContainedPath(root, candidate) {
+  return candidate === root || candidate.startsWith(root.endsWith(sep) ? root : root + sep)
 }
 
 function hashFile(filename) {

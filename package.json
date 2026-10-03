@@ -13,13 +13,14 @@
   "files": [
     "index.js",
     "dist/",
+    "src/",
     "tiers.json",
     "README.md",
     "docs/",
     "LICENSE"
   ],
   "scripts": {
-    "build": "node scripts/clean-dist.mjs && tsc -p tsconfig.build.json",
+    "build": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",

@@ -20,6 +20,10 @@ npm test
 npm run build
 ```
 
+The build stages compiled output and replaces `dist/` only after a successful
+compile. A compile failure must leave the last successful output available, but
+the failed command is still a failed verification.
+
 Before packaging a local archive, inspect its contents without publishing it:
 
 ```bash
@@ -29,22 +33,39 @@ npm run smoke:package
 
 The package smoke exercises a temporary packed installation and cleans its
 temporary archive and installation when it exits. It is distinct from a
-registry publication.
+registry publication. Packed source maps must point to source files available in
+the packed artifact (expected to include the relevant `src/` sources).
 
 ## Native OpenCode smoke
 
 The native smoke uses the normal `opencode.jsonc` plugin entry and does not
 require tier-agent stubs. It checks that the host can materialize the three
-reserved agents, resolve their configured models and variants, and expose the
-intended permissions. It also invokes each tier directly, exercises one
-primary-to-`medium` native call, confirms that tier children do not receive the
-primary execution protocol, and checks native cancellation and provider-error
-outcomes without fallback.
+reserved agents and resolve their configured models and variants. Plan coverage
+is behavioral: a real Plan session may dispatch `fast`, `medium`, and `heavy`.
+The probe drives this with real prompts, not context-snapshot calls. It checks
+the root context-tool filter and `execute.before` guard, then prompt preflight
+installs the full child policy before the host's first native child-tool
+snapshot; each child context's effective persistent read-only policy,
+unsafe-tool filter, and guard are checked as a second layer. Normal Plan-safe
+`question`, `skill`, and `subagent` tools remain visible unless user-denied;
+the full child policy keeps wildcard `subagent` at `ask` and named tier allows
+visible, while the guard rejects custom targets. Switching the same root back
+to `Build` must remove only the origin marker: the first Build request has its
+normal mutating tools, new Build children are normal, and existing Plan-owned
+descendants remain read-only.
 
-Plan dispatch is covered structurally by the unit suite: Plan may target any
-reserved tier, while its session-scoped read-only rules and inherited child
-context prevent edit, write, patch, and shell tools. The canonical `medium` and
-`heavy` permissions remain unchanged for Build-originated children.
+It continues to check canonical Build-originated tier permissions, that tier
+children do not receive the primary execution protocol, provider-error
+outcomes without fallback, and native cancellation. The service deadline is
+bounded over HTTP, including response bodies; one overall deadline spans
+startup, HTTP, observer work, and result arrival. Cancellation must interrupt
+active root and child work and leave diagnostic evidence rather than hanging.
+When no output path is supplied, a failed probe retains its diagnostic artifact
+under `/tmp/opencode`.
+
+The native host's subagent-depth limit still applies. The default V2.0.19/.22
+depth is `1`, so child-nested delegation requires host depth `>=2`; the plugin
+does not change host configuration.
 
 Run it with provider credentials and the configured models available:
 
@@ -78,7 +99,7 @@ scenarios are:
 |---|---|---|
 | `trivial` | Direct | Answer a one-step arithmetic question |
 | `known-scope` | `medium` | Make a specified edit and run its exact test command |
-| `discover-implement` | `fast` → `medium` | Discover validation ownership, implement it, add tests, and run `npm test` |
+| `discover-implement` | `fast` → `medium` | Discover validation ownership, implement blank/over-limit handling, add meaningful tests, and run `npm test` |
 | `discover-analyze` | `fast` → `heavy` | Map authentication boundaries and provide a security assessment without editing |
 
 ### Task success and policy success
@@ -99,8 +120,17 @@ individual `taskProblems`, `policyProblems`, and `evidenceProblems` fields.
 For a nontrivial tiered scenario, the evaluator expects the primary's first
 tool to be native `subagent`; it rejects mutation by the primary before or
 after the delegated execution when the policy disallows it. A known-scope task
-uses one `medium` dispatch, and a discovery-plus-implementation task must carry
-concrete discovered paths into the next prompt. The direct control is
+uses one fresh `medium` execution child; an explicit verified continuation may
+reuse that same child, but two fresh `medium` children fail policy. A
+discovery-plus-implementation task must carry concrete discovered paths into
+the first fresh execution prompt. An explicit validated continuation of that
+same child retains its context and need not repeat the paths; every additional
+fresh execution child must receive them. `discover-implement` also
+requires meaningful regression evidence for both blank-after-trimming and
+over-limit-after-trimming behavior. A useful negative control is to run the
+regression suite against the old implementation and require it to fail; when
+evidence is asynchronous, wait until it is visible or describe the invariant
+being checked rather than relying on a fixed delay. The direct control is
 deliberately permissive about ordinary primary tools, except that it cannot
 create a child session and the trivial control has its natural one-tool guard.
 
@@ -120,9 +150,14 @@ structured `result.output` containing:
 Matching `result.metadata` must agree on `sessionID` and `status`. A
 `running`/background result is not evidence that delegated work finished. A
 continuation must provide the explicit `sessionID` of an already established
-child owned by the same tier. The linked child must be a direct child of the
-root, have a context between dispatch and completion, and use the expected
-model and variant.
+child. For evaluator evidence, that child must be owned by the same tier; this
+is an evidence-correlation constraint, not a global runtime ban. The linked
+child must be a direct child of the root, have a context between dispatch and
+completion, and use the expected model and variant. A malformed child
+completion or a missing dispatch-to-completion context fails closed. Native
+child linkage is validated before fixture verification or reset; malformed
+linkage stops the whole batch, and observer cleanup removes all context
+children before teardown.
 
 For an allowed primary verification shell command, the native completion shape
 contains `output` (string), `truncated` (boolean), `status: "completed"`, and
@@ -131,29 +166,41 @@ contains `output` (string), `truncated` (boolean), `status: "completed"`, and
 
 ### Fixture and command policy
 
-Before each scenario the evaluator restores a pristine fixture manifest. It
-allows only immutable `opencode.jsonc` and `.opencode` infrastructure changes,
-rejects infrastructure changes, and runs the behavior/test verifier from a
-separate control directory. Workspace manifests use relative paths, SHA-256
-file hashes, and hashed symlink targets. Handoff checks establish structural
-file evidence; they do not prove that every finding was understood.
+Before each scenario the evaluator restores a pristine fixture manifest. Fixture
+snapshots contain only files, directories, and symlinks under the contained
+fixture root; relative paths, SHA-256 file hashes, and hashed symlink targets
+make outside paths invalid evidence. It allows only immutable `opencode.jsonc`
+and `.opencode` infrastructure changes, rejects infrastructure changes, and
+runs the behavior/test verifier from a separate control directory. Any verifier
+change to that control directory is an evidence failure, even if the verifier
+reports success. Handoff checks establish structural file evidence; they do not
+prove that every finding was understood.
 
-For headless isolation, the evaluator gives each root session a
-session-scoped deny rule for external directories. Native children inherit that
-control. It is an evaluator control, not the normal plugin's permission policy:
+For headless isolation, the evaluator gives each root session a session-scoped
+`permissions` array with a deny rule for external directories using the OpenCode
+V2 shape `{ action: "external_directory", resource: "*", effect: "deny" }`.
+Native children inherit that control. It is an evaluator control, not the normal
+plugin's permission policy:
 ordinary use keeps the host's `ask` behavior and does not auto-allow outside
 paths. A denied outside read remains tool evidence and an error metric.
 
-The plugin uses the host's native session permission setter for Plan sessions
-before dispatch, merging the current rules rather than replacing them. If the
-host cannot expose a supported setter, the dispatch hook fails closed instead of
-allowing an unverified Plan child.
+The root Plan session uses only a nonrestrictive origin marker; its context-tool
+filter and `execute.before` guard enforce root read-only behavior without a
+root deny-all session policy. Children inherit the marker at creation, and the
+first child context uses the host's native session permission setter to install
+persistent read-only rules, filtering, and the guard. If the host cannot expose
+a supported setter, the dispatch hook fails closed instead of allowing an
+unverified Plan child. Removing the marker from a parentless `Build` context
+does not rewrite its original permissions; existing Plan children retain their
+child policy.
 
 After a tiered delegation, the primary allowlist is native orchestration,
 read/search tools (`read`, `glob`, `grep`, `webfetch`, and `websearch`), and the
 exact scenario-declared fixture verification command. Unknown commands fail the
 assessment; there is no arbitrary shell or shell-regex allowlist. Mutation
-commands remain delegated. The direct control is intentionally permissive about
+commands remain delegated. The root evaluator permits that declared verification
+once, after the final execution delegation; it does not permit repeated or
+unrequested root commands. The direct control is intentionally permissive about
 ordinary primary-native tools and is not a shell-safety measurement.
 
 ## Prompt-size proxy

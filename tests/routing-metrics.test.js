@@ -128,6 +128,20 @@ describe("routing metrics", () => {
     expect(result.handoffs[0].promptTokens).toBeGreaterThan(0)
   })
 
+  it("does not correlate malformed tool identities through an undefined map key", () => {
+    const result = summarizeRoutingTrace(trace({
+      tools: [
+        { phase: "before", seq: 1, observedAt: 100, sessionID: "root", messageID: "m1", tool: "subagent", input: { agent: "fast" } },
+        { phase: "after", seq: 2, observedAt: 150, sessionID: "root", messageID: "m1", tool: "subagent", status: "completed", resultOutput: { sessionID: "child-1", status: "completed", output: "one" } },
+        { phase: "before", seq: 3, observedAt: 200, sessionID: "root", id: "call-2", tool: "subagent", input: { agent: "medium" } },
+        { phase: "after", seq: 4, observedAt: 275, sessionID: "root", id: "call-2", tool: "subagent", status: "completed", resultOutput: { sessionID: "child-2", status: "completed", output: "two" } },
+      ],
+    }))
+
+    expect(result.dispatchDurations).toHaveLength(2)
+    expect(result.dispatchDurations.map((dispatch) => dispatch.durationMs)).toEqual([null, null])
+  })
+
   it("uses linear quantiles and keeps small-n p95 explicit", () => {
     expect(quantile([1, 2, 3], 0.5)).toBe(2)
     expect(quantile([1, 2, 3], 0.95)).toBe(2.9)
@@ -197,6 +211,29 @@ describe("routing metrics", () => {
     expect(sample.status).toBe("failed")
     expect(sample.evidenceProblems).toContain("scenario result known-scope is missing root session root")
     expect(summary.arms.direct.armErrors).toEqual([{ repetition: 0, message: "transport truncated artifact" }])
+  })
+
+  it("keeps verifier control corruption and missing snapshot footprints in evidence failures", () => {
+    const result = trace({ id: "known-scope" })
+    const report = {
+      id: "known-scope",
+      problems: [
+        "fixture verifier changed control files: routing-limit-loader.mjs",
+        'verification command "npm test" is missing before/after snapshot evidence',
+      ],
+    }
+    const summary = summarizeMatchedBenchmark([{
+      arm: "direct",
+      repetition: 0,
+      results: [result],
+      reports: [report],
+      errors: [],
+    }], { scenarioIDs: ["known-scope"] })
+    const sample = summary.samples[0]
+    expect(sample.evidenceProblems).toEqual(report.problems)
+    expect(sample.policyProblems).toEqual([])
+    expect(summary.qualityGate.evidenceFailureCount).toBe(2)
+    expect(summary.qualityGate.complete).toBe(false)
   })
 
   it("counterbalances deterministically", () => {

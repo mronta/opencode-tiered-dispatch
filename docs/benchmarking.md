@@ -40,9 +40,11 @@ The order alternates between repetitions, provider calls never run in parallel,
 and a failed arm is not retried. Both arms receive the same four prompts:
 
 - `trivial`: one-step arithmetic;
-- `known-scope`: a specified edit and exact test;
-- `discover-implement`: discovery, implementation, regression tests, and
-  `npm test`;
+- `known-scope`: a specified edit and exact test using one fresh `medium`
+  execution child; an explicit verified continuation may reuse that same child,
+  but two fresh `medium` children fail policy;
+- `discover-implement`: discovery, blank/over-limit implementation,
+  meaningful regression tests, and `npm test`;
 - `discover-analyze`: authentication-boundary discovery and security analysis.
 
 The direct control explicitly disables the plugin, denies the root `build`
@@ -60,7 +62,8 @@ failed attempts, attempted pairs, and pairs where both arms completed. It
 measures startup, scenario execution, verifier time, harness overhead, and
 total time separately.
 
-The native evaluator's default per-process deadline is `600000` ms. A focused
+The native evaluator's default per-process deadline is `600000` ms and spans
+startup, HTTP response bodies, observer work, and result arrival. A focused
 evaluation can override it with `--timeout-ms`; the benchmark command itself
 passes the default to each fresh native process.
 
@@ -73,6 +76,24 @@ first-delegation policy, child linkage, handoff evidence, and exact fixture
 verification commands. The direct arm bypasses tier-route and primary
 orchestration-policy checks except for the no-child rule and the trivial
 one-tool check.
+
+Handoff evidence requires discovered paths in the first fresh execution prompt;
+an explicit successfully linked continuation of that same child retains context
+and need not repeat them. A second fresh execution still requires the paths,
+even when route validation separately rejects the extra dispatch. The root may
+run the declared fixture verification only once, after the final execution.
+
+Fixture snapshot evidence is confined to paths under the contained fixture root;
+the separate verifier-control directory has its own before/after snapshot. A
+malformed child completion or a missing child execution context fails closed
+before fixture verification/reset; observer cleanup removes all context
+children before teardown. Any malformed linkage fails the whole batch. Any
+verifier-control tamper is an evidence failure, even when the task itself
+appears successful. For
+`discover-implement`, meaningful regression evidence must cover both trimmed
+blank and trimmed over-limit inputs; an old-implementation mutant/negative
+control is useful evidence, while asynchronous observations should wait until
+visible or state the invariant being checked.
 
 Task completion and policy compliance are separate dimensions. A report can
 contain:
@@ -121,10 +142,11 @@ The metrics module keeps these token components separate:
 - `cacheWrite`
 
 Missing or non-numeric components remain unknown (`null`) rather than being
-invented. Reasoning is not added to output tokens as a billing estimate. Usage
-is reported for the root, each tier, the total, and attribution by captured
-provider/model/variant and request identity; missing identity is retained in an
-explicit `unknown` bucket.
+invented or zero-filled. Partial usage therefore keeps each unavailable
+component `null`; an observed numeric zero remains zero. Reasoning is not
+added to output tokens as a billing estimate. Usage is reported for the root,
+each tier, the total, and attribution by captured provider/model/variant and
+request identity; missing identity is retained in an explicit `unknown` bucket.
 
 Captured numeric session costs are direct `Money.USD` values. The report exposes
 the same numeric unit as `costUSD` and its `cost` alias: there is no `10^12`

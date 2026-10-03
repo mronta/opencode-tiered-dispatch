@@ -14,10 +14,65 @@ import {
   snapshotRoutingWorkspace,
   validateScenarioResultSet,
 } from "./routing-eval.mjs"
+import {
+  fetchJsonWithDeadline,
+  waitForDeadline,
+} from "./native-http.mjs"
+
+export { waitForDeadline as waitFor }
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)))
 let runtimeModelSelection
+
+// This is a smoke-test contract, not an import from the implementation.  The
+// native check must remain useful when the runtime changes how it marks its
+// session policy.  In particular, custom user rules may surround the bounded
+// plugin policy and stricter user denies must still win by normal last-match
+// ordering.
+export const NATIVE_PLAN_POLICY_RULES = Object.freeze([
+  Object.freeze({ action: "*", resource: "*", effect: "deny" }),
+  Object.freeze({ action: "grep", resource: "*", effect: "allow" }),
+  Object.freeze({ action: "glob", resource: "*", effect: "allow" }),
+  Object.freeze({ action: "webfetch", resource: "*", effect: "allow" }),
+  Object.freeze({ action: "websearch", resource: "*", effect: "allow" }),
+  Object.freeze({ action: "question", resource: "*", effect: "allow" }),
+  Object.freeze({ action: "skill", resource: "*", effect: "allow" }),
+  Object.freeze({ action: "read", resource: "*", effect: "allow" }),
+  Object.freeze({ action: "read", resource: "*.env", effect: "ask" }),
+  Object.freeze({ action: "read", resource: "*.env.*", effect: "ask" }),
+  Object.freeze({ action: "read", resource: "*.env.example", effect: "allow" }),
+  Object.freeze({ action: "subagent", resource: "*", effect: "ask" }),
+  Object.freeze({ action: "subagent", resource: "fast", effect: "allow" }),
+  Object.freeze({ action: "subagent", resource: "medium", effect: "allow" }),
+  Object.freeze({ action: "subagent", resource: "heavy", effect: "allow" }),
+])
+export const NATIVE_PLAN_SAFE_TOOLS = Object.freeze([
+  "read",
+  "glob",
+  "grep",
+  "webfetch",
+  "websearch",
+  "question",
+  "skill",
+])
+const NATIVE_PLAN_ALLOWED_CONTEXT_TOOLS = new Set([...NATIVE_PLAN_SAFE_TOOLS, "subagent"])
+// OpenCode 2.x exposes patch rather than the legacy edit tool on the native
+// host. Require the two mutation capabilities that are stable on the support
+// range, then compare the complete observed mutating set on restoration.
+const NATIVE_BUILD_REQUIRED_MUTATING_TOOLS = Object.freeze(["patch", "shell"])
+const NATIVE_PLAN_MUTATING_ACTIONS = Object.freeze([
+  "edit",
+  "write",
+  "patch",
+  "shell",
+  "todowrite",
+  "task",
+  "delete",
+  "external_directory",
+])
 async function runNativeSmoke(argv = process.argv.slice(2)) {
+  const nativeOptions = parseNativeOptions(argv)
+  const runDeadline = Date.now() + nativeOptions.timeoutMs
   // CLI-only runtime dependencies are loaded after argument parsing/import of
   // this module.  The pure parser and evidence helpers are also used by the
   // pre-build test suite, where dist/ intentionally does not exist yet.
@@ -26,10 +81,10 @@ async function runNativeSmoke(argv = process.argv.slice(2)) {
     import("../dist/tiers.js"),
   ])
   runtimeModelSelection = modelSelection
-  const nativeOptions = parseNativeOptions(argv)
   const routingEval = nativeOptions.routingEval
   const arm = nativeOptions.arm
   const outputPath = nativeOptions.output
+  const diagnosticOutputPath = outputPath ?? join("/tmp/opencode", `native-smoke-${Date.now()}-${process.pid}.json`)
   const selectedScenarios = selectScenarios(nativeOptions.scenario)
   const workspace = mkdtempSync(join(tmpdir(), "opencode-tiered-dispatch-native-"))
   const control = mkdtempSync(join(tmpdir(), "opencode-tiered-dispatch-native-control-"))
@@ -50,6 +105,7 @@ async function runNativeSmoke(argv = process.argv.slice(2)) {
   let observedReports = []
   let observerFailure
   let preserveTemporaryEvidence = false
+  const nativeHttpTimeoutMs = Math.min(nativeOptions.timeoutMs, 30_000)
 
   mkdirSync(join(workspace, ".opencode", "plugins"), { recursive: true })
   const pluginEntry = {
@@ -74,7 +130,7 @@ async function runNativeSmoke(argv = process.argv.slice(2)) {
   if (routingEval) seedRoutingFixture(workspace)
   writeFileSync(join(workspace, ".opencode", "plugins", "native-smoke-observer.js"), routingEval
     ? routingObserverSource(paths, rootModel, { nodeBinary: process.execPath, arm, hideRootSubagent: arm === "direct", scenarios: selectedScenarios })
-    : observerSource(paths, rootModel, requiredTierModels, providerErrorModel))
+    : observerSource(paths, rootModel, requiredTierModels, providerErrorModel, runDeadline))
 
   const port = await freePort()
   const password = `native-smoke-${Date.now()}`
@@ -91,39 +147,64 @@ async function runNativeSmoke(argv = process.argv.slice(2)) {
   let logs = ""
   child.stdout.on("data", (chunk) => { logs += String(chunk) })
   child.stderr.on("data", (chunk) => { logs += String(chunk) })
+  let stopPromise
+  const stopOwnedProcess = () => {
+    stopPromise ??= stopProcess(child)
+    return stopPromise
+  }
 
   try {
     const authorization = `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}`
-    await waitFor(async () => {
+    await waitForDeadline(async (signal, deadline) => {
       try {
-        const response = await fetch(`http://127.0.0.1:${port}/api/agent`, { headers: { authorization } })
-        return response.ok
+        const response = await fetchJsonWithDeadline(
+          `http://127.0.0.1:${port}/api/agent`,
+          { headers: { authorization }, signal },
+          { deadline },
+        )
+        return response.response.ok
       } catch {
         return false
       }
-    }, 30_000, () => logs)
-    await waitFor(() => existsSync(paths.marker) || existsSync(paths.failure), 180_000, () => logs)
+    }, undefined, () => sanitizeDiagnosticText(logs, password), { deadline: stageDeadline(runDeadline, 30_000), nativeTimeout: true })
+    await waitForDeadline(() => existsSync(paths.marker) || existsSync(paths.failure), undefined, () => sanitizeDiagnosticText(logs, password), {
+      deadline: stageDeadline(runDeadline, 180_000),
+      nativeTimeout: true,
+    })
     startupMs = Date.now() - launchStartedAt
     if (existsSync(paths.failure)) {
       observerFailure = readJson(paths.failure)
-      throw new Error(formatFailure(readFileSync(paths.failure, "utf8"), logs))
+      throw new Error(formatFailure(readFileSync(paths.failure, "utf8"), sanitizeDiagnosticText(logs, password)))
     }
-    const initialAgentResponse = await fetch(`http://127.0.0.1:${port}/api/agent`, { headers: { authorization } })
+    const initialAgent = await fetchJsonWithDeadline(
+      `http://127.0.0.1:${port}/api/agent`,
+      { headers: { authorization } },
+      { deadline: stageDeadline(runDeadline, nativeHttpTimeoutMs) },
+    )
+    const initialAgentResponse = initialAgent.response
     if (!initialAgentResponse.ok) throw new Error(`could not read initial native agent catalog: HTTP ${initialAgentResponse.status}`)
     if (!routingEval || arm === "tiered") {
-      verifyMaterializedAgents((await initialAgentResponse.json()).data ?? [], requiredTierModels)
+      verifyMaterializedAgents(initialAgent.data?.data ?? [], requiredTierModels)
     }
 
-    await waitFor(() => existsSync(paths.result) || existsSync(paths.failure), nativeOptions.timeoutMs, () => logs, { nativeTimeout: true })
+    await waitForDeadline(() => existsSync(paths.result) || existsSync(paths.failure), undefined, () => sanitizeDiagnosticText(logs, password), {
+      deadline: runDeadline,
+      nativeTimeout: true,
+    })
     if (existsSync(paths.failure)) {
       observerFailure = readJson(paths.failure)
-      throw new Error(formatFailure(readFileSync(paths.failure, "utf8"), logs))
+      throw new Error(formatFailure(readFileSync(paths.failure, "utf8"), sanitizeDiagnosticText(logs, password)))
     }
     const result = JSON.parse(readFileSync(paths.result, "utf8"))
     observedResults = result
-    const agentResponse = await fetch(`http://127.0.0.1:${port}/api/agent`, { headers: { authorization } })
+    const agent = await fetchJsonWithDeadline(
+      `http://127.0.0.1:${port}/api/agent`,
+      { headers: { authorization } },
+      { deadline: stageDeadline(runDeadline, nativeHttpTimeoutMs) },
+    )
+    const agentResponse = agent.response
     if (!agentResponse.ok) throw new Error(`could not read native agent catalog: HTTP ${agentResponse.status}`)
-    const agentPayload = await agentResponse.json()
+    const agentPayload = agent.data
     try {
       if (routingEval) {
         const beforeEvaluator = snapshotRoutingWorkspace(workspace)
@@ -141,7 +222,7 @@ async function runNativeSmoke(argv = process.argv.slice(2)) {
       }
       else verify(result, agentPayload.data ?? agentPayload, workspace, providerErrorModel)
     } catch (error) {
-      throw new Error(`${error?.message ?? String(error)}\nOpenCode logs:\n${logs}`)
+      throw new Error(`${error?.message ?? String(error)}\nOpenCode logs:\n${sanitizeDiagnosticText(logs, password)}`)
     }
     writeArtifact(outputPath, makeArtifact({
       arm,
@@ -159,25 +240,27 @@ async function runNativeSmoke(argv = process.argv.slice(2)) {
   } catch (error) {
     // Capture the causal state before SIGTERM can wake the blocked root.  A
     // post-shutdown snapshot is retained separately and never replaces it.
+    const normalizedError = normalizeNativeSmokeError(error)
+    const diagnosticLogs = sanitizeDiagnosticText(logs, password)
     const progressAtTimeout = readProgressJournal(paths.progress)
     const failureAtTimeout = observerFailure ?? (existsSync(paths.failure) ? readJson(paths.failure) : undefined)
-    await stopProcess(child)
+    await stopOwnedProcess()
     const progressAfterShutdown = readProgressJournal(paths.progress)
     const failureAfterShutdown = existsSync(paths.failure) ? readJson(paths.failure) : undefined
     const progress = progressAtTimeout ?? progressAfterShutdown
     const failure = failureAtTimeout ?? failureAfterShutdown
     const completedResults = progressAtTimeout?.completedResults ?? progressAfterShutdown?.completedResults ?? []
     const resultForArtifact = observedResults ?? (completedResults.length > 0 ? completedResults : failure?.results ?? null)
-    const failureRecord = enrichFailure(error, failure, progress, nativeOptions.timeoutMs)
-    const diagnosticError = progress === undefined || !isNativeTimeout(error)
-      ? error
-      : new Error(`${error?.message ?? String(error)}\n${formatProgressSummary(progress)}\nHypothesis: ${failureRecord.hypothesis}`)
-    if (isNativeTimeout(error)) {
+    const failureRecord = enrichFailure(normalizedError, failure, progress, nativeOptions.timeoutMs)
+    const diagnosticError = progress === undefined || !isNativeTimeout(normalizedError)
+      ? normalizedError
+      : new Error(`${normalizedError?.message ?? String(normalizedError)}\n${formatProgressSummary(progress)}\nHypothesis: ${failureRecord.hypothesis}`)
+    if (isNativeTimeout(normalizedError)) {
       console.error(`OpenCode native-agent smoke timeout: ${formatProgressSummary(progress)}`)
       console.error(`Hypothesis: ${failureRecord.hypothesis}`)
     }
     try {
-      writeArtifact(outputPath, makeArtifact({
+      writeArtifact(diagnosticOutputPath, makeArtifact({
         arm,
         rootModel,
         tierModels: requiredTierModels,
@@ -188,6 +271,7 @@ async function runNativeSmoke(argv = process.argv.slice(2)) {
         reports: observedReports,
         results: resultForArtifact,
         errors: [diagnosticError?.message ?? String(diagnosticError)],
+        logs: diagnosticLogs,
         failure: failureRecord,
         progress: progressAtTimeout,
         postShutdownProgress: progressAfterShutdown,
@@ -195,7 +279,7 @@ async function runNativeSmoke(argv = process.argv.slice(2)) {
       }))
     } catch (artifactError) {
       preserveTemporaryEvidence = true
-      const retained = retainDiagnosticEvidence({ outputPath, control, workspace })
+      const retained = retainDiagnosticEvidence({ outputPath: diagnosticOutputPath, control, workspace, logs: diagnosticLogs })
       const retainedPath = retained.path ?? `${control} (workspace: ${workspace})`
       const retentionError = retained.error === undefined ? "" : `\nEvidence copy also failed: ${retained.error.message ?? String(retained.error)}`
       const artifactFailure = new Error(`${diagnosticError?.message ?? String(diagnosticError)}\nCould not write diagnostic artifact: ${artifactError?.message ?? String(artifactError)}\nRetained evaluator evidence: ${retainedPath}${retentionError}`)
@@ -203,9 +287,10 @@ async function runNativeSmoke(argv = process.argv.slice(2)) {
       console.error(artifactFailure.message)
       throw artifactFailure
     }
+    console.error(`Native smoke diagnostic artifact: ${diagnosticOutputPath}`)
     throw diagnosticError
   } finally {
-    await stopProcess(child)
+    await stopOwnedProcess()
     if (!preserveTemporaryEvidence) {
       rmSync(workspace, { recursive: true, force: true })
       rmSync(control, { recursive: true, force: true })
@@ -218,6 +303,25 @@ async function runNativeSmoke(argv = process.argv.slice(2)) {
 
 function formatFailure(failure, logs) {
   return `${failure}\nOpenCode logs:\n${logs}`
+}
+
+function normalizeNativeSmokeError(error) {
+  if (error?.code !== "NATIVE_DEADLINE_EXCEEDED") return error
+  const normalized = new Error(error?.message ?? String(error))
+  normalized.code = "NATIVE_SMOKE_TIMEOUT"
+  normalized.cause = error
+  normalized.deadline = error.deadline
+  return normalized
+}
+
+function sanitizeDiagnosticText(value, ...secrets) {
+  let text = String(value ?? "")
+  for (const secret of secrets) {
+    if (typeof secret === "string" && secret !== "") text = text.split(secret).join("[REDACTED]")
+  }
+  return text
+    .replace(/Basic\s+[A-Za-z0-9+/=]+/giu, "Basic [REDACTED]")
+    .replace(/(api[-_]?key|authorization|password|secret|token)\s*[:=]\s*[^\s,;]+/giu, "$1=[REDACTED]")
 }
 
 export function parseNativeOptions(argv) {
@@ -307,6 +411,10 @@ function detectHostVersion() {
   } catch {
     return null
   }
+}
+
+function stageDeadline(overallDeadline, capMs) {
+  return Math.min(overallDeadline, Date.now() + Math.max(1, capMs))
 }
 
 function readJson(filename) {
@@ -437,11 +545,12 @@ export function enrichFailure(error, observerFailure, progress, timeoutMs) {
 }
 
 function isNativeTimeout(error) {
-  return error?.code === "NATIVE_SMOKE_TIMEOUT"
+  return error?.code === "NATIVE_SMOKE_TIMEOUT" || error?.code === "NATIVE_DEADLINE_EXCEEDED"
 }
 
-export function makeArtifact({ arm: artifactArm, rootModel: artifactRootModel, tierModels, hostVersion: version, startupMs: startup, timeoutMs, scenarioIDs, reports, results, errors, failure, progress, postShutdownProgress, postShutdownFailure }) {
+export function makeArtifact({ arm: artifactArm, rootModel: artifactRootModel, tierModels, hostVersion: version, startupMs: startup, timeoutMs, scenarioIDs, reports, results, errors, logs, failure, progress, postShutdownProgress, postShutdownFailure }) {
   const resultList = Array.isArray(results) ? results : null
+  const nativeResult = resultList === null && results !== undefined ? results : null
   return {
     schemaVersion: 1,
     arm: artifactArm,
@@ -456,8 +565,10 @@ export function makeArtifact({ arm: artifactArm, rootModel: artifactRootModel, t
       : "tiered plugin enabled; native tier agents and primary routing protocol are under evaluation",
     reports: Array.isArray(reports) ? reports : [],
     results: resultList,
+    nativeResult,
     rawTrace: resultList?.map((result) => result?.rawTrace ?? result) ?? null,
     errors: Array.isArray(errors) ? errors : [String(errors)],
+    logs: logs ?? null,
     failure: failure ?? null,
     progress: progress ?? null,
     postShutdownProgress: postShutdownProgress ?? null,
@@ -471,7 +582,7 @@ function writeArtifact(filename, artifact) {
   writeFileSync(filename, JSON.stringify(artifact, null, 2) + "\n")
 }
 
-function retainDiagnosticEvidence({ outputPath, control, workspace }) {
+function retainDiagnosticEvidence({ outputPath, control, workspace, logs }) {
   const base = outputPath === undefined
     ? join(tmpdir(), `opencode-native-evidence-${Date.now()}-${process.pid}`)
     : `${outputPath}.evidence-${Date.now()}-${process.pid}`
@@ -482,6 +593,7 @@ function retainDiagnosticEvidence({ outputPath, control, workspace }) {
     mkdirSync(temporary, { recursive: true })
     cpSync(control, join(temporary, "control"), { recursive: true })
     cpSync(workspace, join(temporary, "workspace"), { recursive: true })
+    if (logs !== undefined) writeFileSync(join(temporary, "logs.txt"), String(logs))
     writeFileSync(join(temporary, "retention.json"), JSON.stringify({ control, workspace, outputPath: outputPath ?? null }, null, 2) + "\n")
     renameSync(temporary, base)
     return { path: base }
@@ -528,7 +640,6 @@ function verifyMaterializedAgents(agents, expectedTiers) {
     const agent = verifyTierAgent(agents, tier, expected, "materialized")
     verifyMaterializedAgentFields(agent, tier)
   }
-  verifyPlanPermissions(agents)
 }
 
 function nativeAgents(providerErrorModel) {
@@ -577,23 +688,265 @@ function verifyMaterializedAgentFields(agent, tier) {
   }
 }
 
-function verifyPlanPermissions(agents) {
-  const plan = agents.find((candidate) => candidate.id === "plan")
-  if (!plan) return
-  for (const tier of ["medium", "heavy"]) {
-    const rule = [...(plan.permissions ?? [])].reverse().find(
-      (candidate) => candidate.action === "subagent" && candidate.resource === tier,
-    )
-    if (rule?.effect !== "deny") {
-      throw new Error(`native plan can invoke ${tier}: ${JSON.stringify(plan)}`)
+export function effectiveNativePermission(permissions, action, resource = "*") {
+  if (!Array.isArray(permissions)) return undefined
+  return [...permissions].reverse().find((rule) =>
+    (rule?.action === action || rule?.action === "*")
+      && nativeResourceMatches(rule?.resource, resource),
+  )
+}
+
+export function verifyNativePlanEvidence(evidence, workspace) {
+  if (!evidence || typeof evidence !== "object") {
+    throw new Error(`native Plan probe produced no evidence: ${JSON.stringify(evidence)}`)
+  }
+  const rootEvidence = evidence.root
+  const childEvidence = evidence.child
+  if (!rootEvidence || !childEvidence) {
+    throw new Error(`native Plan probe omitted root or child evidence: ${JSON.stringify(evidence)}`)
+  }
+  verifyNativePlanRoot(rootEvidence, evidence.buildPermissionsBefore)
+  verifyNativePlanSession(childEvidence, "Plan fast child", evidence.userDenied)
+  if (workspace !== undefined && existsSync(join(workspace, "native-smoke-plan-guard.txt"))) {
+    throw new Error("native Plan execution guard allowed the mutation probe")
+  }
+
+  if (childEvidence.agent !== "fast") {
+    throw new Error(`native Plan probe used the wrong child agent: ${JSON.stringify(childEvidence)}`)
+  }
+  if (childEvidence.parentID !== rootEvidence.id) {
+    throw new Error(`native Plan child did not retain Plan ancestry: ${JSON.stringify({ root: rootEvidence.id, child: childEvidence })}`)
+  }
+  verifyNativePlanGuard(evidence)
+
+  const before = evidence.buildPermissionsBefore
+  const after = evidence.buildPermissionsAfter
+  if (!sameNativePermissionRules(before, after)) {
+    throw new Error(`native Build permissions were not restored after switching back from Plan: ${JSON.stringify({ before, after })}`)
+  }
+  if (!evidence.restoredBuild || evidence.restoredBuild.agent !== "build") {
+    throw new Error(`native Build root was not restored after the Plan probe: ${JSON.stringify(evidence.restoredBuild)}`)
+  }
+  verifyBuildContextHasMutationTools(evidence.buildBefore, evidence.restoredBuild)
+  if (!evidence.restoredBuildChild || evidence.restoredBuildChild.agent !== "fast") {
+    throw new Error(`native Build child was not created after restoring the root: ${JSON.stringify(evidence.restoredBuildChild)}`)
+  }
+  if (evidence.restoredBuildChild.parentID !== evidence.restoredBuild.id) {
+    throw new Error(`native Build child has the wrong parent after root restoration: ${JSON.stringify(evidence.restoredBuildChild)}`)
+  }
+  if (hasNativePlanPolicy(evidence.restoredBuildChild.permissions)) {
+    throw new Error(`new Build child inherited the Plan policy after root restoration: ${JSON.stringify(evidence.restoredBuildChild)}`)
+  }
+
+  const planSessionIDs = new Set([rootEvidence.id, childEvidence.id])
+  for (const event of evidence.toolEvents ?? []) {
+    if (!planSessionIDs.has(event.sessionID)) continue
+    if (NATIVE_PLAN_MUTATING_ACTIONS.includes(event.tool) && (event.status === "completed" || event.result?.status === "completed")) {
+      throw new Error(`native Plan probe executed a mutating tool: ${JSON.stringify(event)}`)
     }
+  }
+  return evidence
+}
+
+function verifyNativePlanRoot(session, baselinePermissions) {
+  if (session.agent !== "plan") {
+    throw new Error(`native Plan root used the wrong agent: ${JSON.stringify(session)}`)
+  }
+  if (!Array.isArray(session.permissions)) {
+    throw new Error(`native Plan root exposed no session permissions: ${JSON.stringify(session)}`)
+  }
+  // The root intentionally retains only the original caller rules plus a
+  // bounded, non-broadening marker.  Do not require the child deny-all policy:
+  // the V2 host snapshots tools before the context hook and the runtime guard
+  // is the root boundary.
+  verifyNativeRootPermissionBlock(session.permissions, baselinePermissions)
+  assertNativeEffect(session.permissions, "read", "native-smoke-private.txt", "deny", "Plan root stricter user read deny")
+  assertNativeEffect(session.permissions, "subagent", "heavy", "deny", "Plan root stricter user delegation deny")
+  const toolNames = session.context?.toolNames
+  if (!Array.isArray(toolNames)) {
+    throw new Error(`Plan root did not expose a captured native context: ${JSON.stringify(session)}`)
+  }
+  for (const tool of nativePlanContextTools(session.permissions)) {
+    if (!toolNames.includes(tool)) {
+      throw new Error(`Plan root native context omitted non-mutating tool ${tool}: ${JSON.stringify(session.context)}`)
+    }
+  }
+  const unsafeTools = toolNames.filter((tool) => !NATIVE_PLAN_ALLOWED_CONTEXT_TOOLS.has(tool))
+  if (unsafeTools.length > 0) {
+    throw new Error(`Plan root native context exposed unsafe tools: ${JSON.stringify({ unsafeTools, context: session.context })}`)
   }
 }
 
-function observerSource(resultPaths, selectedRootModel, configuredTiers, configuredProviderErrorModel) {
+function verifyNativePlanSession(session, label, userDenied = []) {
+  const permissions = session.permissions
+  if (!Array.isArray(permissions)) {
+    throw new Error(`${label} exposed no session permissions: ${JSON.stringify(session)}`)
+  }
+  for (const expected of NATIVE_PLAN_POLICY_RULES) {
+    if (!permissions.some((actual) => sameNativePermissionRule(actual, expected))) {
+      throw new Error(`${label} omitted the effective Plan policy rule ${JSON.stringify(expected)}: ${JSON.stringify(permissions)}`)
+    }
+  }
+  for (const action of NATIVE_PLAN_MUTATING_ACTIONS) {
+    assertNativeEffect(permissions, action, "native-smoke-protected.txt", "deny", `${label} ${action}`)
+  }
+  const deniedDelegations = new Set(userDenied
+    .filter((rule) => rule?.action === "subagent")
+    .map((rule) => rule.resource))
+  assertNativeEffect(permissions, "subagent", "fast", deniedDelegations.has("fast") ? "deny" : "allow", `${label} fast delegation`)
+  assertNativeEffect(permissions, "subagent", "medium", deniedDelegations.has("medium") ? "deny" : "allow", `${label} medium delegation`)
+  assertNativeEffect(permissions, "subagent", "heavy", deniedDelegations.has("heavy") ? "deny" : "allow", `${label} heavy delegation`)
+  assertNativeEffect(permissions, "subagent", "unknown-agent", "ask", `${label} wildcard delegation visibility`)
+  assertNativeEffect(permissions, "question", "*", "allow", `${label} question capability`)
+  assertNativeEffect(permissions, "skill", "*", "allow", `${label} skill capability`)
+  assertNativeEffect(permissions, "read", "native-smoke-private.txt", "deny", `${label} stricter user read deny`)
+  assertNativeEffect(permissions, "read", "ordinary.txt", "allow", `${label} read capability`)
+  assertNativeEffect(permissions, "read", "config.env", "ask", `${label} environment ask`)
+  assertNativeEffect(permissions, "read", "config.env.local", "ask", `${label} nested environment ask`)
+  assertNativeEffect(permissions, "read", "config.env.example", "allow", `${label} environment example read`)
+
+  const toolNames = session.context?.toolNames
+  if (!Array.isArray(toolNames)) {
+    throw new Error(`${label} did not expose a captured native context: ${JSON.stringify(session)}`)
+  }
+  for (const tool of nativePlanContextTools(permissions)) {
+    if (!toolNames.includes(tool)) {
+      throw new Error(`${label} native context omitted non-mutating tool ${tool}: ${JSON.stringify(session.context)}`)
+    }
+  }
+  const unsafeTools = toolNames.filter((tool) => !NATIVE_PLAN_ALLOWED_CONTEXT_TOOLS.has(tool))
+  if (unsafeTools.length > 0) {
+    throw new Error(`${label} native context exposed unsafe tools: ${JSON.stringify({ unsafeTools, context: session.context })}`)
+  }
+}
+
+function nativePlanContextTools(permissions) {
+  return [...NATIVE_PLAN_SAFE_TOOLS, "subagent"].filter((tool) => (
+    effectiveNativePermission(permissions, tool, "*")?.effect !== "deny"
+  ))
+}
+
+function hasNativePlanPolicy(permissions) {
+  return Array.isArray(permissions)
+    && NATIVE_PLAN_POLICY_RULES.every((expected) => permissions.some((actual) => sameNativePermissionRule(actual, expected)))
+}
+
+function verifyNativePlanGuard(evidence) {
+  const guardEvents = (evidence.guardToolEvents ?? []).filter((event) => (
+    NATIVE_PLAN_MUTATING_ACTIONS.includes(event.tool) || event.tool === "subagent"
+  ))
+  const blockedEvent = guardEvents.find((event) => event.status === "error" || event.result?.status === "error" || event.result?.error !== undefined)
+  const guardError = String(evidence.guardErrorText ?? "")
+  if (!blockedEvent && !/read-only|not permitted|permission|blocked|only the fast, medium, and heavy plugin tiers/iu.test(guardError)) {
+    throw new Error(`native Plan execution guard was not observed: ${JSON.stringify({ guardEvents, guardError })}`)
+  }
+  if (guardEvents.some((event) => event.tool === "subagent" && (event.status === "completed" || event.result?.status === "completed"))) {
+    throw new Error(`native Plan execute guard allowed a non-plugin subagent target: ${JSON.stringify(guardEvents)}`)
+  }
+  if (guardEvents.some((event) => NATIVE_PLAN_MUTATING_ACTIONS.includes(event.tool) && (event.status === "completed" || event.result?.status === "completed"))) {
+    throw new Error(`native Plan execution guard allowed a mutating tool: ${JSON.stringify(guardEvents)}`)
+  }
+}
+
+function verifyBuildContextHasMutationTools(before, restored) {
+  const baselineTools = before?.context?.toolNames
+  const restoredTools = restored?.context?.toolNames
+  if (!Array.isArray(baselineTools) || !Array.isArray(restoredTools)) {
+    throw new Error(`native Build context evidence did not include tool snapshots: ${JSON.stringify({ before, restored })}`)
+  }
+  const baselineMutating = baselineTools.filter((tool) => NATIVE_PLAN_MUTATING_ACTIONS.includes(tool))
+  const restoredMutating = restoredTools.filter((tool) => NATIVE_PLAN_MUTATING_ACTIONS.includes(tool))
+  const missingRequired = NATIVE_BUILD_REQUIRED_MUTATING_TOOLS.filter((tool) => !baselineMutating.includes(tool))
+  if (missingRequired.length > 0) {
+    throw new Error(`first Build context omitted required mutating tools: ${JSON.stringify({ missingRequired, baselineTools })}`)
+  }
+  if (!sameStringSet(baselineMutating, restoredMutating)) {
+    throw new Error(`restored Build context changed its mutating tool set: ${JSON.stringify({ baselineMutating, restoredMutating, before, restored })}`)
+  }
+}
+
+function verifyNativeRootPermissionBlock(actual, baseline) {
+  if (!Array.isArray(baseline) || !Array.isArray(actual) || actual.length < baseline.length) {
+    throw new Error(`native Plan root did not retain the original Build permission block: ${JSON.stringify({ baseline, actual })}`)
+  }
+  if (!sameNativePermissionRules(actual.slice(0, baseline.length), baseline)) {
+    throw new Error(`native Plan root changed the original Build permission block: ${JSON.stringify({ baseline, actual })}`)
+  }
+  const marker = actual.slice(baseline.length)
+  if (marker.length === 0 || marker.some((rule) => !isNonRestrictiveMarkerRule(rule))) {
+    throw new Error(`native Plan root retained a full/restrictive child policy instead of only a bounded marker: ${JSON.stringify({ baseline, actual })}`)
+  }
+  if (hasNativePlanPolicy(actual)) {
+    throw new Error(`native Plan root retained the child full read-only policy: ${JSON.stringify(actual)}`)
+  }
+}
+
+function isNonRestrictiveMarkerRule(rule) {
+  if (rule?.effect !== "deny" || rule.action === "*" || rule.resource === "*") return false
+  const knownActions = new Set([...NATIVE_PLAN_SAFE_TOOLS, ...NATIVE_PLAN_MUTATING_ACTIONS, "subagent"])
+  if (!knownActions.has(rule.action)) return true
+  return ![
+    "*",
+    "ordinary.txt",
+    "native-smoke-private.txt",
+    "native-smoke-protected.txt",
+    "config.env",
+    "config.env.local",
+    "config.env.example",
+    "fast",
+    "medium",
+    "heavy",
+    "unknown-agent",
+  ].some((resource) => nativeResourceMatches(rule.resource, resource))
+}
+
+function sameStringSet(left, right) {
+  return left.length === right.length && left.every((value) => right.includes(value))
+}
+
+function assertNativeEffect(permissions, action, resource, expected, label) {
+  const actual = effectiveNativePermission(permissions, action, resource)
+  if (actual?.effect !== expected) {
+    throw new Error(`${label} expected ${expected}, got ${JSON.stringify(actual)}: ${JSON.stringify(permissions)}`)
+  }
+}
+
+function nativeResourceMatches(pattern, resource) {
+  if (pattern === "*") return true
+  if (pattern === resource) return true
+  if (typeof pattern !== "string" || typeof resource !== "string") return false
+  if (pattern.startsWith("*.") && pattern.endsWith(".*")) {
+    return resource.includes(pattern.slice(1, -1))
+  }
+  if (pattern.startsWith("*")) return resource.endsWith(pattern.slice(1))
+  return false
+}
+
+function sameNativePermissionRules(left, right) {
+  return Array.isArray(left)
+    && Array.isArray(right)
+    && left.length === right.length
+    && left.every((rule, index) => JSON.stringify(rule) === JSON.stringify(right[index]))
+}
+
+function sameNativePermissionRule(left, right) {
+  return left?.action === right?.action
+    && left?.resource === right?.resource
+    && left?.effect === right?.effect
+}
+
+function observerSource(resultPaths, selectedRootModel, configuredTiers, configuredProviderErrorModel, overallDeadline) {
   const directModels = Object.fromEntries(
     Object.entries(configuredTiers).map(([tier, config]) => [tier, runtimeModelSelection(config.model, config.variant)]),
   )
+  const planBuildPermissions = [
+    { action: "*", resource: "*", effect: "allow" },
+    { action: "grep", resource: "*", effect: "deny" },
+    { action: "read", resource: "native-smoke-private.txt", effect: "deny" },
+    { action: "edit", resource: "native-smoke-protected.txt", effect: "deny" },
+    { action: "subagent", resource: "heavy", effect: "deny" },
+    { action: "subagent", resource: "fast", effect: "allow" },
+  ]
   return [
     `import { appendFileSync, writeFileSync } from "node:fs"`,
     `const markerPath = ${JSON.stringify(resultPaths.marker)}`,
@@ -605,6 +958,8 @@ function observerSource(resultPaths, selectedRootModel, configuredTiers, configu
     `const expectedTiers = ${JSON.stringify(configuredTiers)}`,
     `const providerErrorModel = ${JSON.stringify(configuredProviderErrorModel)}`,
     `const tiers = ${JSON.stringify(["fast", "medium", "heavy"])}`,
+    `const planBuildPermissions = ${JSON.stringify(planBuildPermissions)}`,
+    `const overallDeadline = ${JSON.stringify(overallDeadline)}`,
     "",
     "function snapshot(event) {",
     "  return {",
@@ -612,6 +967,8 @@ function observerSource(resultPaths, selectedRootModel, configuredTiers, configu
     "    agent: event.agent,",
     "    model: event.model,",
     "    hasProtocol: event.system.some((part) => String(part?.text ?? \"\").includes(\"Tiered Dispatch Protocol\")),",
+    "    hasPlanInstruction: event.system.some((part) => String(part?.text ?? \"\").includes(\"Plan-originated child\")),",
+    "    systemText: event.system.map((part) => String(part?.text ?? \"\")).join(\"\\n\"),",
     "    toolNames: Object.keys(event.tools ?? {}),",
     "  }",
     "}",
@@ -637,8 +994,8 @@ function observerSource(resultPaths, selectedRootModel, configuredTiers, configu
     "  return {",
     "    type: \"tool\", phase, observedAt: Date.now(), scenarioID: progressState.scenarioID, rootSessionID: progressState.rootSessionID,",
     "    sessionID: event.sessionID, messageID: event.messageID, id: event.id, tool: event.tool, agent: event.agent,",
-    "    input: compactInput, status: event.status,",
-    "    result: phase === \"after\" ? { sessionID: output?.sessionID, status: output?.status, metadata: event.result?.metadata === undefined ? undefined : { sessionID: event.result.metadata?.sessionID, status: event.result.metadata?.status }, output: compactText(output?.output), exit: output?.exit, signal: output?.signal, timeout: output?.timeout } : undefined,",
+    "    input: compactInput, status: event.status ?? (event.error === undefined ? undefined : \"error\"),",
+    "    result: phase === \"after\" ? { sessionID: output?.sessionID, status: output?.status, metadata: event.result?.metadata === undefined ? undefined : { sessionID: event.result.metadata?.sessionID, status: event.result.metadata?.status }, output: compactText(output?.output), exit: output?.exit, signal: output?.signal, timeout: output?.timeout, error: compactText(event.error) } : undefined,",
     "  }",
     "}",
     "",
@@ -647,19 +1004,27 @@ function observerSource(resultPaths, selectedRootModel, configuredTiers, configu
     "  catch (error) { process.stderr.write(\"native smoke progress journal unavailable: \" + (error?.message ?? String(error)) + \"\\n\") }",
     "}",
     "",
+    "function timeoutError(message) { const error = new Error(message); error.code = \"NATIVE_SMOKE_TIMEOUT\"; return error }",
+    "",
     "async function requestWithTimeout(operation, timeout, message) {",
     "  let timer",
     "  try {",
-    "    return await Promise.race([Promise.resolve().then(operation), new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), Math.max(1, timeout)) })])",
+    "    return await Promise.race([Promise.resolve().then(operation), new Promise((_, reject) => { timer = setTimeout(() => reject(timeoutError(message)), Math.max(1, timeout)) })])",
     "  } finally { clearTimeout(timer) }",
     "}",
     "",
-    "async function sessionContext(ctx, sessionID, timeout = 5_000) {",
-    "  return requestWithTimeout(() => ctx.session.context({ sessionID }), timeout, \"session context inspection timed out\")",
+    "async function runOperation(operation, message, cap = 30_000) {",
+    "  const remaining = overallDeadline - Date.now()",
+    "  if (remaining <= 0) throw timeoutError(message)",
+    "  return requestWithTimeout(operation, Math.min(cap, remaining), message)",
     "}",
     "",
-    "async function createSession(ctx, title, agent, model, activeSessions) {",
-    "  const session = await ctx.session.create({ title, agent, model, location: { directory: ctx.location.directory } })",
+    "async function sessionContext(ctx, sessionID, timeout = 5_000) {",
+    "  return runOperation(() => ctx.session.context({ sessionID }), \"session context inspection timed out\", timeout)",
+    "}",
+    "",
+    "async function createSession(ctx, title, agent, model, activeSessions, options = {}) {",
+    "  const session = await ctx.session.create({ title, agent, model, location: { directory: ctx.location.directory }, ...options })",
     "  activeSessions?.add(session.id)",
     "  return session",
     "}",
@@ -668,6 +1033,7 @@ function observerSource(resultPaths, selectedRootModel, configuredTiers, configu
     "  id: \"tiered-native-smoke-observer\",",
     "  async setup(ctx) {",
     "    const events = []",
+    "    const toolEvents = []",
     "    const registrations = []",
     "    const activeSessions = new Set()",
     "    let progressState = { phase: \"setup\", scenarioID: null, rootSessionID: null, observedAt: Date.now() }",
@@ -688,7 +1054,7 @@ function observerSource(resultPaths, selectedRootModel, configuredTiers, configu
     "      })",
     "    }))",
     "    for (const phase of [\"before\", \"after\"]) {",
-    "      registrations.push(await ctx.tool.hook(\"execute.\" + phase, (event) => writeProgress(compactTool(event, phase, progressState))))",
+    "      registrations.push(await ctx.tool.hook(\"execute.\" + phase, (event) => { const observed = compactTool(event, phase, progressState); toolEvents.push(observed); writeProgress(observed) }))",
     "    }",
     "    checkpoint(\"ready\")",
     "    writeFileSync(markerPath, \"setup complete\")",
@@ -707,9 +1073,9 @@ function observerSource(resultPaths, selectedRootModel, configuredTiers, configu
     "            checkpoint(\"direct-session-create\", { scenarioID: tier, rootSessionID: null })",
     "            const session = await createSession(ctx, `[native smoke] direct ${tier}`, tier, directModels[tier], activeSessions)",
     "            checkpoint(\"prompt\", { scenarioID: tier, rootSessionID: session.id })",
-    "            await ctx.session.prompt({ sessionID: session.id, text: directPrompts[tier] })",
+    "            await runOperation(() => ctx.session.prompt({ sessionID: session.id, text: directPrompts[tier] }), `native ${tier} prompt timed out`)",
     "            checkpoint(\"wait\", { scenarioID: tier, rootSessionID: session.id })",
-    "            await ctx.session.wait({ sessionID: session.id })",
+    "            await runOperation(() => ctx.session.wait({ sessionID: session.id }), `native ${tier} wait timed out`)",
     "            ensureActive(\"direct session wait\")",
     "            results[tier] = session.id",
     "            checkpoint(\"direct-complete\", { scenarioID: tier, rootSessionID: session.id })",
@@ -726,9 +1092,9 @@ function observerSource(resultPaths, selectedRootModel, configuredTiers, configu
     "          checkpoint(\"routing-session-create\", { scenarioID: \"routing\", rootSessionID: null })",
     "          const routingRoot = await createSession(ctx, \"[native smoke] primary routing\", \"build\", rootModel, activeSessions)",
     "          checkpoint(\"routing-prompt\", { scenarioID: \"routing\", rootSessionID: routingRoot.id })",
-    "          await ctx.session.prompt({ sessionID: routingRoot.id, text: \"Use the native subagent tool exactly once. Select agent medium and ask it to return exactly NATIVE_ROUTE_MEDIUM_OK without using tools. After it returns, reply exactly NATIVE_ROUTE_OK. Do not call any other tools.\" })",
+    "          await runOperation(() => ctx.session.prompt({ sessionID: routingRoot.id, text: \"Use the native subagent tool exactly once. Select agent medium and ask it to return exactly NATIVE_ROUTE_MEDIUM_OK without using tools. After it returns, reply exactly NATIVE_ROUTE_OK. Do not call any other tools.\" }), \"native routing prompt timed out\")",
     "          checkpoint(\"routing-wait\", { scenarioID: \"routing\", rootSessionID: routingRoot.id })",
-    "          await ctx.session.wait({ sessionID: routingRoot.id })",
+    "          await runOperation(() => ctx.session.wait({ sessionID: routingRoot.id }), \"native routing wait timed out\")",
     "          ensureActive(\"routing session wait\")",
     "          const routingChild = await waitForAgentEvent(events, routingStart, \"medium\")",
     "          const routingRootMessages = await sessionContext(ctx, routingRoot.id)",
@@ -736,13 +1102,15 @@ function observerSource(resultPaths, selectedRootModel, configuredTiers, configu
     "          const routing = { rootSessionID: routingRoot.id, childSessionID: routingChild.sessionID, rootText: messageText(routingRootMessages), childText: messageText(routingChildMessages) }",
     "          checkpoint(\"native-tool-checks\", { scenarioID: \"routing\", rootSessionID: routingRoot.id })",
     "          await exerciseNativeTools(ctx, events)",
+    "          checkpoint(\"plan-permissions\", { scenarioID: \"plan\", rootSessionID: null })",
+    "          const plan = await exerciseNativePlan(ctx, events, activeSessions, toolEvents)",
     "          const tierEvents = events.filter((event) => tiers.includes(event.agent) && results[event.agent] === event.sessionID)",
     "          const routingEvents = events.slice(routingStart)",
     "          checkpoint(\"native-lifecycle\", { scenarioID: \"lifecycle\", rootSessionID: null })",
     "          const lifecycle = await exerciseNativeLifecycle(ctx, events, activeSessions)",
     "          ensureActive(\"native lifecycle\")",
     "          checkpoint(\"complete\", { scenarioID: null, rootSessionID: null })",
-    "          writeFileSync(resultPath, JSON.stringify({ expected: expectedTiers, expectedProviderErrorModel: providerErrorModel, tiers: results, outputs, routing, lifecycle, tierEvents, routingEvents, events }))",
+    "          writeFileSync(resultPath, JSON.stringify({ expected: expectedTiers, expectedProviderErrorModel: providerErrorModel, tiers: results, outputs, routing, plan, lifecycle, tierEvents, routingEvents, toolEvents, events }))",
     "        } catch (error) {",
     "          const failedFrom = { ...progressState }",
     "          checkpoint(\"failure\", { failedFromPhase: failedFrom.phase, failedFromScenarioID: failedFrom.scenarioID, failedFromRootSessionID: failedFrom.rootSessionID, error: error?.message ?? String(error) })",
@@ -763,6 +1131,62 @@ function observerSource(resultPaths, selectedRootModel, configuredTiers, configu
     "  },",
     "}",
     "",
+    "async function exerciseNativePlan(ctx, events, activeSessions, toolEvents) {",
+    "  const buildRoot = await createSession(ctx, \"[native smoke] Plan restoration\", \"build\", rootModel, activeSessions, { permissions: planBuildPermissions })",
+    "  const buildContextStart = events.length",
+    "  await runOperation(() => ctx.session.prompt({ sessionID: buildRoot.id, text: \"Reply exactly NATIVE_BUILD_BASELINE_OK without using tools.\" }), \"native Build baseline prompt timed out\")",
+    "  await runOperation(() => ctx.session.wait({ sessionID: buildRoot.id }), \"native Build baseline wait timed out\")",
+    "  const buildBeforeContext = await waitForContextEvent(events, buildContextStart, buildRoot.id, \"build\")",
+    "  const before = await ctx.session.get({ sessionID: buildRoot.id })",
+    "  const buildPermissionsBefore = clone(before.permissions ?? [])",
+    "  await ctx.session.switchAgent({ sessionID: buildRoot.id, agent: \"plan\" })",
+    "  const planStart = events.length",
+    "  await runOperation(() => ctx.session.prompt({ sessionID: buildRoot.id, text: \"Use the native subagent tool exactly once. Select agent fast and ask it to use the read tool once on README.md, then return exactly NATIVE_PLAN_FAST_OK. Do not use edit, write, patch, shell, question, or skill. After the child returns, reply exactly NATIVE_PLAN_OK. Do not delegate another tier.\" }), \"native Plan delegation prompt timed out\")",
+    "  await runOperation(() => ctx.session.wait({ sessionID: buildRoot.id }), \"native Plan delegation wait timed out\")",
+    "  const planRootEvent = await waitForContextEvent(events, planStart, buildRoot.id, \"plan\")",
+    "  const planRoot = await captureSessionInfo(ctx, planRootEvent)",
+    "  const planChildEvent = await waitForAgentEvent(events, planStart, \"fast\")",
+    "  const planChild = await captureSessionInfo(ctx, planChildEvent)",
+    "  const planRootMessages = await sessionContext(ctx, buildRoot.id)",
+    "  const planChildMessages = await sessionContext(ctx, planChildEvent.sessionID)",
+    "  planRoot.text = messageText(planRootMessages)",
+    "  planChild.text = messageText(planChildMessages)",
+    "  const guardStart = toolEvents.length",
+    "  await runOperation(() => ctx.session.prompt({ sessionID: buildRoot.id, text: \"Call the native subagent tool exactly once with agent `native-smoke-unknown` and ask it to return exactly NATIVE_PLAN_GUARD_SHOULD_NOT_RUN. The Plan execute guard must reject this non-plugin target before any child starts. Do not retry, do not use any other tool, and then reply exactly NATIVE_PLAN_GUARD_OK.\" }), \"native Plan guard prompt timed out\")",
+    "  await runOperation(() => ctx.session.wait({ sessionID: buildRoot.id }), \"native Plan guard wait timed out\")",
+    "  const guardMessages = await sessionContext(ctx, buildRoot.id)",
+    "  const guardToolEvents = toolEvents.slice(guardStart)",
+    "  await ctx.session.switchAgent({ sessionID: buildRoot.id, agent: \"build\" })",
+    "  const buildChildStart = events.length",
+    "  await runOperation(() => ctx.session.prompt({ sessionID: buildRoot.id, text: \"Use the native subagent tool exactly once. Select agent fast and ask it to return exactly NATIVE_RESTORED_BUILD_CHILD_OK without using tools. After it returns, reply exactly NATIVE_RESTORED_BUILD_OK. Do not call any other tools.\" }), \"restored Build child prompt timed out\")",
+    "  await runOperation(() => ctx.session.wait({ sessionID: buildRoot.id }), \"restored Build child wait timed out\")",
+    "  const restoredBuildContext = await waitForContextEvent(events, buildChildStart, buildRoot.id, \"build\")",
+    "  const restoredBuild = await captureSessionInfo(ctx, restoredBuildContext)",
+    "  const restoredBuildChildEvent = await waitForAgentEvent(events, buildChildStart, \"fast\")",
+    "  const restoredBuildChild = await captureSessionInfo(ctx, restoredBuildChildEvent)",
+    "  restoredBuild.text = messageText(await sessionContext(ctx, buildRoot.id))",
+    "  return {",
+    "    root: planRoot, child: planChild, buildBefore: { id: buildRoot.id, agent: \"build\", permissions: buildPermissionsBefore, context: buildBeforeContext },",
+    "    buildPermissionsBefore, buildPermissionsAfter: clone(restoredBuild.permissions ?? []), userDenied: planBuildPermissions.filter((rule) => rule.effect === \"deny\"),",
+    "    restoredBuild, restoredBuildChild, guardToolEvents, guardErrorText: messageErrors(guardMessages),",
+    "    toolEvents: toolEvents.filter((event) => [buildRoot.id, planChildEvent.sessionID, restoredBuildChildEvent.sessionID].includes(event.sessionID)),",
+    "  }",
+    "}",
+    "",
+    "async function captureSessionInfo(ctx, observed) {",
+    "  const sessionID = observed.sessionID",
+    "  const session = await ctx.session.get({ sessionID })",
+    "  return { id: session.id ?? sessionID, parentID: session.parentID, agent: session.agent ?? observed.agent, model: session.model, permissions: clone(session.permissions ?? []), context: observed }",
+    "}",
+    "",
+    "async function waitForContextEvent(events, start, sessionID, agent) {",
+    "  return poll(() => [...events].reverse().find((candidate) => events.indexOf(candidate) >= start && candidate.sessionID === sessionID && (agent === undefined || candidate.agent === agent)), Boolean, 30_000, `native smoke did not observe context for ${agent ?? \"session\"} ${sessionID}`)",
+    "}",
+    "",
+    "function clone(value) {",
+    "  return JSON.parse(JSON.stringify(value))",
+    "}",
+    "",
     "async function exerciseNativeTools(ctx, events) {",
     "  const checks = {",
     "    medium: \"Tool-access test: your response is invalid unless you call the patch tool now. Apply this exact patch before saying anything: *** Begin Patch\\n*** Add File: native-smoke-medium.txt\\n+MEDIUM_EDIT_OK\\n*** End Patch. After the patch succeeds, reply exactly TOOL_CHECK_MEDIUM_OK.\",",
@@ -771,8 +1195,8 @@ function observerSource(resultPaths, selectedRootModel, configuredTiers, configu
     "  for (const [agent, text] of Object.entries(checks)) {",
     "    const child = [...events].reverse().find((event) => event.agent === agent)",
     "    if (!child) throw new Error(`native smoke did not observe ${agent} child for tool check`)",
-    "    await ctx.session.prompt({ sessionID: child.sessionID, text })",
-    "    await ctx.session.wait({ sessionID: child.sessionID })",
+    "    await runOperation(() => ctx.session.prompt({ sessionID: child.sessionID, text }), `native ${agent} tool-check prompt timed out`)",
+    "    await runOperation(() => ctx.session.wait({ sessionID: child.sessionID }), `native ${agent} tool-check wait timed out`)",
     "  }",
     "}",
     "",
@@ -780,17 +1204,17 @@ function observerSource(resultPaths, selectedRootModel, configuredTiers, configu
     "  const cancellationStart = events.length",
     "  const cancellationRoot = await createSession(ctx, \"[native smoke] cancellation\", \"build\", rootModel, activeSessions)",
     "  let cancellationError",
-    "  const cancellationPrompt = ctx.session.prompt({ sessionID: cancellationRoot.id, text: \"Use the native subagent tool exactly once. Select agent fast and ask it to spend a long time producing a detailed research answer. Do not answer until the child returns.\" }).catch((error) => { cancellationError = String(error) })",
+    "  const cancellationPrompt = runOperation(() => ctx.session.prompt({ sessionID: cancellationRoot.id, text: \"Use the native subagent tool exactly once. Select agent fast and ask it to spend a long time producing a detailed research answer. Do not answer until the child returns.\" }), \"native cancellation prompt timed out\").catch((error) => { cancellationError = String(error) })",
     "  const cancellationChild = await waitForAgentEvent(events, cancellationStart, \"fast\")",
-    "  const cancellationInterrupt = await withTimeout(ctx.session.interrupt({ sessionID: cancellationRoot.id, resume: false }), 30_000)",
-    "  await withTimeout(cancellationPrompt, 30_000)",
+    "  const cancellationInterrupt = await withTimeout(() => ctx.session.interrupt({ sessionID: cancellationRoot.id, resume: false }), 30_000)",
+    "  await cancellationPrompt",
     "  const cancellationRootInfo = await waitForOutcome(ctx, cancellationRoot.id, \"interrupted\", 30_000)",
     "  const cancellationChildInfo = await waitForOutcome(ctx, cancellationChild.sessionID, \"interrupted\", 30_000)",
     "  const providerStart = events.length",
     "  const providerRoot = await createSession(ctx, \"[native smoke] provider error\", \"build\", rootModel, activeSessions)",
     "  let providerPromptError",
-    "  const providerPrompt = ctx.session.prompt({ sessionID: providerRoot.id, text: \"Use the native subagent tool exactly once. Select agent provider-error and ask it to return exactly PROVIDER_ERROR_SHOULD_NOT_SUCCEED. Do not select another agent or retry with another model.\" }).catch((error) => { providerPromptError = String(error) })",
-    "  await withTimeout(providerPrompt, 30_000)",
+    "  const providerPrompt = runOperation(() => ctx.session.prompt({ sessionID: providerRoot.id, text: \"Use the native subagent tool exactly once. Select agent provider-error and ask it to return exactly PROVIDER_ERROR_SHOULD_NOT_SUCCEED. Do not select another agent or retry with another model.\" }), \"native provider-error prompt timed out\").catch((error) => { providerPromptError = String(error) })",
+    "  await providerPrompt",
     "  const providerRootInfo = await waitForCompletion(ctx, providerRoot.id, 30_000)",
     "  const fallbackEvents = events.slice(providerStart).filter((event) => [\"fast\", \"medium\", \"heavy\"].includes(event.agent))",
     "  const providerMessages = await sessionContext(ctx, providerRoot.id)",
@@ -814,7 +1238,7 @@ function observerSource(resultPaths, selectedRootModel, configuredTiers, configu
     "}",
     "",
     "async function poll(read, matches, timeout, failureMessage) {",
-    "  const deadline = Date.now() + timeout",
+    "  const deadline = Math.min(overallDeadline, Date.now() + timeout)",
     "  let latest",
     "  while (Date.now() < deadline) {",
     "    const remaining = Math.max(1, deadline - Date.now())",
@@ -824,11 +1248,13 @@ function observerSource(resultPaths, selectedRootModel, configuredTiers, configu
     "    if (Date.now() >= deadline) break",
     "    await new Promise((resolve) => setTimeout(resolve, 100))",
     "  }",
-    "  throw new Error(`${failureMessage}: ${JSON.stringify(latest)}`)",
+    "  throw timeoutError(`${failureMessage}: ${JSON.stringify(latest)}`)",
     "}",
     "",
-    "async function withTimeout(promise, timeout) {",
-    "  return Promise.race([promise, new Promise((_, reject) => setTimeout(() => reject(new Error(\"native smoke operation timed out\")), timeout))])",
+    "async function withTimeout(operation, timeout) {",
+    "  const remaining = overallDeadline - Date.now()",
+    "  if (remaining <= 0) throw timeoutError(\"native smoke operation timed out\")",
+    "  return requestWithTimeout(operation, Math.min(timeout, remaining), \"native smoke operation timed out\")",
     "}",
     "",
     "function messageErrors(messages) {",
@@ -842,6 +1268,7 @@ function observerSource(resultPaths, selectedRootModel, configuredTiers, configu
 }
 
 function verify(result, agents, workspace, configuredProviderErrorModel) {
+  verifyNativePlanEvidence(result.plan, workspace)
   const fileChecks = {
     medium: { path: join(workspace, "native-smoke-medium.txt"), content: "MEDIUM_EDIT_OK\n", action: "edit" },
     heavy: { path: join(workspace, "native-smoke-heavy.txt"), content: "HEAVY_SHELL_OK", action: "run a shell command" },
@@ -942,22 +1369,35 @@ function normalizedVariant(actual, expected) {
   return expected === undefined && actual === "default" ? undefined : (actual ?? undefined)
 }
 
-async function stopProcess(process) {
-  if (process.exitCode !== null || process.signalCode !== null) return
-  await new Promise((resolve) => {
+export async function stopProcess(child, { timeoutMs = 5_000 } = {}) {
+  if (!child || child.exitCode != null || child.signalCode != null) return { stopped: true, alreadyExited: true }
+  return new Promise((resolve) => {
     let finished = false
-    const finish = () => {
+    let timer
+    const finish = (details = {}) => {
       if (finished) return
       finished = true
       clearTimeout(timer)
-      resolve()
+      if (typeof child.removeListener === "function") child.removeListener("exit", onExit)
+      resolve({ stopped: true, ...details })
     }
-    const timer = setTimeout(() => {
-      process.kill("SIGKILL")
-      finish()
-    }, 5_000)
-    process.once("exit", finish)
-    process.kill("SIGTERM")
+    const onExit = () => finish({ signal: child.signalCode ?? undefined })
+    timer = setTimeout(() => {
+      try {
+        child.kill("SIGKILL")
+        finish({ forced: true })
+      } catch (error) {
+        // Cleanup must not replace the smoke failure.  The caller already has
+        // the original error and the returned diagnostic records this one.
+        finish({ forced: true, cleanupError: error?.message ?? String(error) })
+      }
+    }, Math.max(1, timeoutMs))
+    if (typeof child.once === "function") child.once("exit", onExit)
+    try {
+      child.kill("SIGTERM")
+    } catch (error) {
+      finish({ cleanupError: error?.message ?? String(error) })
+    }
   })
 }
 
@@ -974,17 +1414,6 @@ async function freePort() {
       server.close(() => resolvePort(address.port))
     })
   })
-}
-
-async function waitFor(predicate, timeout, getLogs, { nativeTimeout = false } = {}) {
-  const deadline = Date.now() + timeout
-  while (Date.now() < deadline) {
-    if (await predicate()) return
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 100))
-  }
-  const error = new Error(`OpenCode native-agent smoke timed out\n${getLogs()}`)
-  if (nativeTimeout) error.code = "NATIVE_SMOKE_TIMEOUT"
-  throw error
 }
 
 if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

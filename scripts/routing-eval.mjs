@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto"
 import { buildRoutingObserverSource } from "./routing-observer.mjs"
+import { matchesTierModel, sequenceOf, toolIdentity, validateNativeLinkage } from "./routing-linkage.mjs"
 import {
   FIXTURE_MANIFEST,
   checkFixture,
@@ -9,6 +10,7 @@ import {
   resolveRoutingCommandDirectory,
   restoreRoutingFixture,
   seedRoutingFixture,
+  snapshotRoutingCommandDirectory,
   snapshotInfrastructure,
   snapshotRoutingWorkspace,
 } from "./routing-fixture.mjs"
@@ -51,6 +53,7 @@ export {
   resolveRoutingCommandDirectory,
   restoreRoutingFixture,
   seedRoutingFixture,
+  snapshotRoutingCommandDirectory,
   snapshotInfrastructure,
   snapshotRoutingWorkspace,
 }
@@ -123,7 +126,7 @@ export function assessRouting(result, expectedRoute = [], tierModels, options = 
   }
 
   const route = dispatches.map((event) => event.input?.agent)
-  if (!matchesRoute(route, expectedRoute)) {
+  if (!matchesRoute(dispatches, expectedRoute)) {
     problems.push(`expected ${expectedRoute.join("→") || "direct"} (focused discovery/resume cycles allowed); observed ${route.join("→") || "direct"}`)
   }
 
@@ -145,18 +148,17 @@ export function assessRouting(result, expectedRoute = [], tierModels, options = 
     })
     problems.push(...linkage.problems)
 
-    problems.push(...assessHandoffEvidence(dispatches, toolEvidence, linkage.completions))
+    problems.push(...assessHandoffEvidence(dispatches, linkage))
     problems.push(...assessPrimaryToolUse({ result, scenario, expectedRoute, tools, dispatches, toolEvidence }))
     problems.push(...assessVerificationCommands({ result, scenario, expectedRoute, dispatches, toolEvidence, arm }))
   }
 
-  const usage = sessions.flatMap((session) => session.usage ?? [])
-  const tokenUsage = usage.filter((entry) => entry?.tokens)
-  const tokens = tokenUsage.length === 0 ? null : tokenUsage.reduce((total, entry) => {
-    for (const key of ["input", "output", "reasoning"]) total[key] += entry.tokens[key] ?? 0
-    total.cachedRead += entry.tokens.cache?.read ?? 0
-    return total
-  }, { input: 0, output: 0, reasoning: 0, cachedRead: 0 })
+  const tokenRecords = sessions.flatMap((session) => {
+    if (isRecord(session?.tokens)) return [session.tokens]
+    const usage = Array.isArray(session?.usage) ? session.usage : []
+    return usage.length > 0 ? usage.map((entry) => entry?.tokens) : []
+  })
+  const tokens = tokenRecords.length === 0 ? null : aggregateObservedTokens(tokenRecords)
 
   const readCalls = toolEvidence.before.filter((event) => READ_TOOLS.has(event.tool))
   const primaryReads = readCalls.filter((event) => event.sessionID === rootSessionID)
@@ -164,7 +166,7 @@ export function assessRouting(result, expectedRoute = [], tierModels, options = 
   const repeatedReads = readFingerprints.length - new Set(readFingerprints).size
   const primaryToolCalls = toolEvidence.before.filter((event) => event.sessionID === rootSessionID)
   const firstDispatch = dispatches[0]
-  const readsBeforeDispatch = primaryReads.filter((event) => firstDispatch === undefined || sequenceOf(event) < sequenceOf(firstDispatch)).length
+  const readsBeforeDispatch = primaryReads.filter((event) => firstDispatch === undefined || (sequenceOf(event) ?? Number.POSITIVE_INFINITY) < (sequenceOf(firstDispatch) ?? Number.POSITIVE_INFINITY)).length
 
   const report = {
     id: result?.id,
@@ -216,11 +218,11 @@ export function classifyRoutingProblems(problems) {
 }
 
 function isTaskProblem(message) {
-  return /(?:answer was incorrect|answer omitted|failed objective|fixture (?:behavior|tests)|changed-limit behavior)/iu.test(message)
+  return /(?:answer was incorrect|answer omitted|failed objective|fixture (?:behavior|tests)|changed-limit behavior|regression test evidence)/iu.test(message)
 }
 
 function isEvidenceProblem(message) {
-  return /(?:inspection(?:Error| failed)?|fixture validation evidence|fixture verification evidence|snapshot evidence|execution context|session (?:evidence|info|metadata)|child session|root session|tool (?:event|completion)|native delegation .*?(?:structured|unobserved|correlated|returned|session)|orphan|synchronous sequence|duplicate observed sequence|routing protocol was not observed|protocol was not observed|result set)/iu.test(message)
+  return /(?:inspection(?:Error| failed)?|fixture validation evidence|fixture verification evidence|fixture verifier (?:changed|control)|immutable infrastructure changed|snapshot evidence|execution context|session (?:evidence|info|metadata)|child session|root session|tool (?:event|completion)|native delegation .*?(?:structured|unobserved|correlated|returned|session)|orphan|synchronous sequence|duplicate observed sequence|routing protocol was not observed|protocol was not observed|result set)/iu.test(message)
 }
 
 /**
@@ -353,6 +355,22 @@ function sameJSON(left, right) {
   return JSON.stringify(left) === JSON.stringify(right)
 }
 
+function aggregateObservedTokens(records) {
+  const components = {
+    input: records.map((tokens) => tokens?.input),
+    output: records.map((tokens) => tokens?.output),
+    reasoning: records.map((tokens) => tokens?.reasoning),
+    cachedRead: records.map((tokens) => tokens?.cache?.read),
+    cachedWrite: records.map((tokens) => tokens?.cache?.write),
+  }
+  return Object.fromEntries(Object.entries(components).map(([key, values]) => [
+    key,
+    values.every((value) => Number.isFinite(value))
+      ? values.reduce((sum, value) => sum + value, 0)
+      : null,
+  ]))
+}
+
 function validateSessionEvidence({ result, sessions, contexts, rootSessionID, tierModels, rootModel, arm }) {
   const problems = []
   const sessionByID = new Map()
@@ -392,7 +410,7 @@ function validateSessionEvidence({ result, sessions, contexts, rootSessionID, ti
 
   const contextIDs = new Set()
   for (const context of contexts) {
-    if (!Number.isInteger(context?.seq)) problems.push(`execution context ${String(context?.sessionID)} is missing its synchronous sequence`)
+    if (sequenceOf(context) === undefined) problems.push(`execution context ${String(context?.sessionID)} is missing its synchronous sequence`)
     const id = context?.sessionID
     if (typeof id !== "string" || id.length === 0) {
       problems.push("execution context is missing sessionID")
@@ -478,9 +496,10 @@ function validateToolEvidence(tools) {
       problems.push(`tool event has unknown phase: ${String(phase)}`)
       continue
     }
-    if (!Number.isInteger(event.seq)) problems.push(`tool ${String(event.tool)} is missing its synchronous sequence`)
-    else if (seenSequences.has(event.seq)) problems.push(`duplicate tool sequence: ${event.seq}`)
-    else seenSequences.add(event.seq)
+    const sequence = sequenceOf(event)
+    if (sequence === undefined) problems.push(`tool ${String(event.tool)} is missing its synchronous sequence`)
+    else if (seenSequences.has(sequence)) problems.push(`duplicate tool sequence: ${sequence}`)
+    else seenSequences.add(sequence)
 
     const missing = ["sessionID", "messageID", "id", "tool"].filter((field) => typeof event[field] !== "string" || event[field].length === 0)
     if (missing.length > 0) {
@@ -499,7 +518,7 @@ function validateToolEvidence(tools) {
     const start = beforeByIdentity.get(identity)
     if (start === undefined) {
       problems.push(`orphan tool completion: ${identity}`)
-    } else if (sequenceOf(event) <= sequenceOf(start)) {
+    } else if (sequenceOf(event) !== undefined && sequenceOf(start) !== undefined && sequenceOf(event) <= sequenceOf(start)) {
       problems.push(`tool completion preceded its call: ${identity}`)
     }
     if (event.status !== "completed") problems.push(`failed tool completion: ${identity} (${String(event.status)})`)
@@ -515,140 +534,80 @@ function validateGlobalSequence(contexts, tools) {
   const problems = []
   const seen = new Set()
   for (const event of [...contexts, ...tools]) {
-    if (!Number.isInteger(event?.seq)) continue
-    if (seen.has(event.seq)) problems.push(`duplicate observed sequence across context/tool events: ${event.seq}`)
-    else seen.add(event.seq)
+    const sequence = sequenceOf(event)
+    if (sequence === undefined) continue
+    if (seen.has(sequence)) problems.push(`duplicate observed sequence across context/tool events: ${sequence}`)
+    else seen.add(sequence)
   }
   return problems
 }
 
 function assessNativeLinkage({ result, dispatches, toolEvidence, sessions, contexts, rootSessionID, tierModels }) {
-  const problems = []
-  const completions = new Map()
-  const sessionByID = new Map(sessions.filter((session) => typeof session?.sessionID === "string").map((session) => [session.sessionID, session]))
-  const contextsByID = new Map()
-  for (const context of contexts) {
-    if (!contextsByID.has(context?.sessionID)) contextsByID.set(context?.sessionID, [])
-    contextsByID.get(context?.sessionID).push(context)
-  }
-
-  const established = new Map()
-  const linkedSessionIDs = new Set()
-  let previousDelegation
-  for (const dispatch of dispatches) {
-    const identity = toolIdentity(dispatch)
-    const completion = toolEvidence.afterByIdentity.get(identity)
-    if (completion !== undefined) completions.set(identity, completion)
-    const agent = dispatch.input?.agent
-    if (typeof agent !== "string") problems.push(`native delegation ${identity} did not specify an agent`)
-    if (tierModels?.[agent] === undefined) problems.push(`native delegation ${identity} used unknown tier ${String(agent)}`)
-
-    if (previousDelegation !== undefined && sequenceOf(dispatch) < sequenceOf(previousDelegation.completion ?? previousDelegation.dispatch)) {
-      problems.push("recovery or execution began before the previous execution returned")
-    }
-
-    if (completion === undefined) {
-      problems.push(`native delegation ${String(agent)} did not complete`)
-      continue
-    }
-    if (completion.status !== "completed") continue
-
-    const structured = completion.resultOutput ?? completion.result?.output
-    const metadata = completion.resultMetadata ?? completion.result?.metadata
-    if (!isRecord(structured) || typeof structured.sessionID !== "string" || structured.sessionID.length === 0 || !["completed", "running"].includes(structured.status) || typeof structured.output !== "string") {
-      problems.push(`native delegation ${String(agent)} is missing structured result.output {sessionID,status,output}; resultText is not correlation evidence`)
-      continue
-    }
-    if (structured.status === "running") {
-      problems.push(`native delegation ${String(agent)} returned pending/background status running; foreground evidence is unverifiable`)
-    }
-    if (!isRecord(metadata)) {
-      problems.push(`native delegation ${String(agent)} is missing structured result.metadata for child ${structured.sessionID}`)
-    } else if (metadata.sessionID !== structured.sessionID || metadata.status !== structured.status) {
-      problems.push(`native delegation ${String(agent)} has inconsistent result.metadata for child ${structured.sessionID}`)
-    }
-
-    const inputSessionID = dispatch.input?.sessionID
-    const childID = structured.sessionID
-    const existingOwner = established.get(childID)
-    if (inputSessionID !== undefined) {
-      if (typeof inputSessionID !== "string" || inputSessionID.length === 0) {
-        problems.push(`native delegation ${String(agent)} supplied an invalid continuation sessionID`)
-      } else if (!established.has(inputSessionID)) {
-        problems.push(`native delegation ${String(agent)} resumed an unestablished child session ${inputSessionID}`)
-      } else if (established.get(inputSessionID) !== agent) {
-        problems.push(`native delegation ${String(agent)} resumed child ${inputSessionID} owned by tier ${String(established.get(inputSessionID))}`)
-      } else if (inputSessionID !== childID) {
-        problems.push(`native delegation ${String(agent)} returned child ${childID} for continuation ${inputSessionID}`)
-      }
-    } else if (existingOwner !== undefined) {
-      problems.push(`native delegation ${String(agent)} reused child session ${childID} without explicit continuation linkage`)
-    }
-
-    const session = sessionByID.get(childID)
-    if (session === undefined) {
-      problems.push(`native delegation ${String(agent)} returned unobserved child session ${childID}`)
-    } else {
-      if (session.parentID !== rootSessionID) problems.push(`native delegation ${String(agent)} returned nested or non-root child ${childID}`)
-      const childContexts = contextsByID.get(childID) ?? []
-      const dispatchSequence = sequenceOf(dispatch)
-      const completionSequence = sequenceOf(completion)
-      const relevantContexts = childContexts.filter((context) => Number.isInteger(context?.seq)
-        && context.seq > dispatchSequence
-        && context.seq < completionSequence)
-      if (relevantContexts.length === 0) {
-        problems.push(`native delegation ${String(agent)} returned child ${childID} without an execution context between dispatch ${dispatchSequence} and completion ${completionSequence}`)
-      }
-      for (const context of relevantContexts) {
-        if (context.agent !== agent) problems.push(`native delegation ${String(agent)} correlated to child ${childID} with context agent ${String(context.agent)}`)
-        if (!matchesTierModel(context.model, tierModels?.[agent], context.variant)) {
-          problems.push(`native delegation ${String(agent)} child session used an unexpected model or variant`)
-        }
-      }
-      if (session.agent !== undefined && session.agent !== agent) problems.push(`native delegation ${String(agent)} correlated to child ${childID} with mismatched session agent`)
-    }
-    established.set(childID, agent)
-    linkedSessionIDs.add(childID)
-    previousDelegation = { dispatch, completion }
-  }
-
-  for (const session of sessions) {
-    if (session?.sessionID !== rootSessionID && typeof session?.sessionID === "string" && !linkedSessionIDs.has(session.sessionID)) {
-      problems.push(`observed non-root session ${session.sessionID} did not belong to a correlated native delegation`)
-    }
-  }
-  for (const context of contexts) {
-    if (context?.sessionID !== rootSessionID && typeof context?.sessionID === "string" && !linkedSessionIDs.has(context.sessionID)) {
-      problems.push(`observed non-root context ${context.sessionID} did not belong to a correlated native delegation`)
-    }
-  }
-  for (const event of [...toolEvidence.before, ...toolEvidence.after]) {
-    if (event.sessionID !== rootSessionID && !linkedSessionIDs.has(event.sessionID)) {
-      problems.push(`observed non-root tool session ${event.sessionID} did not belong to a correlated native delegation`)
-    }
-  }
-
-  return { problems, completions, linkedSessionIDs }
+  return validateNativeLinkage({
+    dispatches,
+    tools: [...toolEvidence.before, ...toolEvidence.after],
+    sessions,
+    contexts,
+    rootSessionID,
+    tierModels,
+    afterByIdentity: toolEvidence.afterByIdentity,
+  })
 }
 
-function assessHandoffEvidence(dispatches, toolEvidence, completions) {
+function assessHandoffEvidence(dispatches, linkage) {
   const problems = []
+  const completions = linkage?.completions ?? new Map()
+  const validatedChildren = new Map()
   for (let index = 0; index < dispatches.length; index += 1) {
     const dispatch = dispatches[index]
-    if (dispatch.input?.agent === "fast") continue
-    const discovery = [...dispatches.slice(0, index)].reverse().find((candidate) => candidate.input?.agent === "fast")
-    if (discovery === undefined) continue
-    const completion = completions.get(toolIdentity(discovery))
-    const output = completion?.resultOutput ?? completion?.result?.output
-    const text = isRecord(output) && typeof output.output === "string" ? output.output : ""
-    const paths = [...text.matchAll(/(?:src|test)\/[\w./-]+/g)].map((match) => match[0].replace(/\.+$/, ""))
-    if (paths.length === 0) {
-      problems.push(`discovery handoff for ${String(dispatch.input?.agent)} contained no structured file evidence`)
-    } else if (typeof dispatch.input?.prompt !== "string" || !paths.some((path) => dispatch.input.prompt.includes(path))) {
-      problems.push("execution prompt did not carry discovered file evidence")
+    const completion = completions.get(toolIdentity(dispatch))
+    const returnedChildID = completedChildID(completion)
+    const agent = dispatch.input?.agent
+    const inputSessionID = dispatch.input?.sessionID
+    const isLinkedContinuation = typeof agent === "string"
+      && agent !== "fast"
+      && typeof inputSessionID === "string"
+      && inputSessionID.length > 0
+      && returnedChildID === inputSessionID
+      && linkage?.linkedSessionIDs?.has(inputSessionID) === true
+      && validatedChildren.get(inputSessionID) === agent
+
+    if (agent !== "fast" && !isLinkedContinuation) {
+      const discovery = [...dispatches.slice(0, index)].reverse().find((candidate) => candidate.input?.agent === "fast")
+      if (discovery !== undefined) {
+        const discoveryCompletion = completions.get(toolIdentity(discovery))
+        const output = discoveryCompletion?.resultOutput ?? discoveryCompletion?.result?.output
+        const text = isRecord(output) && typeof output.output === "string" ? output.output : ""
+        const paths = [...text.matchAll(/(?:src|test)\/[\w./-]+/g)].map((match) => match[0].replace(/\.+$/, ""))
+        if (paths.length === 0) {
+          problems.push(`discovery handoff for ${String(agent)} contained no structured file evidence`)
+        } else if (typeof dispatch.input?.prompt !== "string" || !paths.some((path) => dispatch.input.prompt.includes(path))) {
+          problems.push("execution prompt did not carry discovered file evidence")
+        }
+      }
+    }
+
+    // Linkage has already validated the native result and child ownership. Keep
+    // the returned child id as the only continuation authority; an input
+    // sessionID by itself is not evidence of context reuse.
+    if (returnedChildID !== undefined && linkage?.linkedSessionIDs?.has(returnedChildID) === true) {
+      validatedChildren.set(returnedChildID, agent)
     }
   }
   return problems
+}
+
+function completedChildID(completion) {
+  if (completion?.status !== "completed") return undefined
+  const output = completion.resultOutput ?? completion.result?.output
+  if (!isRecord(output)
+    || output.status !== "completed"
+    || typeof output.sessionID !== "string"
+    || output.sessionID.length === 0
+    || typeof output.output !== "string") return undefined
+  const metadata = completion.resultMetadata ?? completion.result?.metadata
+  if (!isRecord(metadata) || metadata.sessionID !== output.sessionID || metadata.status !== output.status) return undefined
+  return output.sessionID
 }
 
 function assessPrimaryToolUse({ result, scenario, expectedRoute, tools, dispatches, toolEvidence }) {
@@ -656,7 +615,7 @@ function assessPrimaryToolUse({ result, scenario, expectedRoute, tools, dispatch
   const rootSessionID = result?.rootSessionID
   const primaryToolCalls = toolEvidence.before.filter((event) => event.sessionID === rootSessionID)
   const firstDispatch = dispatches[0]
-  const firstDispatchSequence = firstDispatch === undefined ? Number.POSITIVE_INFINITY : sequenceOf(firstDispatch)
+  const firstDispatchSequence = firstDispatch === undefined ? Number.POSITIVE_INFINITY : (sequenceOf(firstDispatch) ?? Number.POSITIVE_INFINITY)
 
   for (const event of primaryToolCalls) {
     if (PRIMARY_MUTATION_TOOLS.has(event.tool)) {
@@ -664,7 +623,7 @@ function assessPrimaryToolUse({ result, scenario, expectedRoute, tools, dispatch
     }
   }
 
-  const preDispatch = primaryToolCalls.filter((event) => event.tool !== "subagent" && sequenceOf(event) < firstDispatchSequence)
+  const preDispatch = primaryToolCalls.filter((event) => event.tool !== "subagent" && (sequenceOf(event) ?? Number.POSITIVE_INFINITY) < firstDispatchSequence)
   if (expectedRoute.length > 0 && preDispatch.length > 0) {
     problems.push(`primary used tools before first nontrivial delegation: ${preDispatch.map((event) => event.tool).join(", ")}`)
   }
@@ -673,7 +632,7 @@ function assessPrimaryToolUse({ result, scenario, expectedRoute, tools, dispatch
   }
 
   if (dispatches.length > 0) {
-    const postDispatch = primaryToolCalls.filter((event) => sequenceOf(event) > sequenceOf(firstDispatch) && !PRIMARY_POST_DELEGATION_TOOLS.has(event.tool) && event.tool !== "shell")
+    const postDispatch = primaryToolCalls.filter((event) => (sequenceOf(event) ?? Number.POSITIVE_INFINITY) > (sequenceOf(firstDispatch) ?? Number.POSITIVE_INFINITY) && !PRIMARY_POST_DELEGATION_TOOLS.has(event.tool) && event.tool !== "shell")
     if (postDispatch.length > 0) {
       problems.push(`primary used disallowed tools after delegation: ${postDispatch.map((event) => event.tool).join(", ")}`)
     }
@@ -713,16 +672,28 @@ function assessVerificationCommands({ result, scenario, expectedRoute, dispatche
     expectedSeen.set(command, expectedSeen.get(command) + 1)
     const workspace = result?.workspace
     const commandDirectory = resolveRoutingCommandDirectory(shell.input, workspace)
-    for (const resolutionProblem of commandDirectory.problems) {
+    if (commandDirectory.root === undefined) {
+      problems.push(`verification command ${formatExact(command)} cannot resolve the fixture workspace`)
+    }
+    for (const resolutionProblem of [...new Set(commandDirectory.problems)]) {
       problems.push(`verification command ${formatExact(command)} ${resolutionProblem}`)
     }
-    if (commandDirectory.root !== undefined && commandDirectory.directory !== commandDirectory.root) {
+    const resolvesToRoot = commandDirectory.root !== undefined
+      && (commandDirectory.directory === commandDirectory.root
+        || (commandDirectory.rootReal !== undefined
+          && commandDirectory.realDirectory !== undefined
+          && commandDirectory.rootReal === commandDirectory.realDirectory))
+    if (commandDirectory.root !== undefined && !resolvesToRoot) {
       const outsideAlias = commandDirectory.aliases.find((alias) => alias.directory !== commandDirectory.root)
       const alias = outsideAlias?.name ?? "cwd"
       const value = outsideAlias?.value
       problems.push(`verification command ${formatExact(command)} used ${alias} ${formatExact(value)} instead of result workspace ${formatExact(workspace)}`)
     }
-    const relevant = [...dispatches].filter((dispatch) => sequenceOf(dispatch) < sequenceOf(shell)).at(-1)
+    const relevant = [...dispatches].filter((dispatch) => {
+      const dispatchSequence = sequenceOf(dispatch)
+      const shellSequence = sequenceOf(shell)
+      return dispatchSequence !== undefined && shellSequence !== undefined && dispatchSequence < shellSequence
+    }).at(-1)
     if (requireDelegation && relevant === undefined) {
       problems.push(`verification command ${formatExact(command)} did not follow a completed relevant delegation`)
     }
@@ -731,7 +702,11 @@ function assessVerificationCommands({ result, scenario, expectedRoute, dispatche
       problems.push(`verification command ${formatExact(command)} did not follow the ${requiredTier} execution delegation`)
     }
     const completion = relevant === undefined ? undefined : toolEvidence.afterByIdentity.get(toolIdentity(relevant))
-    if (requireDelegation && (completion === undefined || completion.status !== "completed" || sequenceOf(completion) >= sequenceOf(shell))) {
+    if (requireDelegation && (completion === undefined
+      || completion.status !== "completed"
+      || sequenceOf(completion) === undefined
+      || sequenceOf(shell) === undefined
+      || sequenceOf(completion) >= sequenceOf(shell))) {
       problems.push(`verification command ${formatExact(command)} did not follow a completed relevant delegation`)
     }
     const shellCompletion = toolEvidence.afterByIdentity.get(toolIdentity(shell))
@@ -798,6 +773,14 @@ function validateVerificationSnapshot(result, shell) {
   if (!Array.isArray(snapshots)) return `verification command ${formatExact(shell.input?.command)} is missing before/after snapshot evidence`
   const evidence = snapshots.find((candidate) => candidate?.identity === identity)
   if (!isRecord(evidence)) return `verification command ${formatExact(shell.input?.command)} is missing before/after snapshot evidence`
+  const snapshotProblems = [
+    ...(Array.isArray(evidence.snapshotProblems) ? evidence.snapshotProblems : []),
+    ...(Array.isArray(evidence.beforeProblems) ? evidence.beforeProblems : []),
+    ...(Array.isArray(evidence.afterProblems) ? evidence.afterProblems : []),
+  ]
+  if (snapshotProblems.length > 0) {
+    return `verification command ${formatExact(shell.input?.command)} has invalid before/after snapshot evidence: ${[...new Set(snapshotProblems)].join("; ")}`
+  }
   if (!isRecord(evidence.before) || !isRecord(evidence.after)) return `verification command ${formatExact(shell.input?.command)} is missing before/after snapshot evidence`
   const beforeProblems = []
   const afterProblems = []
@@ -814,57 +797,19 @@ function validateVerificationSnapshot(result, shell) {
   return undefined
 }
 
-function matchesRoute(route, expectedRoute) {
+function matchesRoute(dispatches, expectedRoute) {
+  const route = dispatches.map((event) => event.input?.agent)
   if (expectedRoute.length === 0) return route.length === 0
   const executionTier = expectedRoute.at(-1)
+  if (expectedRoute.length === 1 && dispatches.filter((dispatch) => dispatch.input?.sessionID === undefined).length !== 1) return false
   return route.length > 0
     && route[0] === expectedRoute[0]
     && route.at(-1) === executionTier
     && route.every((tier) => tier === "fast" || tier === executionTier)
 }
 
-function matchesTierModel(observedModel, expectedConfig, observedVariant) {
-  const actual = normalizeModel(observedModel, observedVariant)
-  const expected = normalizeExpectedModel(expectedConfig)
-  return actual !== undefined && expected !== undefined
-    && actual.providerID === expected.providerID
-    && actual.id === expected.id
-    && actual.variant === expected.variant
-}
-
-function normalizeExpectedModel(value) {
-  if (typeof value === "string") return normalizeModel(value)
-  if (!isRecord(value)) return undefined
-  if (typeof value.model === "string") return normalizeModel(value.model, value.variant)
-  if (typeof value.providerID === "string" && typeof value.id === "string") {
-    return { providerID: value.providerID, id: value.id, variant: value.variant }
-  }
-  return undefined
-}
-
-function normalizeModel(value, variant) {
-  if (typeof value === "string") {
-    const [reference, embeddedVariant] = value.split("#", 2)
-    const separator = reference.indexOf("/")
-    if (separator <= 0 || separator === reference.length - 1) return undefined
-    return { providerID: reference.slice(0, separator), id: reference.slice(separator + 1), variant: variant ?? embeddedVariant }
-  }
-  if (isRecord(value) && typeof value.providerID === "string" && typeof value.id === "string") {
-    return { providerID: value.providerID, id: value.id, variant: variant ?? value.variant }
-  }
-  return undefined
-}
-
-function toolIdentity(event) {
-  return `${event.sessionID}/${event.messageID}/${event.id}/${event.tool}`
-}
-
-function sequenceOf(event) {
-  return Number.isInteger(event?.seq) ? event.seq : Number.POSITIVE_INFINITY
-}
-
 function compareSequence(left, right) {
-  return sequenceOf(left) - sequenceOf(right)
+  return (sequenceOf(left) ?? Number.POSITIVE_INFINITY) - (sequenceOf(right) ?? Number.POSITIVE_INFINITY)
 }
 
 function formatExact(value) {

@@ -71,9 +71,10 @@ opencode debug agents
 Confirm that `fast`, `medium`, and `heavy` are present.
 
 The provider must expose each exact model below as enabled and tool-capable.
-Choose a capable primary model in your normal OpenCode configuration. This
-plugin does not set the primary/root model, does not require a particular
-pricey model, and does not guarantee that the primary never executes work.
+Choose a capable primary model in your normal OpenCode configuration. The
+primary/root model remains user-selected; this plugin does not replace it, does
+not require a particular pricey model, and does not guarantee that the primary
+never executes work.
 
 ## Canonical tiers
 
@@ -104,9 +105,10 @@ deterministic task graph or a security sandbox.
 | Discovery followed by implementation | `fast` then `medium` |
 
 For example, an ordinary request such as “Find how display-name validation is
-currently handled, then reject blank names and add focused tests” is expected to
-use `fast` for discovery and `medium` for implementation. The user does not need
-to write “delegate this” or name a tier. A request such as “Update the already
+currently handled, then reject blank and over-limit names after trimming and add
+focused tests” is expected to use `fast` for discovery and `medium` for
+implementation. The user does not need to write “delegate this” or name a tier.
+A request such as “Update the already
 identified error message and run its focused test” is expected to use `medium`.
 “What is 2 + 2?” is a direct trivial request.
 
@@ -124,17 +126,35 @@ guarantee that every request creates a child session.
   and permissions, overwriting user values in those behavioral fields.
   Cosmetic `color` configuration is preserved.
 - The built-in `Plan` agent receives no execution protocol and can invoke all
-  three plugin tiers. Before dispatch, the plugin applies native session-scoped
-  read-only rules (preserving existing restrictions); child sessions inherit
-  them. Plan-originated children may read/search and use safe tier
-  orchestration, but cannot edit, write, patch, run shell commands, or mutate
-  the workspace. `Build` and the current primary keep the host's normal custom
-  permissions.
+  three plugin tiers. A Plan root carries a nonrestrictive origin marker;
+  context-tool filtering and an execution guard enforce its read-only behavior.
+  Plan-originated sessions may use native read/search, `question`, `skill`, and
+  safe tier orchestration. Children inherit the marker at creation; the first
+  child context installs the persistent read-only session policy and guard for
+  that child and its descendants. Unsafe tools are filtered; edit, write,
+  patch, shell, and other workspace mutation remain unavailable. `question` and
+  `skill` are safe native actions, but tools requested by skill contents remain
+  subject to the same guard. Normal Plan-safe `question`, `skill`, and
+  `subagent` tools remain visible unless the user denies them; the child policy
+  keeps wildcard `subagent` at `ask` and named tier allows visible, while the
+  guard rejects custom targets.
+- If the same root session switches back to `Build`, its pre-Plan root
+  permissions remain unchanged and its Plan origin marker is removed, so its
+  first Build request has normal mutating tools. Descendants already owned by
+  `Plan` remain read-only, while new Build-originated children keep the host's
+  normal custom permissions.
 - `fast` is read-only. `medium` and `heavy` retain their canonical edit, write,
   and shell permissions when invoked from `Build`; the Plan session policy does
   not globally change those tier definitions. Native permissions constrain tool
   use but are not a security sandbox; the primary still has its normal host
   tools.
+- Tier prompts prohibit ordinary delegation and self-escalation. Safe tier
+  orchestration from a Plan-originated read-only session is the controlled
+  exception. The evaluator's same-tier continuation check is evidence
+  correlation only, not a global runtime ban.
+- Native host subagent-depth limits still apply. The default V2.0.19/.22 depth
+  is `1`, so nested child delegation requires host depth `>=2`; the plugin does
+  not change host configuration.
 
 ## Configuration
 

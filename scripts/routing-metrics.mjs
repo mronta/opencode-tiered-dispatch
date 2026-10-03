@@ -1,5 +1,6 @@
 import { getEncoding } from "js-tiktoken"
 import { classifyRoutingProblems } from "./routing-eval.mjs"
+import { sequenceOf, toolIdentity } from "./routing-linkage.mjs"
 
 const READ_TOOLS = new Set(["read", "glob", "grep", "webfetch", "websearch"])
 const TOKEN_KEYS = Object.freeze(["input", "output", "reasoning", "cacheRead", "cacheWrite"])
@@ -49,7 +50,10 @@ export function summarizeRoutingTrace(trace) {
   const afterByIdentity = new Map(
     tools
       .filter((event) => event?.phase === "after")
-      .map((event) => [toolIdentity(event), event]),
+      .flatMap((event) => {
+        const identity = toolIdentity(event)
+        return identity === undefined ? [] : [[identity, event]]
+      }),
   )
   const dispatches = before
     .filter((event) => event?.tool === "subagent" && event.sessionID === rootSessionID)
@@ -94,7 +98,7 @@ export function summarizeRoutingTrace(trace) {
       agent: dispatch.input?.agent ?? null,
       sessionID: dispatch.sessionID ?? null,
       childSessionID: structuredChildSessionID(completion),
-      sequence: Number.isInteger(dispatch.seq) ? dispatch.seq : null,
+      sequence: sequenceOf(dispatch) ?? null,
       durationMs: start !== null && end !== null && end >= start ? end - start : null,
     }
   })
@@ -811,16 +815,8 @@ function countValues(values) {
   return counts
 }
 
-function toolIdentity(event) {
-  return `${event?.sessionID}/${event?.messageID}/${event?.id}/${event?.tool}`
-}
-
-function sequenceOf(event) {
-  return Number.isInteger(event?.seq) ? event.seq : Number.POSITIVE_INFINITY
-}
-
 function compareSequence(left, right) {
-  return sequenceOf(left) - sequenceOf(right)
+  return (sequenceOf(left) ?? Number.POSITIVE_INFINITY) - (sequenceOf(right) ?? Number.POSITIVE_INFINITY)
 }
 
 function eventTime(event) {

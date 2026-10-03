@@ -4,9 +4,12 @@ import { basename, dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { counterbalancedArmOrder, summarizeMatchedBenchmark } from "./routing-metrics.mjs"
 import { scenarios } from "./routing-eval.mjs"
+import { parseNativeOptions } from "./opencode-native-smoke.mjs"
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)))
 const nativeSmoke = join(root, "scripts", "opencode-native-smoke.mjs")
+const NATIVE_CLEANUP_GRACE_MS = 10_000
+const NATIVE_PROCESS_TIMEOUT_MS = parseNativeOptions([]).timeoutMs + NATIVE_CLEANUP_GRACE_MS
 
 export function parseBenchmarkArgs(argv = []) {
   let runs = 1
@@ -84,11 +87,17 @@ export function runBenchmark(options, dependencies = {}) {
           cwd: root,
           env: { ...process.env },
           stdio: "inherit",
+          timeout: NATIVE_PROCESS_TIMEOUT_MS,
+          killSignal: "SIGTERM",
         })
       } catch (error) {
         processErrors.push(error?.message ?? String(error))
       }
-      if (child.error !== undefined) processErrors.push(child.error.message ?? String(child.error))
+      if (child.error !== undefined) {
+        processErrors.push(child.error.code === "ETIMEDOUT"
+          ? `native evaluator timed out after ${NATIVE_PROCESS_TIMEOUT_MS}ms`
+          : child.error.message ?? String(child.error))
+      }
       if (child.status !== 0) processErrors.push(`native evaluator exited with ${child.status ?? `signal ${child.signal}`}`)
       const artifact = readArtifact(artifactPath)
       const artifactProblems = artifactCompletionProblems(artifact, arm)
