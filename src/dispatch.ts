@@ -77,7 +77,6 @@ export function createDispatcher(
 ): Dispatcher {
   const inFlight = new Set<string>()
   const ownedSessionIDs = new Set<string>()
-  const nonOwnedSessionIDs = new Set<string>()
   const activeOperations = new Set<Promise<unknown>>()
   const cleanupFailures: unknown[] = []
   let closing = false
@@ -246,6 +245,7 @@ export function createDispatcher(
       }
       await interruptionChain
       inFlight.delete(child.id)
+      ownedSessionIDs.delete(child.id)
     }
   }
 
@@ -266,14 +266,8 @@ export function createDispatcher(
 
   const isOwnedSession = async (sessionID: string): Promise<boolean> => {
     if (ownedSessionIDs.has(sessionID)) return true
-    if (nonOwnedSessionIDs.has(sessionID)) return false
     const session = await runtime.getSession(sessionID)
-    if (session.metadata?.plugin === "tiered-dispatch") {
-      ownedSessionIDs.add(sessionID)
-      return true
-    }
-    nonOwnedSessionIDs.add(sessionID)
-    return false
+    return session.metadata?.plugin === "tiered-dispatch"
   }
 
   const cleanup = (): Promise<void> => {
@@ -283,9 +277,18 @@ export function createDispatcher(
       while (activeOperations.size > 0 || inFlight.size > 0) {
         const operations = [...activeOperations]
         const sessions = [...inFlight]
-        const interruptions = await Promise.allSettled(sessions.map((sessionID) => runtime.interrupt(sessionID)))
-        for (const interruption of interruptions) {
-          if (interruption.status === "rejected") cleanupFailures.push(interruption.reason)
+        const interruptions = await settleAllWithin(
+          sessions.map((sessionID) => runtime.interrupt(sessionID)),
+          CLEANUP_DRAIN_TIMEOUT_MS,
+        )
+        if (interruptions === undefined) {
+          cleanupFailures.push(new DispatchError(
+            `Timed out while interrupting ${sessions.length} tiered delegation session${sessions.length === 1 ? "" : "s"}`,
+          ))
+        } else {
+          for (const interruption of interruptions) {
+            if (interruption.status === "rejected") cleanupFailures.push(interruption.reason)
+          }
         }
         const drained = await settleWithin(operations, CLEANUP_DRAIN_TIMEOUT_MS)
         if (!drained) {
@@ -295,7 +298,6 @@ export function createDispatcher(
           break
         }
       }
-      inFlight.clear()
       if (cleanupFailures.length > 0) {
         throw new AggregateError(cleanupFailures, "Tiered Dispatch could not interrupt every child session")
       }
@@ -314,6 +316,21 @@ async function settleWithin(promises: readonly Promise<unknown>[], timeoutMs: nu
     timer = setTimeout(() => resolve(false), timeoutMs)
   })
   const result = await Promise.race([drained, timedOut])
+  if (timer !== undefined) clearTimeout(timer)
+  return result
+}
+
+async function settleAllWithin(
+  promises: readonly Promise<unknown>[],
+  timeoutMs: number,
+): Promise<PromiseSettledResult<unknown>[] | undefined> {
+  if (promises.length === 0) return []
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const settled = Promise.allSettled(promises)
+  const timedOut = new Promise<undefined>((resolve) => {
+    timer = setTimeout(() => resolve(undefined), timeoutMs)
+  })
+  const result = await Promise.race([settled, timedOut])
   if (timer !== undefined) clearTimeout(timer)
   return result
 }

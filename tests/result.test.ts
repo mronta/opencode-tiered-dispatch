@@ -61,4 +61,11 @@ describe("delegation result extraction", () => {
   it("rejects empty output", () => {
     expect(() => extractFinalText([{ type: "assistant", content: [] }])).toThrow(/without assistant text/)
   })
+
+  it("rejects an empty final assistant message instead of returning stale text", () => {
+    expect(() => extractFinalText([
+      { type: "assistant", content: [{ type: "text", text: "intermediate" }] },
+      { type: "assistant", content: [] },
+    ])).toThrow(/without assistant text/)
+  })
 })

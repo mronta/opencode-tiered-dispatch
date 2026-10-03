@@ -81,6 +81,15 @@ function parseTier(value: unknown, tier: TierName): TierOptions {
   }
 }
 
+function validateOptionalTiers(value: unknown): void {
+  if (value === undefined) return
+  const input = objectAt(value, "options.tiers")
+  rejectUnknownFields(input, new Set(TIER_NAMES), "options.tiers")
+  for (const tier of TIER_NAMES) {
+    if (input[tier] !== undefined) parseTier(input[tier], tier)
+  }
+}
+
 function parseTaxonomy(value: unknown): Partial<Record<TierName, string[]>> {
   if (value === undefined) return {}
   const input = objectAt(value, "options.taxonomy")
@@ -106,10 +115,6 @@ export function parseOptions(value: unknown): RouterOptions {
   if (input.enabled !== undefined && typeof input.enabled !== "boolean") {
     throw new ConfigurationError("options.enabled must be a boolean")
   }
-  if (input.enabled === false) return { enabled: false }
-
-  const tiersInput = objectAt(input.tiers, "options.tiers")
-  rejectUnknownFields(tiersInput, new Set(TIER_NAMES), "options.tiers")
 
   const directThreshold = input.directThreshold ?? "trivial"
   if (directThreshold !== "never" && directThreshold !== "trivial") {
@@ -118,6 +123,15 @@ export function parseOptions(value: unknown): RouterOptions {
   if (input.logging !== undefined && typeof input.logging !== "boolean") {
     throw new ConfigurationError("options.logging must be a boolean")
   }
+  const taxonomy = parseTaxonomy(input.taxonomy)
+
+  if (input.enabled === false) {
+    validateOptionalTiers(input.tiers)
+    return { enabled: false }
+  }
+
+  const tiersInput = objectAt(input.tiers, "options.tiers")
+  rejectUnknownFields(tiersInput, new Set(TIER_NAMES), "options.tiers")
 
   return {
     enabled: true,
@@ -126,7 +140,7 @@ export function parseOptions(value: unknown): RouterOptions {
       medium: parseTier(tiersInput.medium, "medium"),
       heavy: parseTier(tiersInput.heavy, "heavy"),
     },
-    taxonomy: parseTaxonomy(input.taxonomy),
+    taxonomy,
     directThreshold,
     logging: input.logging ?? false,
   }

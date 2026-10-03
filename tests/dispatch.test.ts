@@ -86,6 +86,29 @@ describe("dispatcher", () => {
     })
   })
 
+  it("does not retain completed child ownership in memory", async () => {
+    const runtime = makeRuntime()
+    vi.mocked(runtime.getSession).mockImplementation(async (id) => id === "root"
+      ? { id, location: { directory: "/workspace" }, permissions: [] }
+      : {
+        id,
+        location: { directory: "/workspace" },
+        metadata: { plugin: "tiered-dispatch" },
+        outcome: "succeeded" as const,
+      })
+    const dispatcher = createDispatcher(runtime, parsed, new Set(["explore", "general"]))
+
+    await dispatcher.execute(
+      { tier: "fast", description: "Find auth", prompt: "Locate auth handling" },
+      toolContext(),
+    )
+    vi.mocked(runtime.getSession).mockClear()
+
+    expect(await dispatcher.isOwnedSession("ses_child")).toBe(true)
+    expect(await dispatcher.isOwnedSession("ses_child")).toBe(true)
+    expect(runtime.getSession).toHaveBeenCalledTimes(2)
+  })
+
   it("preserves caller edit denial for medium", async () => {
     const runtime = makeRuntime()
     const dispatcher = createDispatcher(runtime, parsed, new Set(["explore", "general"]))

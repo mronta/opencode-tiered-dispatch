@@ -32,18 +32,16 @@ interface FailureContentPart {
 type ContextMessage = { type: string } | AssistantMessage | IdleMessage | FailureMessage
 
 export function extractFinalText(messages: readonly ContextMessage[]): string {
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index]
-    if (message?.type !== "assistant") continue
-    const assistant = message as AssistantMessage
-    const text = assistant.content
-      .filter((part): part is AssistantTextPart => part.type === "text")
-      .map((part) => part.text)
-      .join("\n")
-      .trim()
-    if (text) return text
-  }
-  throw new DispatchError("Delegation completed without assistant text")
+  const message = [...messages].reverse().find((candidate) => candidate.type === "assistant")
+  if (!message) throw new DispatchError("Delegation completed without assistant text")
+  const assistant = message as AssistantMessage
+  const text = assistant.content
+    .filter((part): part is AssistantTextPart => part.type === "text")
+    .map((part) => part.text)
+    .join("\n")
+    .trim()
+  if (!text) throw new DispatchError("Delegation completed without assistant text")
+  return text
 }
 
 export function assertSuccessfulOutcome(

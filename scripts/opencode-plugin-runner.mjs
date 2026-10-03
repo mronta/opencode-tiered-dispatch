@@ -399,17 +399,17 @@ async function runRoutingEvaluation({ ctx, session, createdSessions, contextEven
     {
       id: "read",
       expected: ["fast"],
-      prompt: "This is a non-trivial, read-only repository investigation. Use tiered_dispatch exactly once with the fast tier before answering; do not call shell, read, glob, edit, or any other direct repository tool, and do not solve it directly. Trace how authorization tokens are parsed in this repository, and have the fast delegate report the relevant files, functions, and data flow without changing files.",
+      prompt: "Investigate how authorization tokens are parsed in this repository. Use the routing protocol's delegation mechanism exactly once before answering; do not call shell, read, glob, edit, or any other direct repository tool yourself. The delegated investigation must be read-only, report the relevant files, functions, and data flow, and stay under 300 words.",
     },
     {
       id: "implementation",
       expected: ["medium"],
-      prompt: "This is an ordinary test implementation task. The evaluation is invalid unless you first make exactly one tiered_dispatch call with the medium tier and wait for its completed result; do not answer directly. Do not call shell, read, glob, edit, or any other direct repository tool, and do not edit files yourself. Have the medium delegate propose the smallest focused regression-test implementation for the authorization parser in src/auth.ts, call no tools at all, and return a concise plain-text plan; then report the proposal.",
+      prompt: "Implement a focused regression test for the authorization parser in src/auth.ts. Use the routing protocol's delegation mechanism exactly once before answering; do not inspect or edit repository files yourself. The delegated agent should make the smallest appropriate change and report what it changed.",
     },
     {
       id: "architecture",
       expected: ["heavy"],
-      prompt: "This is a high-risk architecture decision. Use tiered_dispatch exactly once with the heavy tier before answering; do not call shell, read, glob, edit, or any other direct repository tool, and do not analyze it directly. Have the heavy delegate assess whether this repository should move token validation behind a cross-service authentication boundary, including failure modes, trust boundaries, migration trade-offs, and a recommendation.",
+      prompt: "Assess whether this repository should move token validation behind a cross-service authentication boundary. Use the routing protocol's delegation mechanism exactly once before answering; do not call shell, read, glob, edit, or any other direct repository tool yourself. The delegated assessment must cover failure modes, trust boundaries, migration trade-offs, and a recommendation in under 400 words.",
     },
     {
       id: "trivial",
@@ -419,7 +419,7 @@ async function runRoutingEvaluation({ ctx, session, createdSessions, contextEven
     {
       id: "split",
       expected: ["fast", "medium"],
-      prompt: "This request has two deliberately separate phases. First delegate the repository investigation of how authorization tokens are parsed to the fast tier and wait for that result. Only after receiving those findings, delegate a focused medium-tier regression-test implementation proposal based on them. Do not investigate or edit the files yourself. The second delegate must use the supplied findings, call no tools at all (including execute), and return a concise plain-text test plan rather than code or a diff; integrate both returned results and summarize the proposed change.",
+      prompt: "This request has two deliberately separate phases. Before answering, make two actual calls to the tiered_dispatch tool and wait for both completed results; a prose claim that delegation happened is not sufficient. First delegate an investigation of how authorization tokens are parsed and keep that report under 250 words. Only after receiving those findings, delegate a focused regression-test implementation proposal based on them. Do not investigate or edit the files yourself. The second delegate must use the supplied findings, call no tools at all (including execute), and return a concise plain-text test plan under 150 words rather than code or a diff; integrate both returned results and summarize the proposed change.",
     },
   ]
   const results = []
@@ -431,7 +431,12 @@ async function runRoutingEvaluation({ ctx, session, createdSessions, contextEven
     const root = await session.create({ title: `routing evaluation ${testCase.id}`, agent: "build", location: { directory: ctx.location.directory } })
     await session.prompt({ sessionID: root.id, text: testCase.prompt })
     trace(configuration, `case ${testCase.id}: prompt returned root=${root.id}`)
-    await waitForSession(session, root.id, 120_000, testCase.id)
+    await waitForSession(
+      session,
+      root.id,
+      Number(process.env.TIERED_DISPATCH_ROUTING_SESSION_TIMEOUT_MS ?? 240_000),
+      testCase.id,
+    )
     trace(configuration, `case ${testCase.id}: wait returned root=${root.id}`)
     const messages = await session.context({ sessionID: root.id })
     const children = createdSessions.slice(before + 1).filter((item) => item.metadata?.plugin === "tiered-dispatch")

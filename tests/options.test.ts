@@ -23,6 +23,15 @@ describe("parseOptions", () => {
     expect(parseOptions({ enabled: false })).toEqual({ enabled: false })
   })
 
+  it("rejects unknown nested fields even when disabled", () => {
+    expect(() => parseOptions({ enabled: false, taxonomy: { other: ["x"] } }))
+      .toThrow(/unknown field/)
+    expect(() => parseOptions({
+      enabled: false,
+      tiers: { fast: { model: "openai/fast", cost: 1 } },
+    })).toThrow(/unknown field: cost/)
+  })
+
   it("rejects unknown fields", () => {
     expect(() => parseOptions({ ...valid, fallback: true })).toThrow(/unknown field: fallback/)
     expect(() => parseOptions({ tiers: { ...valid.tiers, fast: { model: "openai/fast", cost: 1 } } }))
