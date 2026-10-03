@@ -11,9 +11,15 @@ describe("delegation result extraction", () => {
   })
 
   it("reports provider failures", () => {
-    expect(() => assertSuccessfulOutcome("failed", [
-      { type: "assistant", content: [], error: { message: "rate limited" } },
-    ])).toThrow(/rate limited/)
+    const providerError = { type: "rate_limit", message: "rate limited" }
+    try {
+      assertSuccessfulOutcome("failed", [
+        { type: "assistant", content: [], error: providerError },
+      ])
+      throw new Error("expected provider failure")
+    } catch (error) {
+      expect(error).toMatchObject({ message: "rate_limit: rate limited", cause: providerError })
+    }
   })
 
   it("rejects empty output", () => {

@@ -43,8 +43,10 @@ export function assertSuccessfulOutcome(
     const assistant = [...messages].reverse().find((message) => message.type === "assistant") as
       | AssistantMessage
       | undefined
-    const detail = assistant?.error?.message ?? assistant?.error?.type ?? "unknown provider error"
-    throw new DispatchError(`Delegation failed: ${detail}`)
+    const providerError = assistant?.error
+    const detail = providerError?.message ?? providerError?.type ?? "unknown provider error"
+    const prefix = providerError?.type && providerError.message ? `${providerError.type}: ` : ""
+    throw new DispatchError(`${prefix}${detail}`, providerError ? { cause: providerError } : undefined)
   }
   throw new DispatchError("Delegation became idle without a recorded outcome")
 }

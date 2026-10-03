@@ -12,7 +12,9 @@ const CHILD_GUARDS: readonly PermissionRule[] = [
   { action: "tiered_dispatch", resource: "*", effect: "deny" },
 ]
 
-const FAST_RULES: readonly PermissionRule[] = [
+const FAST_READ_ACTIONS = new Set(["grep", "glob", "webfetch", "websearch", "read"])
+
+const FAST_READ_ONLY_RULES: readonly PermissionRule[] = [
   { action: "*", resource: "*", effect: "deny" },
   { action: "grep", resource: "*", effect: "allow" },
   { action: "glob", resource: "*", effect: "allow" },
@@ -22,7 +24,6 @@ const FAST_RULES: readonly PermissionRule[] = [
   { action: "read", resource: "*.env", effect: "ask" },
   { action: "read", resource: "*.env.*", effect: "ask" },
   { action: "read", resource: "*.env.example", effect: "allow" },
-  ...CHILD_GUARDS,
 ]
 
 export function buildDelegatedPermissions(
@@ -30,9 +31,18 @@ export function buildDelegatedPermissions(
   callerAgentRules: readonly PermissionRule[] | undefined,
   callerSessionRules: readonly PermissionRule[] | undefined,
 ): PermissionRule[] {
+  const callerRules = [...(callerAgentRules ?? []), ...(callerSessionRules ?? [])]
+  if (tier !== "fast") return [...callerRules, ...CHILD_GUARDS]
+
+  // Session rules are last-match-wins. Keep caller denies and read-only asks
+  // after the fast baseline so it cannot weaken a caller restriction, while
+  // write-related caller asks/allows cannot grant mutation access.
   return [
-    ...(callerAgentRules ?? []),
-    ...(callerSessionRules ?? []),
-    ...(tier === "fast" ? FAST_RULES : CHILD_GUARDS),
+    ...callerRules,
+    ...FAST_READ_ONLY_RULES,
+    ...callerRules.filter(
+      (rule) => rule.effect === "deny" || (rule.effect === "ask" && FAST_READ_ACTIONS.has(rule.action)),
+    ),
+    ...CHILD_GUARDS,
   ]
 }

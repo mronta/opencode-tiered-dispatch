@@ -61,6 +61,20 @@ Model IDs and variants are workstation-specific. Check the active catalog with
 For an npm installation, publish or pack this project and use the resulting
 package name in the plugin entry. The package exports compiled `dist/` output.
 
+For a published package, install it globally through OpenCode and add the same
+configuration entry:
+
+```bash
+opencode plugin add opencode-tiered-dispatch
+```
+
+For a project-local installation, keep the plugin entry in that project's
+`opencode.jsonc` and point `package` at the installed package or checkout.
+Set `"enabled": false` to keep the package configured but inactive, or remove
+the entry to unload it completely. Update a global installation with
+`opencode plugin update opencode-tiered-dispatch`; remove it with
+`opencode plugin remove opencode-tiered-dispatch`.
+
 ## Configuration
 
 ```ts
@@ -114,7 +128,20 @@ npm run typecheck
 npm test
 npm run build
 npm pack --dry-run
+npm run smoke:package
 ```
 
-The smoke tests use mocked OpenCode runtime calls. Real-provider tests should
-be run explicitly because they consume model usage.
+`npm run smoke:package` installs the packed tarball into a clean temporary npm
+project and imports its plugin export. The OpenCode V2 registration/session
+smoke is explicit and requires three model references from the active catalog:
+
+```bash
+TIERED_DISPATCH_FAST_MODEL=provider/model \
+TIERED_DISPATCH_MEDIUM_MODEL=provider/model \
+TIERED_DISPATCH_HEAVY_MODEL=provider/model \
+npm run smoke:opencode
+```
+
+Set `TIERED_DISPATCH_*_VARIANT` variables when the configured models require a
+variant. The smoke test does not send a provider prompt; real-provider tests
+should be run separately because they consume model usage.

@@ -19,7 +19,9 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "prepack": "npm run build"
+    "prepack": "npm run build",
+    "smoke:package": "node scripts/package-smoke.mjs",
+    "smoke:opencode": "node scripts/opencode-smoke.mjs"
   },
   "keywords": [
     "opencode",
@@ -29,7 +31,7 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "@opencode/plugin": "^2.0.18"
+    "@opencode/plugin": "2.0.18"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
