@@ -140,6 +140,7 @@ export function createDispatcher(
       void interrupt()
     }
     context.signal.addEventListener("abort", abort, { once: true })
+    let finished = false
 
     try {
       if (closing || context.signal.aborted) {
@@ -173,6 +174,7 @@ export function createDispatcher(
         text,
       }
       log("delegation completed", { tier: input.tier, model: output.model, sessionID: child.id })
+      finished = true
       return {
         content: text,
         output,
@@ -180,6 +182,7 @@ export function createDispatcher(
       }
     } finally {
       context.signal.removeEventListener("abort", abort)
+      if (!finished) await interrupt()
       if (interruption) await interruption
       inFlight.delete(child.id)
     }

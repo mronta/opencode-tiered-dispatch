@@ -18,12 +18,7 @@ describe("delegation result extraction", () => {
       ])
       throw new Error("expected provider failure")
     } catch (error) {
-      expect(error).toMatchObject({
-        name: "TieredDispatchProviderError",
-        message: "rate_limit: rate limited",
-        cause: providerError,
-        providerError,
-      })
+      expect(error).toBe(providerError)
     }
   })
 

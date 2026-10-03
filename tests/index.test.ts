@@ -181,11 +181,7 @@ describe("plugin setup", () => {
         signal: new AbortController().signal,
         progress: vi.fn(async () => undefined),
       },
-    )).rejects.toMatchObject({
-      name: "TieredDispatchProviderError",
-      message: "rate_limit: provider refused",
-      providerError: { type: "rate_limit", message: "provider refused", status: 429 },
-    })
+    )).rejects.toEqual({ type: "rate_limit", message: "provider refused", status: 429 })
     expect(fixture.context.session.create).toHaveBeenCalledOnce()
     expect(fixture.context.session.create).toHaveBeenCalledWith(expect.objectContaining({
       model: { providerID: "p", id: "fast" },

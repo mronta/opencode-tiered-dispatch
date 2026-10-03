@@ -1,4 +1,4 @@
-import { DispatchError, ProviderDispatchError, type ProviderErrorRecord } from "./errors.js"
+import { DispatchError, type ProviderErrorRecord } from "./errors.js"
 
 interface AssistantTextPart {
   type: "text"
@@ -44,7 +44,7 @@ export function assertSuccessfulOutcome(
       | AssistantMessage
       | undefined
     const providerError = assistant?.error
-    if (providerError) throw new ProviderDispatchError(providerError)
+    if (providerError) throw providerError
     throw new DispatchError("unknown provider error")
   }
   throw new DispatchError("Delegation became idle without a recorded outcome")

@@ -19,16 +19,3 @@ export type ProviderErrorRecord = Readonly<Record<string, unknown>> & {
   message?: unknown
   status?: unknown
 }
-
-export class ProviderDispatchError extends DispatchError {
-  override readonly name = "TieredDispatchProviderError"
-  readonly providerError: ProviderErrorRecord
-
-  constructor(providerError: ProviderErrorRecord) {
-    const type = typeof providerError.type === "string" ? providerError.type : undefined
-    const message = typeof providerError.message === "string" ? providerError.message : undefined
-    const detail = message ?? type ?? "unknown provider error"
-    super(type && message ? `${type}: ${detail}` : detail, { cause: providerError })
-    this.providerError = providerError
-  }
-}

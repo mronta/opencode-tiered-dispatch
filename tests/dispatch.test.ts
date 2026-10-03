@@ -142,6 +142,18 @@ describe("dispatcher", () => {
     await expect(execution).rejects.toThrow(/cancelled/)
   })
 
+  it("interrupts a child when prompting fails", async () => {
+    const runtime = makeRuntime()
+    vi.mocked(runtime.prompt).mockRejectedValue(new Error("prompt failed"))
+    const dispatcher = createDispatcher(runtime, parsed, new Set(["explore", "general"]))
+
+    await expect(dispatcher.execute(
+      { tier: "medium", description: "Implement", prompt: "Implement" },
+      toolContext(),
+    )).rejects.toThrow("prompt failed")
+    expect(runtime.interrupt).toHaveBeenCalledWith("ses_child")
+  })
+
   it("keeps concurrent tier results and child sessions isolated", async () => {
     const runtime = makeRuntime()
     let nextID = 0
@@ -181,12 +193,7 @@ describe("dispatcher", () => {
     await expect(dispatcher.execute(
       { tier: "fast", description: "Fail", prompt: "Trigger failure" },
       toolContext(),
-    )).rejects.toMatchObject({
-      name: "TieredDispatchProviderError",
-      message: "rate_limit: provider refused",
-      cause: providerError,
-      providerError,
-    })
+    )).rejects.toBe(providerError)
     expect(runtime.createSession).toHaveBeenCalledOnce()
     expect(runtime.createSession).toHaveBeenCalledWith(expect.objectContaining({ agent: "explore" }))
   })
