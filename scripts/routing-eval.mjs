@@ -3,6 +3,10 @@ import { dirname, join } from "node:path"
 import { spawnSync } from "node:child_process"
 
 const READ_TOOLS = new Set(["read", "glob", "grep", "webfetch", "websearch"])
+// The primary may coordinate another delegation or inspect the workspace after
+// a delegation returns. Keep this allowlist deliberately narrow: implementation
+// and arbitrary command-execution tools must remain in the delegated session.
+const PRIMARY_POST_DELEGATION_TOOLS = new Set(["subagent", "skill", ...READ_TOOLS])
 
 export const scenarios = [
   { id: "trivial", text: "What is 2 + 2? Reply with just the number.", route: [] },
@@ -88,7 +92,7 @@ export default {
     const contexts = []
     const registrations = []
     registrations.push(await ctx.session.hook("context", event => {
-      setImmediate(() => contexts.push({ sessionID: event.sessionID, agent: event.agent, model: event.model, hasProtocol: event.system.some(part => String(part?.text ?? "").includes("Tiered Dispatch Protocol")) }))
+      setImmediate(() => contexts.push({ sessionID: event.sessionID, agent: event.agent, model: event.model, variant: event.variant, hasProtocol: event.system.some(part => String(part?.text ?? "").includes("Tiered Dispatch Protocol")) }))
     }))
     for (const phase of ["before", "after"]) {
       registrations.push(await ctx.tool.hook("execute." + phase, event => {
@@ -107,13 +111,15 @@ export default {
           const root = await ctx.session.create({ title: "[routing eval] " + scenario.id, agent: "build", model: ${JSON.stringify(model)}, location: { directory: ctx.location.directory } })
           await ctx.session.prompt({ sessionID: root.id, text: scenario.text })
           await ctx.session.wait({ sessionID: root.id })
+          await new Promise(resolve => setImmediate(resolve))
           const sessionIDs = [...new Set([root.id, ...contexts.slice(contextStart).map(event => event.sessionID)])]
           const sessions = []
           for (const sessionID of sessionIDs) {
             const info = await ctx.session.get({ sessionID })
             const messages = await ctx.session.context({ sessionID })
             const assistant = messages.filter(message => message.type === "assistant")
-            sessions.push({ sessionID, parentID: info.parentID, outcome: info.outcome, text: assistant.flatMap(message => message.content ?? []).filter(part => part.type === "text").map(part => part.text).join("\\n"), usage: assistant.map(message => ({ tokens: message.tokens, cost: message.cost })) })
+            const context = [...contexts.slice(contextStart)].reverse().find(event => event.sessionID === sessionID)
+            sessions.push({ sessionID, parentID: info.parentID, agent: info.agent ?? context?.agent, model: info.model ?? context?.model, variant: info.variant ?? context?.variant, outcome: info.outcome, text: assistant.flatMap(message => message.content ?? []).filter(part => part.type === "text").map(part => part.text).join("\\n"), usage: assistant.map(message => ({ tokens: message.tokens, cost: message.cost })) })
           }
           const afterFiles = snapshotFiles(ctx.location.directory)
           const changedFiles = [...new Set([...Object.keys(beforeFiles), ...Object.keys(afterFiles)])].filter(path => beforeFiles[path] !== afterFiles[path])
@@ -132,27 +138,30 @@ export default {
 `
 }
 
-export function assessRouting(result, expectedRoute) {
-  const dispatches = result.tools.filter(event => event.phase === "before" && event.tool === "subagent" && event.sessionID === result.rootSessionID)
+export function assessRouting(result, expectedRoute, tierModels) {
+  const tools = result.tools ?? []
+  const dispatches = tools.filter(event => event.phase === "before" && event.tool === "subagent" && event.sessionID === result.rootSessionID)
   const route = dispatches.map(event => event.input?.agent)
   const problems = [...(result.fixtureProblems ?? [])]
+  const configuredTierModels = tierModels ?? result.requiredTierModels ?? result.tierModels
   const executionTier = expectedRoute.at(-1)
   const matchesRoute = expectedRoute.length === 0 ? route.length === 0
     : route[0] === expectedRoute[0] && route.at(-1) === executionTier
       && route.every(tier => tier === "fast" || tier === executionTier)
   if (!matchesRoute) problems.push(`expected ${expectedRoute.join("→") || "direct"} (focused discovery/resume cycles allowed); observed ${route.join("→") || "direct"}`)
-  if (result.sessions.some(session => session.outcome !== "succeeded")) problems.push("one or more sessions did not succeed")
+  if ((result.sessions ?? []).some(session => session.outcome !== "succeeded")) problems.push("one or more sessions did not succeed")
   if (result.contexts && !result.contexts.some(event => event.sessionID === result.rootSessionID && event.hasProtocol)) problems.push("primary routing protocol was not observed")
-  const completions = new Map(result.tools.flatMap((event, index) => event.phase === "after" && event.status === "completed" ? [[event.id, { event, index }]] : []))
+  problems.push(...correlationProblems(result, dispatches, configuredTierModels))
+  const completions = new Map(tools.flatMap((event, index) => event.phase === "after" && event.status === "completed" ? [[event.id, { event, index }]] : []))
   let previousExecution
   for (const dispatch of dispatches) {
-    const dispatchIndex = result.tools.indexOf(dispatch)
+    const dispatchIndex = tools.indexOf(dispatch)
     const completion = completions.get(dispatch.id)
     if (!completion || completion.index <= dispatchIndex) problems.push("native delegation did not complete")
     if (previousExecution && (completions.get(previousExecution.id)?.index ?? Infinity) >= dispatchIndex) problems.push("recovery or execution began before the previous execution returned")
     if (dispatch.input?.agent === "fast") continue
     previousExecution = dispatch
-    const discoveryCalls = dispatches.filter(previous => previous.input?.agent === "fast" && result.tools.indexOf(previous) < result.tools.indexOf(dispatch))
+    const discoveryCalls = dispatches.filter(previous => previous.input?.agent === "fast" && tools.indexOf(previous) < tools.indexOf(dispatch))
     for (const discovery of discoveryCalls) {
       if ((completions.get(discovery.id)?.index ?? Infinity) >= dispatchIndex) problems.push("dependent phases overlapped or discovery failed")
     }
@@ -163,19 +172,29 @@ export function assessRouting(result, expectedRoute) {
       if (!paths.some(path => dispatch.input?.prompt?.includes(path))) problems.push("execution prompt did not carry discovered file evidence")
     }
   }
-  if (result.tools.some(event => event.phase === "after" && event.tool === "subagent" && event.status === "error")) problems.push("a native delegation failed")
-  const readCalls = result.tools.filter(event => event.phase === "before" && READ_TOOLS.has(event.tool))
+  if (tools.some(event => event.phase === "after" && event.tool === "subagent" && event.status === "error")) problems.push("a native delegation failed")
+  const readCalls = tools.filter(event => event.phase === "before" && READ_TOOLS.has(event.tool))
   const primaryReads = readCalls.filter(event => event.sessionID === result.rootSessionID)
-  const firstDispatchIndex = dispatches.length > 0 ? result.tools.indexOf(dispatches[0]) : result.tools.length
-  const readsBeforeDispatch = primaryReads.filter(event => result.tools.indexOf(event) < firstDispatchIndex).length
-  const preDispatchPrimaryTools = result.tools.filter((event, index) => event.phase === "before"
-    && event.sessionID === result.rootSessionID
-    && event.tool !== "subagent"
-    && index < firstDispatchIndex)
+  const primaryToolCalls = tools.filter(event => event.phase === "before" && event.sessionID === result.rootSessionID)
+  const firstDispatchIndex = dispatches.length > 0 ? tools.indexOf(dispatches[0]) : tools.length
+  const readsBeforeDispatch = primaryReads.filter(event => tools.indexOf(event) < firstDispatchIndex).length
+  const preDispatchPrimaryTools = primaryToolCalls.filter(event => {
+    const index = tools.indexOf(event)
+    return event.tool !== "subagent" && index < firstDispatchIndex
+  })
   if (expectedRoute.length > 0 && preDispatchPrimaryTools.length > 0) {
     problems.push(`primary used tools before first nontrivial delegation: ${preDispatchPrimaryTools.map(event => event.tool).join(", ")}`)
   }
-  const usage = result.sessions.flatMap(session => session.usage)
+  if (expectedRoute.length === 0 && primaryToolCalls.length > 1) {
+    problems.push(`trivial route used ${primaryToolCalls.length} primary tool calls (expected at most one)`)
+  }
+  if (dispatches.length > 0) {
+    const postDispatchPrimaryTools = primaryToolCalls.filter(event => tools.indexOf(event) > firstDispatchIndex && !isAllowedPrimaryPostDelegation(event))
+    if (postDispatchPrimaryTools.length > 0) {
+      problems.push(`primary used disallowed tools after delegation: ${postDispatchPrimaryTools.map(event => event.tool).join(", ")}`)
+    }
+  }
+  const usage = (result.sessions ?? []).flatMap(session => session.usage ?? [])
   const tokenUsage = usage.filter(entry => entry.tokens)
   const tokens = tokenUsage.length === 0 ? null : tokenUsage.reduce((total, entry) => {
     for (const key of ["input", "output", "reasoning"]) total[key] += entry.tokens[key] ?? 0
@@ -184,5 +203,114 @@ export function assessRouting(result, expectedRoute) {
   }, { input: 0, output: 0, reasoning: 0, cachedRead: 0 })
   const readFingerprints = readCalls.map(event => `${event.tool}:${JSON.stringify(event.input)}`)
   const repeatedReads = readFingerprints.length - new Set(readFingerprints).size
-  return { id: result.id, route, elapsedMs: result.elapsedMs, primaryReadCount: primaryReads.length, readsBeforeDispatch, repeatedReads, toolCalls: result.tools.filter(event => event.phase === "before").length, problems, tokens }
+  return { id: result.id, route, elapsedMs: result.elapsedMs, primaryReadCount: primaryReads.length, readsBeforeDispatch, repeatedReads, toolCalls: tools.filter(event => event.phase === "before").length, problems, tokens }
+}
+
+function isAllowedPrimaryPostDelegation(event) {
+  if (PRIMARY_POST_DELEGATION_TOOLS.has(event.tool)) return true
+  return event.tool === "shell" && isVerificationCommand(event.input?.command)
+}
+
+function isVerificationCommand(command) {
+  if (typeof command !== "string") return false
+  const trimmed = command.trim()
+  if (trimmed === "") return false
+  const inlineNode = trimmed.match(/^node\s+--input-type=module\s+-e\s+(?:"([\s\S]*)"|'([\s\S]*)')$/i)
+  if (inlineNode) return isReadOnlyInlineNodeScript(inlineNode[1] ?? inlineNode[2])
+  if (/[|;&`<>\n\r]|\$\(/u.test(trimmed)) return false
+  if (/(?:^|\s)(?:>>?|<<|tee|touch|rm|rmdir|mv|cp|install|mkdir|sed\s+-i|perl\s+-i|python(?:3)?\s+-c|node\s+-e|git\s+(?:add|commit|reset|restore|checkout|clean)|npm\s+(?:install|ci|uninstall)|pnpm\s+(?:add|install|remove)|yarn\s+(?:add|install|remove))\b/i.test(trimmed)) return false
+  if (/(?:^|\s)--?(?:output|out|write|fix|update(?:snapshot)?|watch(?:all)?|coverage(?:directory|-directory)?)(?:=|\s|$)/i.test(trimmed)) return false
+  return /^(?:(?:npm|pnpm|yarn|bun)\s+(?:test|run\s+(?:test|typecheck|check|verify|lint))|(?:node|bun|deno)\s+--test|(?:pytest|vitest|jest|cargo\s+test|go\s+test|make\s+(?:test|check|verify|lint))|git\s+(?:diff|status|log)(?:\s|$))/i.test(trimmed)
+}
+
+function isReadOnlyInlineNodeScript(script) {
+  if (/[`\n\r]|\$\(/u.test(script)) return false
+  return !/(?:node:(?:fs|child_process|net|http|https)\b|\b(?:writeFile|appendFile|write|append|unlink|rm|mkdir|rmdir|rename|copyFile|chmod|chown|truncate)(?:Sync)?\s*\(|\b(?:exec|spawn|fork)(?:Sync)?\s*\(|\bfetch\s*\(|\b(?:Deno|Bun)\.(?:write|remove|rename|spawn)\s*\(|\bprocess\.(?:exit|kill|chdir)\s*\()/i.test(script)
+}
+
+function correlationProblems(result, dispatches, tierModels) {
+  if (dispatches.length === 0) return []
+
+  const contexts = new Map()
+  for (const context of result.contexts ?? []) {
+    if (context.sessionID !== undefined) contexts.set(context.sessionID, context)
+  }
+
+  const observed = new Map()
+  for (const session of result.sessions ?? []) {
+    if (session.sessionID === undefined) continue
+    const context = contexts.get(session.sessionID)
+    observed.set(session.sessionID, {
+      ...context,
+      ...session,
+      agent: session.agent ?? context?.agent,
+      model: session.model ?? context?.model,
+      variant: session.variant ?? context?.variant,
+    })
+  }
+  // Keep context-only records visible so a missing session inspection cannot
+  // accidentally make a root tool trace look like a completed child.
+  for (const [sessionID, context] of contexts) {
+    if (!observed.has(sessionID)) observed.set(sessionID, { ...context, sessionID })
+  }
+
+  const children = [...observed.values()].filter(session => session.sessionID !== result.rootSessionID)
+  const used = new Set()
+  const problems = []
+  for (const dispatch of dispatches) {
+    const agent = dispatch.input?.agent
+    const available = children.filter(session => !used.has(session.sessionID) && session.agent === agent)
+    const rooted = available.find(session => session.parentID === result.rootSessionID)
+    if (!rooted) {
+      problems.push(`native delegation ${agent ?? "unknown"} did not correlate to an observed child session with parent ${result.rootSessionID}`)
+      continue
+    }
+    const child = available.find(session => session.parentID === result.rootSessionID && session.outcome === "succeeded")
+    if (!child) {
+      problems.push(`native delegation ${agent ?? "unknown"} child session did not succeed`)
+      continue
+    }
+    used.add(child.sessionID)
+    const expectedModel = tierModels?.[agent]
+    if (expectedModel !== undefined && !matchesTierModel(child.model, expectedModel, child.variant)) {
+      problems.push(`native delegation ${agent} child session used an unexpected model or variant`)
+    }
+  }
+  return problems
+}
+
+function matchesTierModel(observedModel, expectedModel, observedVariant) {
+  const actual = normalizeModel(observedModel, observedVariant)
+  const expected = normalizeModel(expectedModel)
+  if (!actual || !expected) return false
+  return actual.providerID === expected.providerID
+    && actual.id === expected.id
+    && normalizeVariant(actual.variant, expected.variant) === expected.variant
+}
+
+function normalizeModel(value, variant) {
+  if (typeof value === "string") {
+    const [reference, embeddedVariant] = value.split("#", 2)
+    const separator = reference.indexOf("/")
+    if (separator <= 0 || separator === reference.length - 1) return undefined
+    return {
+      providerID: reference.slice(0, separator),
+      id: reference.slice(separator + 1),
+      variant: variant ?? embeddedVariant,
+    }
+  }
+  if (value && typeof value === "object") {
+    const model = value
+    if (typeof model.providerID === "string" && typeof model.id === "string") {
+      return { providerID: model.providerID, id: model.id, variant: variant ?? model.variant }
+    }
+    if (typeof model.model === "string") return normalizeModel(model.model, variant ?? model.variant)
+    if (model.model && typeof model.model === "object") return normalizeModel(model.model, variant ?? model.variant)
+    if (model.modelRef && typeof model.modelRef === "object") return normalizeModel(model.modelRef, variant ?? model.variant)
+  }
+  return undefined
+}
+
+function normalizeVariant(actual, expected) {
+  return expected === undefined && actual === "default" ? undefined : actual
 }

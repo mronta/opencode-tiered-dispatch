@@ -297,10 +297,15 @@ outside `.git` and `node_modules`, not external paths or a security sandbox.
 Handoff checks are structural, not proof that all findings were understood.
 Repeated reads are diagnostic, not necessarily
 redundant (for example, rereading after an edit can be necessary).
-It exits nonzero when observed routing misses the expected route or the primary
-uses a tool before its first nontrivial delegation. The report also shows all
-primary reads, including integration verification, so over-exploration can be
-distinguished from final verification.
+It exits nonzero when observed routing misses the expected route, the primary
+uses a tool before its first nontrivial delegation, or the primary executes a
+disallowed tool after delegation. After delegation, the primary allowlist is
+limited to native `subagent`/`skill` orchestration, read/search tools (`read`,
+`glob`, `grep`, `webfetch`, and `websearch`), and standalone test/check
+commands for integration or final verification. Mutation commands and other
+command execution remain delegated. The report also shows all primary reads,
+including integration verification, so over-exploration can be distinguished
+from final verification.
 It is intentionally separate from the smoke test: nondeterministic model
 compliance is not a structural plugin test. Passing examples do not guarantee
 general splitting or establish net cost savings. It inherits the host's global

@@ -91,7 +91,7 @@ function verifyRoutingEvaluation(results) {
   const reports = scenarios.map(scenario => {
     const result = results.find(candidate => candidate.id === scenario.id)
     if (!result) throw new Error(`routing evaluation missing scenario ${scenario.id}`)
-    return assessRouting(result, scenario.route)
+    return assessRouting(result, scenario.route, requiredTierModels)
   })
   const reportByID = new Map(reports.map(report => [report.id, report]))
   const trivial = results.find(result => result.id === "trivial")
