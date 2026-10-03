@@ -157,6 +157,10 @@ function observerSource(resultPaths, selectedRootModel, configuredTiers, configu
     "  return messages.filter((message) => message.type === \"assistant\").flatMap((message) => message.content ?? []).filter((part) => part.type === \"text\").map((part) => part.text).join(\"\\n\").trim()",
     "}",
     "",
+    "async function createSession(ctx, title, agent, model) {",
+    "  return ctx.session.create({ title, agent, model, location: { directory: ctx.location.directory } })",
+    "}",
+    "",
     "export default {",
     "  id: \"tiered-native-smoke-observer\",",
     "  async setup(ctx) {",
@@ -175,7 +179,7 @@ function observerSource(resultPaths, selectedRootModel, configuredTiers, configu
     "          }",
     "          const results = {}",
     "          for (const tier of tiers) {",
-    "            const session = await ctx.session.create({ title: `[native smoke] direct ${tier}`, agent: tier, model: directModels[tier], location: { directory: ctx.location.directory } })",
+    "            const session = await createSession(ctx, `[native smoke] direct ${tier}`, tier, directModels[tier])",
     "            await ctx.session.prompt({ sessionID: session.id, text: directPrompts[tier] })",
     "            await ctx.session.wait({ sessionID: session.id })",
     "            results[tier] = session.id",
@@ -183,12 +187,12 @@ function observerSource(resultPaths, selectedRootModel, configuredTiers, configu
     "          await new Promise((resolve) => setTimeout(resolve, 100))",
     "          const outputs = {}",
     "          for (const tier of tiers) {",
-    "            const direct = [...events].reverse().find((event) => event.agent === tier && event.sessionID === results[tier])",
-    "            const messages = direct ? await ctx.session.context({ sessionID: direct.sessionID }) : []",
-    "            outputs[tier] = { childSessionID: direct?.sessionID, childText: messageText(messages) }",
+    "            const tierEvent = [...events].reverse().find((event) => event.agent === tier && event.sessionID === results[tier])",
+    "            const messages = tierEvent ? await ctx.session.context({ sessionID: tierEvent.sessionID }) : []",
+    "            outputs[tier] = { sessionID: tierEvent?.sessionID, text: messageText(messages) }",
     "          }",
     "          const routingStart = events.length",
-    "          const routingRoot = await ctx.session.create({ title: \"[native smoke] primary routing\", agent: \"build\", model: rootModel, location: { directory: ctx.location.directory } })",
+    "          const routingRoot = await createSession(ctx, \"[native smoke] primary routing\", \"build\", rootModel)",
     "          await ctx.session.prompt({ sessionID: routingRoot.id, text: \"Use the native subagent tool exactly once. Select agent medium and ask it to return exactly NATIVE_ROUTE_MEDIUM_OK without using tools. After it returns, reply exactly NATIVE_ROUTE_OK. Do not call any other tools.\" })",
     "          await ctx.session.wait({ sessionID: routingRoot.id })",
     "          const routingChild = await waitForAgentEvent(events, routingStart, \"medium\")",
@@ -223,7 +227,7 @@ function observerSource(resultPaths, selectedRootModel, configuredTiers, configu
     "",
     "async function exerciseNativeLifecycle(ctx, events) {",
     "  const cancellationStart = events.length",
-    "  const cancellationRoot = await ctx.session.create({ title: \"[native smoke] cancellation\", agent: \"build\", model: rootModel, location: { directory: ctx.location.directory } })",
+    "  const cancellationRoot = await createSession(ctx, \"[native smoke] cancellation\", \"build\", rootModel)",
     "  let cancellationError",
     "  const cancellationPrompt = ctx.session.prompt({ sessionID: cancellationRoot.id, text: \"Use the native subagent tool exactly once. Select agent fast and ask it to spend a long time producing a detailed research answer. Do not answer until the child returns.\" }).catch((error) => { cancellationError = String(error) })",
     "  const cancellationChild = await waitForAgentEvent(events, cancellationStart, \"fast\")",
@@ -232,7 +236,7 @@ function observerSource(resultPaths, selectedRootModel, configuredTiers, configu
     "  const cancellationRootInfo = await waitForOutcome(ctx, cancellationRoot.id, \"interrupted\", 30_000)",
     "  const cancellationChildInfo = await waitForOutcome(ctx, cancellationChild.sessionID, \"interrupted\", 30_000)",
     "  const providerStart = events.length",
-    "  const providerRoot = await ctx.session.create({ title: \"[native smoke] provider error\", agent: \"build\", model: rootModel, location: { directory: ctx.location.directory } })",
+    "  const providerRoot = await createSession(ctx, \"[native smoke] provider error\", \"build\", rootModel)",
     "  let providerPromptError",
     "  const providerPrompt = ctx.session.prompt({ sessionID: providerRoot.id, text: \"Use the native subagent tool exactly once. Select agent provider-error and ask it to return exactly PROVIDER_ERROR_SHOULD_NOT_SUCCEED. Do not select another agent or retry with another model.\" }).catch((error) => { providerPromptError = String(error) })",
     "  await withTimeout(providerPrompt, 30_000)",
@@ -294,15 +298,15 @@ function verify(result, agents, workspace, configuredProviderErrorModel) {
     if (new Set(events.map((event) => event.sessionID)).size !== 1) {
       throw new Error(`native ${tier} was invoked more than once: ${JSON.stringify(events)}`)
     }
-    const child = events.at(-1)
-    if (child.hasProtocol) throw new Error(`native ${tier} child received the primary routing protocol`)
-    if (!child.model?.providerID || !child.model?.id) throw new Error(`native ${tier} child has no resolved model`)
-    if (child.toolNames.includes("subagent")) throw new Error(`native ${tier} child can recurse`)
+    const tierEvent = events.at(-1)
+    if (tierEvent.hasProtocol) throw new Error(`native ${tier} tier session received the primary routing protocol`)
+    if (!tierEvent.model?.providerID || !tierEvent.model?.id) throw new Error(`native ${tier} tier session has no resolved model`)
+    if (tierEvent.toolNames.includes("subagent")) throw new Error(`native ${tier} tier session can recurse`)
     const expected = result.expected[tier]
-    if (!matchesExpectedModel(child.model, expected)) {
-      throw new Error(`native ${tier} used the wrong model: ${JSON.stringify({ expected, actual: child.model })}`)
+    if (!matchesExpectedModel(tierEvent.model, expected)) {
+      throw new Error(`native ${tier} used the wrong model: ${JSON.stringify({ expected, actual: tierEvent.model })}`)
     }
-    if (result.outputs[tier]?.childText !== `NATIVE_${tier.toUpperCase()}_OK`) {
+    if (result.outputs[tier]?.text !== `NATIVE_${tier.toUpperCase()}_OK`) {
       throw new Error(`native ${tier} returned the wrong child result: ${JSON.stringify(result.outputs[tier])}`)
     }
     const fileCheck = fileChecks[tier]
