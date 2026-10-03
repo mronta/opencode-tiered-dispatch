@@ -85,13 +85,7 @@ function formatFailure(failure, logs) {
 
 function verifyMaterializedAgents(agents, expectedTiers) {
   for (const [tier, expected] of Object.entries(expectedTiers)) {
-    const agent = agents.find((candidate) => candidate.id === tier)
-    if (!agent || agent.mode !== "subagent") {
-      throw new Error(`native ${tier} was not materialized as a subagent: ${JSON.stringify(agent)}`)
-    }
-    if (!matchesExpectedModel(agent.model, expected)) {
-      throw new Error(`native ${tier} was materialized with the wrong model: ${JSON.stringify(agent)}`)
-    }
+    verifyTierAgent(agents, tier, expected, "materialized")
   }
 }
 
@@ -121,6 +115,17 @@ function matchesExpectedModel(actual, expected) {
   return actual.providerID === configured.providerID
     && actual.id === configured.id
     && normalizedVariant(actual.variant, expected.variant) === (expected.variant ?? undefined)
+}
+
+function verifyTierAgent(agents, tier, expected, phase) {
+  const agent = agents.find((candidate) => candidate.id === tier)
+  if (!agent || agent.mode !== "subagent") {
+    throw new Error(`native ${tier} was not ${phase} as a subagent: ${JSON.stringify(agent)}`)
+  }
+  if (!matchesExpectedModel(agent.model, expected)) {
+    throw new Error(`native ${tier} was ${phase} with the wrong model: ${JSON.stringify(agent)}`)
+  }
+  return agent
 }
 
 function observerSource(resultPaths, selectedRootModel, configuredTiers, configuredProviderErrorModel) {
@@ -304,11 +309,7 @@ function verify(result, agents, workspace, configuredProviderErrorModel) {
     if (fileCheck && (!existsSync(fileCheck.path) || readFileSync(fileCheck.path, "utf8") !== fileCheck.content)) {
       throw new Error(`native ${tier} could not ${fileCheck.action}: ${JSON.stringify(result.outputs[tier])}`)
     }
-    const agent = agents.find((candidate) => candidate.id === tier)
-    if (!agent || agent.mode !== "subagent") throw new Error(`native ${tier} is not a subagent agent`)
-    if (!matchesExpectedModel(agent.model, expected)) {
-      throw new Error(`native ${tier} has the wrong configured model: ${JSON.stringify(agent)}`)
-    }
+    const agent = verifyTierAgent(agents, tier, expected, "configured")
     const permissions = agent.permissions ?? []
     const subagentRule = [...permissions].reverse().find(
       (rule) => rule.resource === "*" && (rule.action === "subagent" || rule.action === "*"),
