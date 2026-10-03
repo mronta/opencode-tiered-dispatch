@@ -166,8 +166,15 @@ export function assessRouting(result, expectedRoute) {
   if (result.tools.some(event => event.phase === "after" && event.tool === "subagent" && event.status === "error")) problems.push("a native delegation failed")
   const readCalls = result.tools.filter(event => event.phase === "before" && READ_TOOLS.has(event.tool))
   const primaryReads = readCalls.filter(event => event.sessionID === result.rootSessionID)
-  const directReads = primaryReads.length
-  if (directReads > 2) problems.push(`primary exceeded discovery budget: ${directReads} calls`)
+  const firstDispatchIndex = dispatches.length > 0 ? result.tools.indexOf(dispatches[0]) : result.tools.length
+  const readsBeforeDispatch = primaryReads.filter(event => result.tools.indexOf(event) < firstDispatchIndex).length
+  const preDispatchPrimaryTools = result.tools.filter((event, index) => event.phase === "before"
+    && event.sessionID === result.rootSessionID
+    && event.tool !== "subagent"
+    && index < firstDispatchIndex)
+  if (expectedRoute.length > 0 && preDispatchPrimaryTools.length > 0) {
+    problems.push(`primary used tools before first nontrivial delegation: ${preDispatchPrimaryTools.map(event => event.tool).join(", ")}`)
+  }
   const usage = result.sessions.flatMap(session => session.usage)
   const tokenUsage = usage.filter(entry => entry.tokens)
   const tokens = tokenUsage.length === 0 ? null : tokenUsage.reduce((total, entry) => {
@@ -175,9 +182,7 @@ export function assessRouting(result, expectedRoute) {
     total.cachedRead += entry.tokens.cache?.read ?? 0
     return total
   }, { input: 0, output: 0, reasoning: 0, cachedRead: 0 })
-  const firstDispatchIndex = dispatches.length > 0 ? result.tools.indexOf(dispatches[0]) : result.tools.length
-  const readsBeforeDispatch = primaryReads.filter(event => result.tools.indexOf(event) < firstDispatchIndex).length
   const readFingerprints = readCalls.map(event => `${event.tool}:${JSON.stringify(event.input)}`)
   const repeatedReads = readFingerprints.length - new Set(readFingerprints).size
-  return { id: result.id, route, elapsedMs: result.elapsedMs, directReads, readsBeforeDispatch, repeatedReads, toolCalls: result.tools.filter(event => event.phase === "before").length, problems, tokens }
+  return { id: result.id, route, elapsedMs: result.elapsedMs, primaryReadCount: primaryReads.length, readsBeforeDispatch, repeatedReads, toolCalls: result.tools.filter(event => event.phase === "before").length, problems, tokens }
 }

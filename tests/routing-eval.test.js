@@ -58,9 +58,9 @@ describe("spontaneous routing assessment", () => {
     expect(assessRouting(result, ["fast", "medium"]).problems).toEqual(["validation failed"])
   })
 
-  it("allows direct trivial work and flags discovery budget overruns", () => {
+  it("allows direct trivial work and rejects pre-dispatch nontrivial tools", () => {
     expect(assessRouting(trace([]), []).problems).toEqual([])
-    const reads = Array.from({ length: 3 }, () => ({ phase: "before", tool: "read", sessionID: "root" }))
-    expect(assessRouting(trace(reads), []).problems).toContain("primary exceeded discovery budget: 3 calls")
+    const reads = [{ phase: "before", tool: "read", sessionID: "root" }]
+    expect(assessRouting(trace(reads), ["fast", "medium"]).problems).toContain("primary used tools before first nontrivial delegation: read")
   })
 })

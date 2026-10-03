@@ -77,6 +77,10 @@ There is no `medium-fast` model variant. This exact mapping is required by the p
 confirm that these exact models and variants are available with `/models` before
 connecting providers.
 
+The canonical packaged mapping lives in the root `tiers.json`; `src/tiers.ts`
+validates and loads it for runtime use. Tests, native smoke checks, and the
+packed plugin all consume that same file.
+
 ## Published or packed installation
 
 For a published package:
@@ -190,7 +194,7 @@ The protocol tells the primary to:
 7. omit per-call model overrides because each tier owns its validated model and
    variant;
 8. integrate delegated results and remain responsible for the final answer;
-9. keep direct discovery to two read-only calls and avoid repeated broad exploration.
+9. delegate before nontrivial discovery and avoid repeated broad exploration.
 
 Tier agents do not receive this orchestration protocol. Their own `system`
 instructions and permissions remain focused on execution, so they cannot recurse
@@ -231,8 +235,8 @@ into another subagent call.
   ```
 - **A model is unavailable:** authenticate with `/connect` and copy the exact
   `provider/model` from `/models`.
-- **A variant is unavailable:** the packaged mapping requires `medium#max` and
-  `heavy#medium`; authenticate or configure the provider so those exact
+- **A variant is unavailable:** the packaged mapping requires `fast#medium`,
+  `medium#max`, and `heavy#medium`; authenticate or configure the provider so those exact
   variants are available. The plugin does not substitute another variant.
 - **A tier call is rejected:** remove the per-call `model` field from the native
   `subagent` invocation and select `fast`, `medium`, or `heavy` according to
@@ -242,6 +246,10 @@ into another subagent call.
   allow `edit`, `shell`, or `subagent`.
 - **No routing guidance appears:** confirm the plugin is configured for the
   project you opened, `enabled` is not false, and start a new session.
+- **No tier agents appear:** run `opencode debug agents` and inspect the
+  OpenCode log for a configuration-normalization warning. A malformed global
+  `opencode.jsonc` causes the plugin entry to be ignored; fix the JSONC and
+  restart the OpenCode service.
 
 ## Development and verification
 
@@ -289,20 +297,21 @@ outside `.git` and `node_modules`, not external paths or a security sandbox.
 Handoff checks are structural, not proof that all findings were understood.
 Repeated reads are diagnostic, not necessarily
 redundant (for example, rereading after an edit can be necessary).
-It exits nonzero when observed routing misses the expected route or read budget.
-The read-budget flag conservatively counts all primary read-only calls, including
-integration verification; the report separately shows reads before the first
-delegation so over-exploration can be distinguished from final verification.
+It exits nonzero when observed routing misses the expected route or the primary
+uses a tool before its first nontrivial delegation. The report also shows all
+primary reads, including integration verification, so over-exploration can be
+distinguished from final verification.
 It is intentionally separate from the smoke test: nondeterministic model
 compliance is not a structural plugin test. Passing examples do not guarantee
 general splitting or establish net cost savings. It inherits the host's global
 configuration and credentials; its files live in a temporary fixture workspace.
 
-Initial live evaluation with a medium-tier primary produced both composite
-routes (`fast → medium` and `fast → heavy`), but performed the known-scope edit
-directly and exceeded primary read budgets. A later run executed both composites
-directly too: decomposition is not repeatable yet. This remains an advisory-routing
-limitation; the evaluator reports it rather than forcing a passing outcome.
+After fixing the user's malformed global `opencode.jsonc`, the host consistently
+loaded all three tier agents. Repeated runs produced both composite routes;
+adding an explicit rule for multi-step known-scope edits produced the expected
+`medium`, `fast → medium`, and `fast → heavy` routes in the latest run. Primary
+integration reads and repeated reads remained diagnostic warnings, so this is
+improved advisory routing—not a hard guarantee.
 
 ### Prompt token budgets
 
@@ -310,7 +319,7 @@ limitation; the evaluator reports it rather than forcing a passing outcome.
 npm run measure:prompts
 ```
 
-The default plugin-added primary protocol measures 361 tokens; tier instructions
+The default plugin-added primary protocol measures 346 tokens; tier instructions
 measure 62–68 tokens with `o200k_base`. The previous primary protocol was 440
 tokens with the same encoding (~18% reduction despite added handoff contracts).
 Tests budget 380 primary tokens and 85 per tier. Custom taxonomy/instructions

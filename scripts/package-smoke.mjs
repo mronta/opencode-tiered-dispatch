@@ -16,6 +16,7 @@ try {
 
   const dryRun = JSON.parse(run("npm", ["pack", "--dry-run", "--json"], root)).at(0)
   const files = dryRun?.files?.map((file) => file.path) ?? []
+  if (!files.includes("tiers.json")) throw new Error("packed package is missing tiers.json")
   const stale = files.filter((file) => /dist\/(dispatch|permissions|result)\./.test(file))
   if (stale.length > 0) throw new Error(`packed package contains removed implementation files: ${stale.join(", ")}`)
 
