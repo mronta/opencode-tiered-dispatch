@@ -1,5 +1,6 @@
 import type { Context } from "@opencode/plugin/promise/plugin"
 import { describe, expect, it, vi } from "vitest"
+import type { AgentCatalogEntry } from "../src/catalog.js"
 import plugin from "../src/index.js"
 import { modelCatalog, requiredTierOptions, tierModel } from "./tier-fixtures.js"
 
@@ -7,6 +8,9 @@ const models = modelCatalog()
 
 type ContextEvent = { sessionID: string; agent: string; tools: Record<string, unknown>; system: unknown[] }
 type ToolEvent = { tool: string; input: unknown }
+type FixtureAgent = AgentCatalogEntry & {
+  permissions: NonNullable<AgentCatalogEntry["permissions"]>
+}
 
 interface FixtureFailures {
   toolHook?: Error
@@ -16,17 +20,19 @@ interface FixtureFailures {
 
 function makeContext(options: Record<string, unknown>, failures: FixtureFailures = {}): {
   context: Context
-  agents: typeof agents
+  agents: FixtureAgent[]
+  setAgentCatalog: (agents: FixtureAgent[]) => void
   hookCallbacks: Array<(event: ContextEvent) => void | Promise<void>>
   toolHookCallbacks: Array<(event: ToolEvent) => void | Promise<void>>
   disposes: { agent: ReturnType<typeof vi.fn>; tool: ReturnType<typeof vi.fn>; context: ReturnType<typeof vi.fn> }
   disposalOrder: string[]
   removedAgents: string[]
 } {
-  const agents = [
+  const agents: FixtureAgent[] = [
     { id: "build", mode: "primary", permissions: [] },
     { id: "all", mode: "all", permissions: [] },
   ]
+  let agentCatalog = agents
   const hookCallbacks: Array<(event: ContextEvent) => void | Promise<void>> = []
   const toolHookCallbacks: Array<(event: ToolEvent) => void | Promise<void>> = []
   const removedAgents: string[] = []
@@ -51,7 +57,7 @@ function makeContext(options: Record<string, unknown>, failures: FixtureFailures
       list: vi.fn(async () => ({ data: models })),
     },
     agent: {
-      list: vi.fn(async () => ({ data: agents })),
+      list: vi.fn(async () => ({ data: agentCatalog })),
       transform: vi.fn(async (callback: (editor: any) => void) => {
         callback({
           list: () => agents,
@@ -94,7 +100,16 @@ function makeContext(options: Record<string, unknown>, failures: FixtureFailures
       }),
     },
   } as unknown as Context
-  return { context, agents, hookCallbacks, toolHookCallbacks, disposes, disposalOrder, removedAgents }
+  return {
+    context,
+    agents,
+    setAgentCatalog: (next) => { agentCatalog = next },
+    hookCallbacks,
+    toolHookCallbacks,
+    disposes,
+    disposalOrder,
+    removedAgents,
+  }
 }
 
 const options = {
@@ -131,15 +146,17 @@ describe("plugin setup", () => {
     const child = { sessionID: "child", agent: "fast", tools: {}, system: [] as unknown[] }
     await hook(child)
     expect(child.system).toEqual([])
-    expect(fixture.context.agent.list).toHaveBeenCalledOnce()
+    expect(fixture.context.agent.list).toHaveBeenCalledTimes(2)
 
     const allRoot = { sessionID: "root-all", agent: "all", tools: {}, system: [] as unknown[] }
     await hook(allRoot)
     expect((allRoot.system[0] as { text: string }).text).toContain("native `subagent`")
+    expect(fixture.context.agent.list).toHaveBeenCalledTimes(3)
 
     const allChild = { sessionID: "child", agent: "all", tools: {}, system: [] as unknown[] }
     await hook(allChild)
     expect(allChild.system).toEqual([])
+    expect(fixture.context.agent.list).toHaveBeenCalledTimes(4)
 
     expect(cleanup).toBeTypeOf("function")
     if (typeof cleanup === "function") await cleanup()
@@ -195,17 +212,78 @@ describe("plugin setup", () => {
     for (const tier of ["fast", "medium", "heavy"]) expect(system(tier)).toContain("Do not delegate")
   })
 
+  it("refreshes effective-agent routing for each context", async () => {
+    const fixture = makeContext(options)
+    await plugin.setup(fixture.context)
+    const hook = fixture.hookCallbacks[0]!
+    const validCatalog = structuredClone(fixture.agents)
+
+    const primary = { sessionID: "root", agent: "build", tools: {}, system: [] as unknown[] }
+    await hook(primary)
+    expect(primary.system).toHaveLength(1)
+
+    const subagentCatalog = structuredClone(validCatalog)
+    const buildAsSubagent = subagentCatalog.find((agent) => agent.id === "build")
+    if (!buildAsSubagent) throw new Error("test fixture is missing build agent")
+    buildAsSubagent.mode = "subagent"
+    fixture.setAgentCatalog(subagentCatalog)
+
+    const subagent = { sessionID: "root", agent: "build", tools: {}, system: [] as unknown[] }
+    await hook(subagent)
+    expect(subagent.system).toEqual([])
+
+    const primaryAgain = structuredClone(subagentCatalog)
+    const buildAsPrimary = primaryAgain.find((agent) => agent.id === "build")
+    if (!buildAsPrimary) throw new Error("test fixture is missing build agent")
+    buildAsPrimary.mode = "primary"
+    fixture.setAgentCatalog(primaryAgain)
+
+    const restored = { sessionID: "root", agent: "build", tools: {}, system: [] as unknown[] }
+    await hook(restored)
+    expect(restored.system).toHaveLength(1)
+    expect(fixture.context.agent.list).toHaveBeenCalledTimes(3)
+  })
+
+  it("revalidates updated tier models and permissions", async () => {
+    const fixture = makeContext(options)
+    await plugin.setup(fixture.context)
+    const hook = fixture.hookCallbacks[0]!
+    const validCatalog = structuredClone(fixture.agents)
+    await hook({ sessionID: "root", agent: "build", tools: {}, system: [] })
+
+    const invalidModel = structuredClone(validCatalog)
+    const fastWithInvalidModel = invalidModel.find((agent) => agent.id === "fast")
+    if (!fastWithInvalidModel) throw new Error("test fixture is missing fast agent")
+    fastWithInvalidModel.model = { ...tierModel("fast"), id: "other" }
+    fixture.setAgentCatalog(invalidModel)
+    await expect(hook({ sessionID: "root", agent: "build", tools: {}, system: [] }))
+      .rejects.toThrow("model does not match")
+
+    const invalidPermissions = structuredClone(validCatalog)
+    const mediumWithInvalidPermissions = invalidPermissions.find((agent) => agent.id === "medium")
+    if (!mediumWithInvalidPermissions) throw new Error("test fixture is missing medium agent")
+    mediumWithInvalidPermissions.permissions = [
+      { action: "*", resource: "*", effect: "deny" },
+      { action: "subagent", resource: "*", effect: "deny" },
+    ]
+    fixture.setAgentCatalog(invalidPermissions)
+    await expect(hook({ sessionID: "root", agent: "build", tools: {}, system: [] }))
+      .rejects.toThrow("must allow the edit permission")
+  })
+
   it("retries agent catalog loading after a transient failure", async () => {
     const fixture = makeContext(options)
     await plugin.setup(fixture.context)
-    vi.mocked(fixture.context.agent.list).mockRejectedValueOnce(new Error("agent catalog unavailable"))
     const hook = fixture.hookCallbacks[0]!
-    const root = { sessionID: "root", agent: "build", tools: {}, system: [] as unknown[] }
+    await hook({ sessionID: "root", agent: "build", tools: {}, system: [] })
+    vi.mocked(fixture.context.agent.list).mockRejectedValueOnce(new Error("agent catalog unavailable"))
 
-    await expect(hook(root)).rejects.toThrow("agent catalog unavailable")
+    await expect(hook({ sessionID: "root", agent: "build", tools: {}, system: [] }))
+      .rejects.toThrow("agent catalog unavailable")
+    const root = { sessionID: "root", agent: "build", tools: {}, system: [] as unknown[] }
     await hook(root)
 
-    expect(fixture.context.agent.list).toHaveBeenCalledTimes(2)
+    expect(fixture.context.agent.list).toHaveBeenCalledTimes(3)
     expect(root.system).toHaveLength(1)
   })
 

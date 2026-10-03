@@ -52,6 +52,10 @@ describe("parseOptions", () => {
       .toMatchObject({ tiers: { medium: { instructions: "Keep the patch small", ...requiredTierOptions().medium } } })
   })
 
+  it("rejects null instead of defaulting directThreshold", () => {
+    expect(() => parseOptions({ ...valid, directThreshold: null })).toThrow(/directThreshold/)
+  })
+
   it("validates taxonomy values", () => {
     expect(() => parseOptions({ ...valid, taxonomy: { fast: [""] } })).toThrow(/non-empty string/)
     expect(() => parseOptions({ ...valid, taxonomy: { other: ["x"] } })).toThrow(/unknown field/)

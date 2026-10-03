@@ -135,7 +135,7 @@ export function parseOptions(value: unknown): RouterOptions {
     throw new ConfigurationError("options.enabled must be a boolean")
   }
 
-  const directThreshold = input.directThreshold ?? "trivial"
+  const directThreshold = input.directThreshold === undefined ? "trivial" : input.directThreshold
   if (directThreshold !== "never" && directThreshold !== "trivial") {
     throw new ConfigurationError('options.directThreshold must be "never" or "trivial"')
   }

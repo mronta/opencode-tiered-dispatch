@@ -33,13 +33,10 @@ export default Plugin.define({
     assertModelsAvailable(options, models)
 
     const routingProtocol = buildRoutingProtocol(options)
-    let agentCatalog: readonly ReturnType<typeof toAgentCatalogEntry>[] | undefined
     const loadAgents = async (): Promise<readonly ReturnType<typeof toAgentCatalogEntry>[]> => {
-      if (agentCatalog !== undefined) return agentCatalog
       const catalog = await ctx.agent.list()
       const agents = catalog.data.map(toAgentCatalogEntry)
       assertAgentsAvailable(agents, options)
-      agentCatalog = agents
       return agents
     }
     const registrations: Registration[] = []
