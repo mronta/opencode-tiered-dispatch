@@ -1,6 +1,8 @@
-import { ConfigurationError, DispatchError } from "./errors.js"
+import { ConfigurationError } from "./errors.js"
 import type { EnabledRouterOptions, TierOptions } from "./options.js"
-import { TIER_AGENTS, TIER_NAMES, type TierName } from "./tiers.js"
+import { TIER_NAMES, type TierName } from "./tiers.js"
+
+const FAST_READ_ACTIONS = new Set(["grep", "glob", "webfetch", "websearch", "read"])
 
 export interface ModelCatalogEntry {
   providerID: string
@@ -13,54 +15,108 @@ export interface ModelCatalogEntry {
 export interface AgentCatalogEntry {
   id: string
   mode?: string
+  model?: { providerID: string; id: string; variant?: string } | null
   permissions?: readonly { action: string; resource: string; effect: "allow" | "deny" | "ask" }[]
 }
 
 export function assertModelsAvailable(
   options: EnabledRouterOptions,
   models: readonly ModelCatalogEntry[],
-  phase: "setup" | "dispatch" = "setup",
-  onlyTier?: TierName,
 ): void {
-  const tiers = onlyTier === undefined ? TIER_NAMES : [onlyTier]
-  for (const tier of tiers) assertModelAvailable(tier, options.tiers[tier], models, phase)
+  for (const tier of TIER_NAMES) assertModelAvailable(tier, options.tiers[tier], models)
 }
 
 function assertModelAvailable(
   tier: TierName,
   configured: TierOptions,
   models: readonly ModelCatalogEntry[],
-  phase: "setup" | "dispatch",
 ): void {
-  const ErrorType = phase === "setup" ? ConfigurationError : DispatchError
   const model = models.find(
     (candidate) => candidate.providerID === configured.modelRef.providerID && candidate.id === configured.modelRef.id,
   )
   if (!model) {
-    throw new ErrorType(`Tier ${tier} model ${configured.model} is not in the active model catalog`)
+    throw new ConfigurationError(`Tier ${tier} model ${configured.model} is not in the active model catalog`)
   }
   if (!model.enabled) {
-    throw new ErrorType(`Tier ${tier} model ${configured.model} is disabled`)
+    throw new ConfigurationError(`Tier ${tier} model ${configured.model} is disabled`)
   }
   if (!model.capabilities.tools) {
-    throw new ErrorType(`Tier ${tier} model ${configured.model} does not support tools`)
+    throw new ConfigurationError(`Tier ${tier} model ${configured.model} does not support tools`)
   }
   if (configured.variant && !model.variants.some((variant) => variant.id === configured.variant)) {
     const available = model.variants.map((variant) => variant.id).join(", ") || "none"
-    throw new ErrorType(
+    throw new ConfigurationError(
       `Tier ${tier} variant ${configured.variant} is unavailable for ${configured.model}; available variants: ${available}`,
     )
   }
 }
 
-export function assertAgentsAvailable(agents: readonly AgentCatalogEntry[]): Set<string> {
-  const subagents = new Set(agents.filter((agent) => agent.mode === "subagent").map((agent) => agent.id))
-  for (const agentID of new Set(Object.values(TIER_AGENTS))) {
+export function assertAgentsAvailable(
+  agents: readonly AgentCatalogEntry[],
+  options?: EnabledRouterOptions,
+): void {
+  for (const agentID of TIER_NAMES) {
     const agent = agents.find((candidate) => candidate.id === agentID)
-    if (!agent) throw new ConfigurationError(`Required built-in agent ${agentID} is unavailable`)
+    if (!agent) throw new ConfigurationError(`Required tier agent ${agentID} is unavailable`)
     if (agent.mode !== "subagent") {
-      throw new ConfigurationError(`Required built-in agent ${agentID} must be a subagent`)
+      throw new ConfigurationError(`Required tier agent ${agentID} must be a subagent`)
+    }
+    if (!options) continue
+    const configured = options.tiers[agentID]
+    if (!agent.model) {
+      throw new ConfigurationError(`Tier agent ${agentID} has no configured model`)
+    }
+    if (
+      agent.model.providerID !== configured.modelRef.providerID
+      || agent.model.id !== configured.modelRef.id
+      || normalizedVariant(agent.model.variant, configured.variant) !== configured.variant
+    ) {
+      throw new ConfigurationError(
+        `Tier agent ${agentID} model does not match options.tiers.${agentID}.model`,
+      )
+    }
+    const permissions = agent.permissions ?? []
+    const subagentRule = effectivePermission(permissions, "subagent")
+    if (subagentRule?.effect !== "deny") {
+      throw new ConfigurationError(`Tier agent ${agentID} must deny the subagent permission`)
+    }
+    const subagentDenyIndex = permissions.findLastIndex(
+      (rule) => rule.resource === "*"
+        && rule.effect === "deny"
+        && (rule.action === "subagent" || rule.action === "*"),
+    )
+    const laterRecursionRules = permissions
+      .slice(subagentDenyIndex + 1)
+      .filter((rule) => rule.effect !== "deny" && (rule.action === "subagent" || rule.action === "*"))
+    if (laterRecursionRules.length > 0) {
+      throw new ConfigurationError(`Tier agent ${agentID} has a later rule that can enable subagent recursion`)
+    }
+    if (agentID === "fast") {
+      const denyAllIndex = permissions.findLastIndex(
+        (rule) => rule.action === "*" && rule.resource === "*" && rule.effect === "deny",
+      )
+      if (denyAllIndex < 0) {
+        throw new ConfigurationError("Tier agent fast must have a deny-all rule before read-only allows")
+      }
+      const unsafeAllows = permissions
+        .slice(denyAllIndex + 1)
+        .filter((rule) => rule.effect !== "deny" && !FAST_READ_ACTIONS.has(rule.action))
+      if (unsafeAllows.length > 0) {
+        throw new ConfigurationError("Tier agent fast has an allow rule for a non-read action")
+      }
     }
   }
-  return subagents
+}
+
+function normalizedVariant(actual: string | undefined, configured: string | undefined): string | undefined {
+  return configured === undefined && actual === "default" ? undefined : actual
+}
+
+function effectivePermission(
+  permissions: readonly NonNullable<AgentCatalogEntry["permissions"]>[number][],
+  action: string,
+): NonNullable<AgentCatalogEntry["permissions"]>[number] | undefined {
+  return [...permissions].reverse().find(
+    (rule) => rule.resource === "*" && (rule.action === action || rule.action === "*"),
+  )
 }

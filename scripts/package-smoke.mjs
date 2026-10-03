@@ -12,6 +12,11 @@ try {
   const tarball = pack.trim().split("\n").at(-1)
   if (!tarball) throw new Error("npm pack did not return a tarball name")
 
+  const dryRun = JSON.parse(run("npm", ["pack", "--dry-run", "--json"], root)).at(0)
+  const files = dryRun?.files?.map((file) => file.path) ?? []
+  const stale = files.filter((file) => /dist\/(dispatch|permissions|result)\./.test(file))
+  if (stale.length > 0) throw new Error(`packed package contains removed implementation files: ${stale.join(", ")}`)
+
   run("npm", ["install", "--ignore-scripts", "--prefix", installDirectory, join(root, tarball)], root)
   run(
     process.execPath,

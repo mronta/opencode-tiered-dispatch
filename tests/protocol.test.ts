@@ -12,12 +12,13 @@ const options = parseOptions({
 })
 
 describe("buildRoutingProtocol", () => {
-  it("describes tiers, splitting, serialization, and the tool", () => {
+  it("describes tiers, splitting, serialization, and the native subagent tool", () => {
     if (!options.enabled) throw new Error("test setup")
     const protocol = buildRoutingProtocol(options)
     expect(protocol).toContain("schema lookup")
     expect(protocol).toContain("collect context with fast")
     expect(protocol).toContain("Serialize medium/heavy")
-    expect(protocol).toContain("tiered_dispatch")
+    expect(protocol).toContain("native `subagent` tool")
+    expect(protocol).toContain("agent `fast`")
   })
 })

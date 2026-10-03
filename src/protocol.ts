@@ -26,6 +26,6 @@ export function buildRoutingProtocol(options: EnabledRouterOptions): string {
     "6. No tier escalates automatically. Inspect failures and decide what to do next.",
     "7. You remain responsible for integrating delegated work and presenting the final answer.",
     "",
-    "Call tiered_dispatch with tier, a short description, and the complete delegated prompt.",
+    "Use the native `subagent` tool with agent `fast`, `medium`, or `heavy`; provide a short description and a complete delegated prompt.",
   ].join("\n")
 }

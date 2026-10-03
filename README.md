@@ -1,84 +1,98 @@
 # OpenCode Tiered Dispatch
 
-`opencode-tiered-dispatch` is an OpenCode V2 plugin that teaches a primary
-agent to use the cheapest adequate model tier:
+`opencode-tiered-dispatch` is an OpenCode V2 plugin that brings the V1 router's
+native subagent workflow to V2. It teaches the primary agent to choose the
+cheapest adequate tier, then call that tier through OpenCode's normal
+`subagent` tool:
 
 - **fast** — focused exploration, search, reads, and research;
 - **medium** — implementation, refactoring, tests, and ordinary fixes;
 - **heavy** — architecture, security, difficult debugging, and high-risk reasoning.
 
-The plugin registers one `tiered_dispatch` tool and injects a short routing
-protocol into primary-agent model requests. It does not generate agent files,
-persist routing state, switch presets, or fall back silently to another model.
+The user-facing calls are native agent calls such as `subagent(agent: "fast", ...)`.
+There is no plugin-owned dispatch tool, custom child-session protocol, generated
+agent file, fallback chain, or persistent routing state.
 
 ## Requirements
 
-- OpenCode V2 `2.0.18` (the version tested by this release) with
-  `@opencode/plugin` `2.0.18`;
-- the built-in `explore` and `general` subagent agents;
-- one available, tool-capable model for each configured tier.
+- OpenCode V2 `2.0.18` with `@opencode/plugin` `2.0.18`;
+- the native V2 `subagent` tool;
+- one enabled, tool-capable model for each tier;
+- three project or global V2 agent definitions named `fast`, `medium`, and `heavy`.
 
-## Quick start: activate the plugin
+V2 plugins can update and remove agents, but the `2.0.18` plugin API cannot add
+new agents. The three definitions therefore belong in `opencode.jsonc`; the
+plugin supplies the routing protocol and validates the configured models.
 
-The plugin is activated by adding it to the OpenCode configuration for the
-project you want to use it in. The reliable setup sequence is:
+## Quick start
 
-1. **Build or install the plugin.** For a local checkout:
+1. Build or install the plugin.
+2. Authenticate providers with `/connect`.
+3. Copy exact model and variant IDs from `/models`.
+4. Add the plugin and native tier agents to `opencode.jsonc`.
+5. Restart OpenCode and start a new session.
+6. Ask the primary agent to delegate a small task and verify that the child is
+   shown as `fast`, `medium`, or `heavy` rather than as `explore` or `general`.
 
-   ```bash
-   cd /home/me/Workspace/opencode-tiered-dispatch
-   npm install
-   npm run build
-   ```
+## Local checkout configuration
 
-2. **Authenticate the model providers.** Start OpenCode in the target project,
-   run `/connect`, and complete the provider login or API-key setup.
-
-3. **Find exact model and variant IDs.** Run `/models` in OpenCode. Copy the
-   IDs exactly as displayed; model references use `provider/model`. A variant is
-   optional and should only be configured when `/models` lists that variant.
-
-4. **Add the plugin configuration.** For one project, edit that project's
-   `opencode.jsonc`. For a global configuration, use the config path printed by
-   `opencode debug paths config`.
-
-5. **Restart OpenCode.** The plugin validates the catalog and registers
-   `tiered_dispatch` when it loads. A missing model, variant, or required agent
-   is reported during startup rather than silently replaced.
-
-6. **Verify activation.** Start a new session and confirm that the primary
-   agent can use the `tiered_dispatch` tool. For a stronger provider-consuming
-   check, use the live smoke commands in [Development](#development).
-
-## Install from a local checkout
-
-Build the package first:
+Build the checkout first:
 
 ```bash
+cd /home/me/Workspace/opencode-tiered-dispatch
 npm install
 npm run build
 ```
 
-Then add it to `opencode.jsonc`:
+Then configure the package directory and the three native agents:
 
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
+  "agents": {
+    "fast": {
+      "mode": "subagent",
+      "description": "Focused read-only exploration and research",
+      "model": "openai/gpt-5.6-luna-fast",
+      "system": "Act as a focused, read-only investigator. Return concrete findings with file paths and line references. Do not edit files, run mutating commands, or delegate further.",
+      "permissions": [
+        { "action": "*", "resource": "*", "effect": "deny" },
+        { "action": "grep", "resource": "*", "effect": "allow" },
+        { "action": "glob", "resource": "*", "effect": "allow" },
+        { "action": "read", "resource": "*", "effect": "allow" },
+        { "action": "webfetch", "resource": "*", "effect": "allow" },
+        { "action": "websearch", "resource": "*", "effect": "allow" },
+        { "action": "subagent", "resource": "*", "effect": "deny" }
+      ]
+    },
+    "medium": {
+      "mode": "subagent",
+      "description": "Implementation, refactoring, tests, and ordinary fixes",
+      "model": "openai/gpt-5.6-luna#max",
+      "system": "Act as an implementation specialist. Match existing patterns, make the requested changes, run targeted verification, and report the result. Do not delegate further.",
+      "permissions": [
+        { "action": "subagent", "resource": "*", "effect": "deny" }
+      ]
+    },
+    "heavy": {
+      "mode": "subagent",
+      "description": "Architecture, security, difficult debugging, and high-risk reasoning",
+      "model": "openai/gpt-5.6-sol#medium",
+      "system": "Act as a senior architecture and difficult-debugging specialist. Analyze evidence, state trade-offs, and give a concrete recommendation. Do not delegate further.",
+      "permissions": [
+        { "action": "subagent", "resource": "*", "effect": "deny" }
+      ]
+    }
+  },
   "plugins": [
     {
       "package": "/home/me/Workspace/opencode-tiered-dispatch",
       "options": {
         "enabled": true,
         "tiers": {
-          "fast": {
-            "model": "provider/model-fast"
-          },
-          "medium": {
-            "model": "provider/model-medium"
-          },
-          "heavy": {
-            "model": "provider/model-heavy"
-          }
+          "fast": { "model": "openai/gpt-5.6-luna-fast" },
+          "medium": { "model": "openai/gpt-5.6-luna", "variant": "max" },
+          "heavy": { "model": "openai/gpt-5.6-sol", "variant": "medium" }
         }
       }
     }
@@ -86,45 +100,33 @@ Then add it to `opencode.jsonc`:
 }
 ```
 
-Model IDs and variants are workstation-specific. Use `/connect` to authenticate
-each required provider and `/models` to inspect the active catalog. Replace the
-placeholder references before starting a session; credentials and subscriptions
-are not bundled with this package.
+The checkout is a local plugin directory. Its root `index.js` is the required
+OpenCode directory entrypoint and re-exports compiled `dist/`; do not point
+`package` at `dist/index.js`.
 
-For an npm installation, publish or pack this project and use the resulting
-package name in the plugin entry. The package exports compiled `dist/` output.
-No agent Markdown files or project files are generated.
+The verified OpenAI mapping is:
 
-For a published package, install it globally through OpenCode and add the same
-configuration entry:
+```text
+fast   → openai/gpt-5.6-luna-fast
+medium → openai/gpt-5.6-luna#max
+heavy  → openai/gpt-5.6-sol#medium
+```
+
+`gpt-5.6-luna-fast` is a model ID, not a `medium-fast` variant. Model IDs and
+variants are workstation-specific; always confirm them with `/models`.
+
+## Published or packed installation
+
+For a published package:
 
 ```bash
 opencode plugin add opencode-tiered-dispatch
 ```
 
-Then set `package` to `opencode-tiered-dispatch` in the plugin entry and restart
-OpenCode. The same `options.tiers` configuration applies to local and published
-installations.
-
-For a project-local installation, keep the plugin entry in that project's
-`opencode.jsonc` and point `package` at the installed package or checkout.
-Set `"enabled": false` to keep the package configured but inactive, or remove
-the entry to unload it completely. Update a global installation with
-`opencode plugin update opencode-tiered-dispatch`; remove it with
-`opencode plugin remove opencode-tiered-dispatch`.
-
-### Activation troubleshooting
-
-- **Model unavailable:** authenticate the provider with `/connect`, then copy
-  the exact model ID from `/models`. The plugin requires all three configured
-  models to be enabled and tool-capable.
-- **Variant unavailable:** remove `variant` to use the model default, or use a
-  variant listed for that exact model in `/models`.
-- **Missing agent:** this release requires OpenCode's built-in `explore` and
-  `general` subagents.
-- **No visible change:** verify that the plugin entry is in the configuration
-  for the project you opened, that `enabled` is not `false`, and restart
-  OpenCode after editing the file.
+Use `"package": "opencode-tiered-dispatch"` in the same plugin object and
+keep the native agent definitions. For a local package archive, use the archive
+or installed package directory as the `package` value. Credentials and provider
+subscriptions are never bundled.
 
 ## Configuration
 
@@ -148,31 +150,60 @@ interface TierOptions {
 }
 ```
 
-Custom taxonomy entries are appended to the defaults and deduplicated
+The plugin validates all three `options.tiers` model references against the
+active catalog. The native agent definitions are the execution interface, so
+their model and variant must match the corresponding plugin option.
+
+Custom taxonomy entries extend the defaults and are deduplicated
 case-insensitively. Unknown fields are rejected. With `enabled: false`, the
-plugin is a no-op and does not validate model availability.
+plugin is a no-op: it does not inject routing guidance or validate model
+availability. Because the native tier agents are ordinary `opencode.jsonc`
+configuration, disable or remove those three entries separately when the tiers
+should disappear from the subagent catalog.
+
+## Routing protocol
+
+The primary session receives concise guidance to:
+
+1. use the cheapest reliable tier;
+2. handle truly trivial work directly;
+3. split separable exploration and implementation phases;
+4. serialize overlapping edits;
+5. avoid automatic escalation and provider fallback;
+6. call the native `subagent` tool with a narrow description and complete prompt.
+
+Tier agents do not receive this orchestration protocol. Their own `system`
+instructions and permissions remain focused on execution, so they cannot recurse
+into another subagent call.
 
 ## Safety and lifecycle
 
-- `fast` delegation runs through `explore` and is independently restricted to
-  read-only tools.
-- `medium` and `heavy` run through `general`.
-- Caller agent and session permission rules are carried into the delegation
-  session, so a read-only or plan-mode caller cannot gain write access.
-- Delegations cannot recursively invoke `tiered_dispatch`.
-- Delegation sessions are created at the caller's project location and remain
-  inspectable after completion.
-- Cancelling the tool interrupts its delegation session.
-- Unloading the plugin interrupts in-flight delegations and disposes the tool
-  and context hook.
-- Provider failures and unavailable models are surfaced; there is no automatic
-  tier escalation or provider fallback.
+- `fast` is configured as read-only through native V2 permissions.
+- `medium` and `heavy` use normal implementation permissions.
+- All tier agents deny the `subagent` action, preventing recursion.
+- Native OpenCode owns child-session creation, foreground waiting, cancellation,
+  provider errors, metadata, and inspectability.
+- The plugin only owns the routing context-hook registration; unloading it
+  disposes that hook.
+- There is no tier escalation or provider fallback.
 
-OpenCode V2.0.18 does not expose parent-linked session creation through the
-plugin session domain. Delegation sessions are therefore standalone sessions,
-with caller location and permissions explicitly copied into them.
+## Troubleshooting
 
-## Development
+- **The plugin is inactive:** run `opencode api get /api/plugin` and check that
+  `tiered-dispatch` is `active`. Restart after changing configuration.
+- **A tier is missing:** define `fast`, `medium`, and `heavy` with
+  `mode: "subagent"` in the same project/global configuration.
+- **A model is unavailable:** authenticate with `/connect` and copy the exact
+  `provider/model` from `/models`.
+- **A variant is unavailable:** remove the variant or use one listed for that
+  exact model.
+- **Fast can mutate files:** inspect the final `fast.permissions` rules; the
+  broad deny must appear before the read-only allows, and no later rule may
+  allow `edit`, `shell`, or `subagent`.
+- **No routing guidance appears:** confirm the plugin is configured for the
+  project you opened, `enabled` is not false, and start a new session.
+
+## Development and verification
 
 ```bash
 npm run typecheck
@@ -182,38 +213,34 @@ npm pack --dry-run
 npm run smoke:package
 ```
 
-`npm run smoke:package` installs the packed tarball into a clean temporary npm
-project and imports its plugin export. The OpenCode V2 registration/session
-smoke is explicit and requires three model references from the active catalog:
+The real OpenCode smoke uses the standard `opencode.jsonc` package entry. It
+starts a primary session and verifies native foreground calls to all three
+agents, their resolved models, the primary routing protocol, and the absence of
+that protocol from tier children:
 
 ```bash
-TIERED_DISPATCH_FAST_MODEL=provider/model \
-TIERED_DISPATCH_MEDIUM_MODEL=provider/model \
-TIERED_DISPATCH_HEAVY_MODEL=provider/model \
+TIERED_DISPATCH_FAST_MODEL=openai/gpt-5.6-luna-fast \
+TIERED_DISPATCH_MEDIUM_MODEL=openai/gpt-5.6-luna \
+TIERED_DISPATCH_MEDIUM_VARIANT=max \
+TIERED_DISPATCH_HEAVY_MODEL=openai/gpt-5.6-sol \
+TIERED_DISPATCH_HEAVY_VARIANT=medium \
 npm run smoke:opencode
 ```
 
-Set `TIERED_DISPATCH_*_VARIANT` variables when the configured models require a
-variant. The registration smoke does not send a provider prompt. Optional
-provider-consuming checks are available when stronger verification is needed:
+`npm run smoke:opencode:config` is an alias for the same standard-configuration
+test. The smoke consumes provider usage and requires credentials for the three
+configured models.
+
+## Updates and removal
+
+For a global published installation:
 
 ```bash
-npm run smoke:opencode:delegate          # real child session and result
-npm run smoke:opencode:tiers              # all three configured tiers
-npm run smoke:opencode:permissions       # fast read-only; medium/heavy edits
-npm run smoke:opencode:cancel             # cancellation interrupts an admitted child
-npm run smoke:opencode:unload             # unload interrupts an active child
-npm run smoke:opencode:reload             # dispose/reload with changed tier config
-npm run smoke:opencode:provider-error    # structured provider failure; no fallback
-npm run smoke:opencode:disabled          # enabled:false remains inert
-npm run smoke:opencode:packed:delegate  # activate the packed tarball itself
-npm run eval:routing                     # fast/medium/heavy/direct/split cases
+opencode plugin update opencode-tiered-dispatch
+opencode plugin remove opencode-tiered-dispatch
 ```
 
-These checks consume provider usage and require credentials for the configured
-models. They run the plugin inside a real OpenCode V2 server, verify the actual
-child model/agent/location/metadata, inspect child results, and use a temporary
-fixture for the routing cases. `eval:routing` runs each acceptance case in its
-own temporary server and fails if the observed choices do not match the
-expected routing taxonomy or if a child/root result was not successfully
-integrated.
+For a local checkout, rebuild after pulling updates and restart OpenCode. Remove
+the plugin object and the three reserved native agent entries from
+`opencode.jsonc` to remove the complete routing setup. No generated files or
+persistent router state remain.
