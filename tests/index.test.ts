@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest"
 import plugin from "../src/index.js"
 
 const models = [
-  { providerID: "openai", id: "gpt-5.6-luna-fast", enabled: true, capabilities: { tools: true }, variants: [] },
+  { providerID: "openai", id: "gpt-6-luna", enabled: true, capabilities: { tools: true }, variants: [{ id: "low" }, { id: "medium" }, { id: "high" }, { id: "xhigh" }, { id: "max" }] },
   { providerID: "openai", id: "gpt-5.6-luna", enabled: true, capabilities: { tools: true }, variants: [{ id: "max" }] },
   { providerID: "openai", id: "gpt-5.6-sol", enabled: true, capabilities: { tools: true }, variants: [{ id: "medium" }] },
 ]
@@ -102,7 +102,7 @@ function makeContext(options: Record<string, unknown>, failures: FixtureFailures
 
 const options = {
   tiers: {
-    fast: { model: "openai/gpt-5.6-luna-fast" },
+    fast: { model: "openai/gpt-6-luna" },
     medium: { model: "openai/gpt-5.6-luna", variant: "max" },
     heavy: { model: "openai/gpt-5.6-sol", variant: "medium" },
   },
@@ -119,7 +119,7 @@ describe("plugin setup", () => {
     expect(fixture.agents.find((agent) => agent.id === "fast")).toMatchObject({
       mode: "subagent",
       description: "Focused read-only exploration and research",
-      model: { providerID: "openai", id: "gpt-5.6-luna-fast" },
+      model: { providerID: "openai", id: "gpt-6-luna" },
     })
     expect(fixture.agents.find((agent) => agent.id === "medium")).toMatchObject({
       mode: "subagent",

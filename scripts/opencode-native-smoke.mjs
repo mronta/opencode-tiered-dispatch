@@ -17,7 +17,7 @@ const paths = {
 }
 
 const tiers = {
-  fast: { model: "openai/gpt-5.6-luna-fast" },
+  fast: { model: "openai/gpt-6-luna" },
   medium: { model: "openai/gpt-5.6-luna", variant: "max" },
   heavy: { model: "openai/gpt-5.6-sol", variant: "medium" },
 }

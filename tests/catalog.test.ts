@@ -4,7 +4,7 @@ import { parseOptions } from "../src/options.js"
 
 const parsed = parseOptions({
   tiers: {
-    fast: { model: "openai/gpt-5.6-luna-fast" },
+    fast: { model: "openai/gpt-6-luna" },
     medium: { model: "openai/gpt-5.6-luna", variant: "max" },
     heavy: { model: "openai/gpt-5.6-sol", variant: "medium" },
   },
@@ -13,17 +13,17 @@ if (!parsed.enabled) throw new Error("test setup")
 
 const models = ["fast", "medium", "heavy"].map((id) => ({
   providerID: "openai",
-  id: id === "fast" ? "gpt-5.6-luna-fast" : id === "medium" ? "gpt-5.6-luna" : "gpt-5.6-sol",
+  id: id === "fast" ? "gpt-6-luna" : id === "medium" ? "gpt-5.6-luna" : "gpt-5.6-sol",
   enabled: true,
   capabilities: { tools: true },
-  variants: id === "fast" ? [] : [{ id: id === "medium" ? "max" : "medium" }],
+  variants: id === "fast" ? [{ id: "low" }, { id: "medium" }, { id: "high" }, { id: "xhigh" }, { id: "max" }] : [{ id: id === "medium" ? "max" : "medium" }],
 }))
 
 const agents = [
   {
     id: "fast",
     mode: "subagent",
-    model: { providerID: "openai", id: "gpt-5.6-luna-fast" },
+    model: { providerID: "openai", id: "gpt-6-luna" },
     permissions: [
       { action: "*", resource: "*", effect: "deny" as const },
       { action: "read", resource: "*", effect: "allow" as const },
@@ -63,14 +63,14 @@ describe("catalog validation", () => {
 
     const noVariantOptions = parseOptions({
       tiers: {
-        fast: { model: "openai/gpt-5.6-luna-fast" },
+        fast: { model: "openai/gpt-6-luna" },
         medium: { model: "openai/gpt-5.6-luna", variant: "max" },
         heavy: { model: "openai/gpt-5.6-sol", variant: "medium" },
       },
     })
     if (!noVariantOptions.enabled) throw new Error("test setup")
     const nativeDefault = structuredClone(agents) as AgentCatalogEntry[]
-    nativeDefault[0]!.model = { providerID: "openai", id: "gpt-5.6-luna-fast", variant: "default" }
+    nativeDefault[0]!.model = { providerID: "openai", id: "gpt-6-luna", variant: "default" }
     expect(() => assertAgentsAvailable(nativeDefault, noVariantOptions)).not.toThrow()
   })
 
@@ -114,7 +114,7 @@ describe("catalog validation", () => {
   it("rejects an unavailable variant", () => {
     const invalid = structuredClone(parsed)
     invalid.tiers.fast.variant = "max"
-    expect(() => assertModelsAvailable(invalid, models)).toThrow(/must use model openai\/gpt-5\.6-luna-fast/)
+    expect(() => assertModelsAvailable(invalid, models)).toThrow(/must use model openai\/gpt-6-luna/)
   })
 
   it("rejects models without tools", () => {

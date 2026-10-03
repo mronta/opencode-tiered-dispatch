@@ -3,7 +3,7 @@ import { parseModelReference, parseOptions } from "../src/options.js"
 
 const valid = {
   tiers: {
-    fast: { model: "openai/gpt-5.6-luna-fast" },
+    fast: { model: "openai/gpt-6-luna" },
     medium: { model: "openai/gpt-5.6-luna", variant: "max" },
     heavy: { model: "openai/gpt-5.6-sol", variant: "medium" },
   },
@@ -36,13 +36,13 @@ describe("parseOptions", () => {
       .toThrow(/unknown field/)
     expect(() => parseOptions({
       enabled: false,
-      tiers: { fast: { model: "openai/gpt-5.6-luna-fast", cost: 1 } },
+      tiers: { fast: { model: "openai/gpt-6-luna", cost: 1 } },
     })).toThrow(/unknown field: cost/)
   })
 
   it("rejects unknown fields", () => {
     expect(() => parseOptions({ ...valid, fallback: true })).toThrow(/unknown field: fallback/)
-    expect(() => parseOptions({ tiers: { ...valid.tiers, fast: { model: "openai/gpt-5.6-luna-fast", cost: 1 } } }))
+    expect(() => parseOptions({ tiers: { ...valid.tiers, fast: { model: "openai/gpt-6-luna", cost: 1 } } }))
       .toThrow(/unknown field: cost/)
   })
 
@@ -50,7 +50,7 @@ describe("parseOptions", () => {
     expect(parseOptions({})).toMatchObject({
       enabled: true,
       tiers: {
-        fast: { model: "openai/gpt-5.6-luna-fast" },
+        fast: { model: "openai/gpt-6-luna" },
         medium: { model: "openai/gpt-5.6-luna", variant: "max" },
         heavy: { model: "openai/gpt-5.6-sol", variant: "medium" },
       },
@@ -67,8 +67,8 @@ describe("parseOptions", () => {
   it("requires the configured tier model mapping", () => {
     expect(() => parseOptions({
       ...valid,
-      tiers: { ...valid.tiers, fast: { model: "openai/gpt-5.6-luna", variant: "max" } },
-    })).toThrow(/options\.tiers\.fast must use model openai\/gpt-5\.6-luna-fast/)
+      tiers: { ...valid.tiers, fast: { model: "openai/gpt-5.6-luna-fast" } },
+    })).toThrow(/options\.tiers\.fast must use model openai\/gpt-6-luna/)
   })
 })
 
