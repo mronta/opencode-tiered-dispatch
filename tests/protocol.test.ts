@@ -2,12 +2,14 @@ import { describe, expect, it } from "vitest"
 import { parseOptions } from "../src/options.js"
 import { buildRoutingProtocol } from "../src/protocol.js"
 
+const tierConfig = {
+  fast: { model: "openai/gpt-5.6-luna-fast" },
+  medium: { model: "openai/gpt-5.6-luna", variant: "max" },
+  heavy: { model: "openai/gpt-5.6-sol", variant: "medium" },
+}
+
 const options = parseOptions({
-  tiers: {
-    fast: { model: "openai/gpt-5.6-luna-fast" },
-    medium: { model: "openai/gpt-5.6-luna", variant: "max" },
-    heavy: { model: "openai/gpt-5.6-sol", variant: "medium" },
-  },
+  tiers: tierConfig,
   taxonomy: { fast: ["schema lookup"] },
 })
 
@@ -34,11 +36,7 @@ describe("buildRoutingProtocol", () => {
 
   it("makes never-direct mode explicit", () => {
     const neverDirect = parseOptions({
-      tiers: {
-        fast: { model: "openai/gpt-5.6-luna-fast" },
-        medium: { model: "openai/gpt-5.6-luna", variant: "max" },
-        heavy: { model: "openai/gpt-5.6-sol", variant: "medium" },
-      },
+      tiers: tierConfig,
       directThreshold: "never",
     })
     if (!neverDirect.enabled) throw new Error("test setup")
