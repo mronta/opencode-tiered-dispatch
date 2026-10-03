@@ -1,9 +1,10 @@
 import { Plugin } from "@opencode/plugin"
+import type { AgentEditor } from "@opencode/plugin/promise/agent"
 import type { Context } from "@opencode/plugin/promise/plugin"
 import { TIER_AGENT_DEFINITIONS } from "./agents.js"
 import { assertAgentsAvailable, assertModelsAvailable } from "./catalog.js"
 import { tierModelOverrideError } from "./invocation.js"
-import { parseOptions } from "./options.js"
+import { parseOptions, type TierOptions } from "./options.js"
 import { buildRoutingProtocol } from "./protocol.js"
 import { isTierName, TIER_NAMES, type TierName } from "./tiers.js"
 
@@ -32,14 +33,14 @@ export default Plugin.define({
     assertModelsAvailable(options, models)
 
     const routingProtocol = buildRoutingProtocol(options)
-    let agentCatalogPromise: Promise<readonly ReturnType<typeof toAgentCatalogEntry>[]> | undefined
-    const loadAgents = (): Promise<readonly ReturnType<typeof toAgentCatalogEntry>[]> => {
-      agentCatalogPromise ??= ctx.agent.list().then((catalog) => {
-        const agents = catalog.data.map(toAgentCatalogEntry)
-        assertAgentsAvailable(agents, options)
-        return agents
-      })
-      return agentCatalogPromise
+    let agentCatalog: readonly ReturnType<typeof toAgentCatalogEntry>[] | undefined
+    const loadAgents = async (): Promise<readonly ReturnType<typeof toAgentCatalogEntry>[]> => {
+      if (agentCatalog !== undefined) return agentCatalog
+      const catalog = await ctx.agent.list()
+      const agents = catalog.data.map(toAgentCatalogEntry)
+      assertAgentsAvailable(agents, options)
+      agentCatalog = agents
+      return agents
     }
     const registrations: Registration[] = []
     try {
@@ -51,11 +52,7 @@ export default Plugin.define({
             agent.mode = "subagent"
             agent.description = definition.description
             agent.system = definition.system
-            agent.model = {
-              providerID: configured.modelRef.providerID,
-              id: configured.modelRef.id,
-              ...(configured.variant === undefined ? {} : { variant: configured.variant }),
-            } as unknown as NonNullable<typeof agent.model>
+            agent.model = toAgentModel(configured)
             agent.permissions = definition.permissions.map((rule) => ({ ...rule }))
           })
         }
@@ -104,6 +101,17 @@ export default Plugin.define({
 
 type ModelInfo = Awaited<ReturnType<Context["model"]["list"]>>["data"][number]
 type AgentInfo = Awaited<ReturnType<Context["agent"]["list"]>>["data"][number]
+type EditableAgent = Parameters<Parameters<AgentEditor["update"]>[1]>[0]
+type AgentModel = NonNullable<EditableAgent["model"]>
+
+function toAgentModel(configured: TierOptions): AgentModel {
+  const model = {
+    providerID: configured.modelRef.providerID as unknown as AgentModel["providerID"],
+    id: configured.modelRef.id as unknown as AgentModel["id"],
+  }
+  if (configured.variant === undefined) return model
+  return { ...model, variant: configured.variant as unknown as NonNullable<AgentModel["variant"]> }
+}
 
 function toModelCatalogEntry(model: ModelInfo) {
   return {

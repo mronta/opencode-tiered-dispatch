@@ -6,11 +6,13 @@ import { spawnSync } from "node:child_process"
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)))
 const installDirectory = mkdtempSync(join(tmpdir(), "opencode-tiered-dispatch-pack-"))
+let tarballPath
 
 try {
   const pack = run("npm", ["pack", "--silent"], root)
   const tarball = pack.trim().split("\n").at(-1)
   if (!tarball) throw new Error("npm pack did not return a tarball name")
+  tarballPath = join(root, tarball)
 
   const dryRun = JSON.parse(run("npm", ["pack", "--dry-run", "--json"], root)).at(0)
   const files = dryRun?.files?.map((file) => file.path) ?? []
@@ -29,6 +31,7 @@ try {
   )
   console.log(`package smoke passed: ${tarball}`)
 } finally {
+  if (tarballPath) rmSync(tarballPath, { force: true })
   rmSync(installDirectory, { recursive: true, force: true })
 }
 

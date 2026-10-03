@@ -109,7 +109,7 @@ const options = {
 }
 
 describe("plugin setup", () => {
-  it("injects routing into primary sessions and leaves native tier agents intact", async () => {
+  it("materializes tiers and injects routing only into root primary sessions", async () => {
     const fixture = makeContext(options)
 
     const cleanup = await plugin.setup(fixture.context)
@@ -120,6 +120,14 @@ describe("plugin setup", () => {
       mode: "subagent",
       description: "Focused read-only exploration and research",
       model: { providerID: "openai", id: "gpt-5.6-luna-fast" },
+    })
+    expect(fixture.agents.find((agent) => agent.id === "medium")).toMatchObject({
+      mode: "subagent",
+      model: { providerID: "openai", id: "gpt-5.6-luna", variant: "max" },
+    })
+    expect(fixture.agents.find((agent) => agent.id === "heavy")).toMatchObject({
+      mode: "subagent",
+      model: { providerID: "openai", id: "gpt-5.6-sol", variant: "medium" },
     })
     const hook = fixture.hookCallbacks[0]!
     const root = { sessionID: "root", agent: "build", tools: {}, system: [] as unknown[] }
@@ -178,6 +186,20 @@ describe("plugin setup", () => {
     await hook(child)
 
     expect((child.system[0] as { text: string }).text).toBe("Keep the patch minimal")
+  })
+
+  it("retries agent catalog loading after a transient failure", async () => {
+    const fixture = makeContext(options)
+    await plugin.setup(fixture.context)
+    vi.mocked(fixture.context.agent.list).mockRejectedValueOnce(new Error("agent catalog unavailable"))
+    const hook = fixture.hookCallbacks[0]!
+    const root = { sessionID: "root", agent: "build", tools: {}, system: [] as unknown[] }
+
+    await expect(hook(root)).rejects.toThrow("agent catalog unavailable")
+    await hook(root)
+
+    expect(fixture.context.agent.list).toHaveBeenCalledTimes(2)
+    expect(root.system).toHaveLength(1)
   })
 
   it("fails closed when session ancestry cannot be inspected", async () => {
@@ -249,6 +271,33 @@ describe("plugin setup", () => {
 
     if (typeof cleanup !== "function") throw new Error("test setup did not return cleanup")
     await expect(cleanup()).rejects.toThrow("could not dispose every registration")
+    expect(fixture.disposalOrder).toEqual(["context", "tool", "agent"])
+  })
+
+  it("aggregates every cleanup failure without losing reverse order", async () => {
+    const fixture = makeContext(options, {
+      dispose: {
+        agent: new Error("agent cleanup failed"),
+        tool: new Error("tool cleanup failed"),
+        context: new Error("context cleanup failed"),
+      },
+    })
+    const cleanup = await plugin.setup(fixture.context)
+
+    if (typeof cleanup !== "function") throw new Error("test setup did not return cleanup")
+    let failure: unknown
+    try {
+      await cleanup()
+    } catch (error) {
+      failure = error
+    }
+
+    expect(failure).toBeInstanceOf(AggregateError)
+    expect((failure as AggregateError).errors.map((error) => (error as Error).message)).toEqual([
+      "context cleanup failed",
+      "tool cleanup failed",
+      "agent cleanup failed",
+    ])
     expect(fixture.disposalOrder).toEqual(["context", "tool", "agent"])
   })
 })

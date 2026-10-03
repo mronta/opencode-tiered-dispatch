@@ -15,7 +15,7 @@ agent file, fallback chain, or persistent routing state.
 
 ## Requirements
 
-- OpenCode V2 `2.0.19` with `@opencode/plugin` `2.0.18` (the tested
+- OpenCode V2 `2.0.19` with `@opencode/plugin` `2.0.19` (the tested
   host/API combination);
 - the native V2 `subagent` tool;
 - one enabled, tool-capable model for each tier;
@@ -124,6 +124,12 @@ The optional `tiers` entries are mainly useful for adding tier-specific
 `instructions`; explicit `model` and `variant` values must still match the
 required mapping.
 
+`directThreshold: "trivial"` permits the primary agent to handle genuinely
+trivial one-step work directly. `directThreshold: "never"` instructs it to
+delegate every executable task and reserve itself for classification,
+delegation, integration, and the final answer. These are model-facing routing
+instructions, not a hard block on the primary agent's native tools.
+
 Custom taxonomy entries extend the defaults and are deduplicated
 case-insensitively. Unknown fields are rejected. With `enabled: false`, the
 plugin removes the reserved tier agents through the runtime transform and does
@@ -133,7 +139,25 @@ disappear; no generated agent files or persistent router state remain.
 
 ## Routing protocol
 
-The primary session receives concise guidance to:
+The primary session receives model-facing guidance to classify and route work;
+OpenCode still gives the primary agent its normal tools, so this is not a
+deterministic task graph and the plugin cannot guarantee that every request
+creates multiple child sessions. The intended decision is:
+
+| Request shape | Preferred route |
+|---|---|
+| Truly trivial one-step work | Handle directly when `directThreshold` is `"trivial"` |
+| Unknown repository context | `fast` |
+| Known-scope implementation | `medium` |
+| Difficult judgment or high-risk reasoning | `heavy` |
+| Discovery followed by implementation | `fast`, then `medium` |
+| Discovery followed by difficult reasoning | `fast`, then `heavy` |
+
+The primary is responsible for classification, decomposition, delegation,
+integration, and the final answer. Tier agents perform the delegated work.
+Independent delegations may run in parallel; dependent phases are serialized.
+
+The protocol tells the primary to:
 
 1. use the cheapest reliable tier;
 2. handle truly trivial work directly;
@@ -186,8 +210,9 @@ into another subagent call.
   ```
 - **A model is unavailable:** authenticate with `/connect` and copy the exact
   `provider/model` from `/models`.
-- **A variant is unavailable:** remove the variant or use one listed for that
-  exact model.
+- **A variant is unavailable:** the packaged mapping requires `medium#max` and
+  `heavy#medium`; authenticate or configure the provider so those exact
+  variants are available. The plugin does not substitute another variant.
 - **A tier call is rejected:** remove the per-call `model` field from the native
   `subagent` invocation and select `fast`, `medium`, or `heavy` according to
   the required capability level.
@@ -207,12 +232,16 @@ npm pack --dry-run
 npm run smoke:package
 ```
 
+The package smoke removes its temporary installation and generated archive when
+it exits.
+
 The real OpenCode smoke uses the standard `opencode.jsonc` package entry with no
-tier-agent stubs. It starts a primary session and verifies that the plugin
-materializes the three native agents, then exercises foreground calls to all
-three agents, their resolved models, the primary routing protocol, and the
-absence of that protocol from tier children. It also verifies native
-cancellation and provider-error outcomes without fallback:
+tier-agent stubs. It verifies materialization and permissions from the native
+agent catalog, exercises each tier directly, and runs one primary-to-medium
+routing scenario to verify model resolution and the absence of the primary
+protocol from tier children. It also verifies native cancellation and
+provider-error outcomes without fallback. The direct checks avoid making all
+structural assertions depend on the primary model choosing to delegate:
 
 ```bash
 npm run smoke:opencode

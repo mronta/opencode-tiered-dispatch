@@ -57,6 +57,9 @@ try {
   }, 30_000, () => logs)
   await waitFor(() => existsSync(paths.marker) || existsSync(paths.failure), 180_000, () => logs)
   if (existsSync(paths.failure)) throw new Error(formatFailure(readFileSync(paths.failure, "utf8"), logs))
+  const initialAgentResponse = await fetch(`http://127.0.0.1:${port}/api/agent`, { headers: { authorization } })
+  if (!initialAgentResponse.ok) throw new Error(`could not read initial native agent catalog: HTTP ${initialAgentResponse.status}`)
+  verifyMaterializedAgents((await initialAgentResponse.json()).data ?? [], tiers)
 
   await waitFor(() => existsSync(paths.result) || existsSync(paths.failure), 600_000, () => logs)
   if (existsSync(paths.failure)) throw new Error(formatFailure(readFileSync(paths.failure, "utf8"), logs))
@@ -80,6 +83,23 @@ function formatFailure(failure, logs) {
   return `${failure}\nOpenCode logs:\n${logs}`
 }
 
+function verifyMaterializedAgents(agents, expectedTiers) {
+  for (const [tier, expected] of Object.entries(expectedTiers)) {
+    const agent = agents.find((candidate) => candidate.id === tier)
+    if (!agent || agent.mode !== "subagent") {
+      throw new Error(`native ${tier} was not materialized as a subagent: ${JSON.stringify(agent)}`)
+    }
+    const separator = expected.model.indexOf("/")
+    if (
+      agent.model?.providerID !== expected.model.slice(0, separator)
+      || agent.model?.id !== expected.model.slice(separator + 1)
+      || normalizedVariant(agent.model?.variant, expected.variant) !== (expected.variant ?? undefined)
+    ) {
+      throw new Error(`native ${tier} was materialized with the wrong model: ${JSON.stringify(agent)}`)
+    }
+  }
+}
+
 function modelRef(config) {
   const separator = config.model.indexOf("/")
   return {
@@ -101,12 +121,16 @@ function nativeAgents(providerErrorModel) {
 }
 
 function observerSource(resultPaths, selectedRootModel, configuredTiers, configuredProviderErrorModel) {
+  const directModels = Object.fromEntries(
+    Object.entries(configuredTiers).map(([tier, config]) => [tier, modelRef(config)]),
+  )
   return [
     `import { writeFileSync } from "node:fs"`,
     `const markerPath = ${JSON.stringify(resultPaths.marker)}`,
     `const resultPath = ${JSON.stringify(resultPaths.result)}`,
     `const failurePath = ${JSON.stringify(resultPaths.failure)}`,
     `const rootModel = ${JSON.stringify(selectedRootModel)}`,
+    `const directModels = ${JSON.stringify(directModels)}`,
     `const expectedTiers = ${JSON.stringify(configuredTiers)}`,
     `const providerErrorModel = ${JSON.stringify(configuredProviderErrorModel)}`,
     `const tiers = ${JSON.stringify(["fast", "medium", "heavy"])}`,
@@ -136,30 +160,38 @@ function observerSource(resultPaths, selectedRootModel, configuredTiers, configu
     "    setImmediate(() => {",
     "      void (async () => {",
     "        try {",
-    "          const childPrompts = {",
-    "            fast: \"Use the native subagent tool exactly once. Select agent fast, set a short description, and ask it to return exactly NATIVE_FAST_OK without using tools. After it returns, reply exactly NATIVE_ROOT_FAST_OK. Do not call any other tools.\",",
-    "            medium: \"Use the native subagent tool exactly once. Select agent medium and ask it to use the patch tool exactly once to create native-smoke-medium.txt containing exactly MEDIUM_EDIT_OK, then return exactly NATIVE_MEDIUM_OK. After it returns, reply exactly NATIVE_ROOT_MEDIUM_OK. Do not call any other tools.\",",
-    "            heavy: \"Use the native subagent tool exactly once. Select agent heavy and ask it to use the shell tool exactly once to run printf HEAVY_SHELL_OK > native-smoke-heavy.txt, then return exactly NATIVE_HEAVY_OK. After it returns, reply exactly NATIVE_ROOT_HEAVY_OK. Do not call any other tools.\",",
+    "          const directPrompts = {",
+    "            fast: \"Return exactly NATIVE_FAST_OK without using tools.\",",
+    "            medium: \"Use the patch tool exactly once to create native-smoke-medium.txt containing exactly MEDIUM_EDIT_OK, then return exactly NATIVE_MEDIUM_OK. Do not use other tools.\",",
+    "            heavy: \"Use the shell tool exactly once to run printf HEAVY_SHELL_OK > native-smoke-heavy.txt, then return exactly NATIVE_HEAVY_OK. Do not use other tools.\",",
     "          }",
     "          const results = {}",
     "          for (const tier of tiers) {",
-    "            const root = await ctx.session.create({ title: `[native smoke] ${tier}`, agent: \"build\", model: rootModel, location: { directory: ctx.location.directory } })",
-    "            await ctx.session.prompt({ sessionID: root.id, text: childPrompts[tier] })",
-    "            await ctx.session.wait({ sessionID: root.id })",
-    "            results[tier] = root.id",
+    "            const session = await ctx.session.create({ title: `[native smoke] direct ${tier}`, agent: tier, model: directModels[tier], location: { directory: ctx.location.directory } })",
+    "            await ctx.session.prompt({ sessionID: session.id, text: directPrompts[tier] })",
+    "            await ctx.session.wait({ sessionID: session.id })",
+    "            results[tier] = session.id",
     "          }",
     "          await new Promise((resolve) => setTimeout(resolve, 100))",
     "          const outputs = {}",
     "          for (const tier of tiers) {",
-    "            const child = [...events].reverse().find((event) => event.agent === tier)",
-    "            const childMessages = child ? await ctx.session.context({ sessionID: child.sessionID }) : []",
-    "            const rootMessages = await ctx.session.context({ sessionID: results[tier] })",
-    "            outputs[tier] = { childSessionID: child?.sessionID, childText: messageText(childMessages), rootText: messageText(rootMessages) }",
+    "            const direct = [...events].reverse().find((event) => event.agent === tier && event.sessionID === results[tier])",
+    "            const messages = direct ? await ctx.session.context({ sessionID: direct.sessionID }) : []",
+    "            outputs[tier] = { childSessionID: direct?.sessionID, childText: messageText(messages) }",
     "          }",
+    "          const routingStart = events.length",
+    "          const routingRoot = await ctx.session.create({ title: \"[native smoke] primary routing\", agent: \"build\", model: rootModel, location: { directory: ctx.location.directory } })",
+    "          await ctx.session.prompt({ sessionID: routingRoot.id, text: \"Use the native subagent tool exactly once. Select agent medium and ask it to return exactly NATIVE_ROUTE_MEDIUM_OK without using tools. After it returns, reply exactly NATIVE_ROUTE_OK. Do not call any other tools.\" })",
+    "          await ctx.session.wait({ sessionID: routingRoot.id })",
+    "          const routingChild = await waitForAgentEvent(events, routingStart, \"medium\")",
+    "          const routingRootMessages = await ctx.session.context({ sessionID: routingRoot.id })",
+    "          const routingChildMessages = await ctx.session.context({ sessionID: routingChild.sessionID })",
+    "          const routing = { rootSessionID: routingRoot.id, childSessionID: routingChild.sessionID, rootText: messageText(routingRootMessages), childText: messageText(routingChildMessages) }",
     "          await exerciseNativeTools(ctx, events)",
-    "          const delegationEvents = events.slice()",
+    "          const tierEvents = events.filter((event) => tiers.includes(event.agent) && results[event.agent] === event.sessionID)",
+    "          const routingEvents = events.slice(routingStart)",
     "          const lifecycle = await exerciseNativeLifecycle(ctx, events)",
-    "          writeFileSync(resultPath, JSON.stringify({ expected: expectedTiers, expectedProviderErrorModel: providerErrorModel, tiers: results, outputs, lifecycle, delegationEvents, events }))",
+    "          writeFileSync(resultPath, JSON.stringify({ expected: expectedTiers, expectedProviderErrorModel: providerErrorModel, tiers: results, outputs, routing, lifecycle, tierEvents, routingEvents, events }))",
     "        } catch (error) {",
     "          writeFileSync(failurePath, JSON.stringify({ message: error?.message ?? String(error), stack: error?.stack, events }))",
     "        }",
@@ -249,7 +281,7 @@ function verify(result, agents, workspace, configuredProviderErrorModel) {
     heavy: { path: join(workspace, "native-smoke-heavy.txt"), content: "HEAVY_SHELL_OK", action: "run a shell command" },
   }
   for (const tier of ["fast", "medium", "heavy"]) {
-    const events = result.delegationEvents.filter((event) => event.agent === tier)
+    const events = result.tierEvents.filter((event) => event.agent === tier)
     if (events.length === 0) throw new Error(`native ${tier} agent was never invoked: ${JSON.stringify(result)}`)
     if (new Set(events.map((event) => event.sessionID)).size !== 1) {
       throw new Error(`native ${tier} was invoked more than once: ${JSON.stringify(events)}`)
@@ -269,9 +301,6 @@ function verify(result, agents, workspace, configuredProviderErrorModel) {
     }
     if (result.outputs[tier]?.childText !== `NATIVE_${tier.toUpperCase()}_OK`) {
       throw new Error(`native ${tier} returned the wrong child result: ${JSON.stringify(result.outputs[tier])}`)
-    }
-    if (result.outputs[tier]?.rootText !== `NATIVE_ROOT_${tier.toUpperCase()}_OK`) {
-      throw new Error(`native ${tier} returned the wrong primary result: ${JSON.stringify(result.outputs[tier])}`)
     }
     const fileCheck = fileChecks[tier]
     if (fileCheck && (!existsSync(fileCheck.path) || readFileSync(fileCheck.path, "utf8") !== fileCheck.content)) {
@@ -324,6 +353,13 @@ function verify(result, agents, workspace, configuredProviderErrorModel) {
   const primary = result.events.find((event) => event.agent === "build" && event.hasProtocol)
   if (!primary) throw new Error(`primary routing protocol was not observed: ${JSON.stringify(result.events)}`)
   if (!primary.toolNames.includes("subagent")) throw new Error("primary session did not expose the native subagent tool")
+  const routingChild = result.routingEvents?.find((event) => event.agent === "medium")
+  if (!routingChild || routingChild.hasProtocol || routingChild.toolNames.includes("subagent")) {
+    throw new Error(`primary routing did not produce a valid medium child: ${JSON.stringify(result.routing)}`)
+  }
+  if (result.routing?.childText !== "NATIVE_ROUTE_MEDIUM_OK" || result.routing?.rootText !== "NATIVE_ROUTE_OK") {
+    throw new Error(`primary routing returned the wrong result: ${JSON.stringify(result.routing)}`)
+  }
   if (
     result.lifecycle?.cancellation?.interrupt?.interrupted !== true
     || result.lifecycle?.cancellation?.rootOutcome !== "interrupted"
