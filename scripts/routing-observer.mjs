@@ -246,8 +246,18 @@ async function waitForTerminalSessions(ctx, sessionIDs, shouldStop = () => false
   throw new Error("background native sessions remained alive before verifier checks: " + resultText(latest))
 }
 
-function toolErrorMetrics(toolEvents, workspace) {
-  const errors = toolEvents.filter((event) => event.phase === "after" && event.status !== "completed")
+function toolErrorMetrics(toolEvents, workspace, rootSessionID) {
+  const after = toolEvents.filter((event) => event.phase === "after")
+  const errors = after.filter((event) => event.status !== "completed")
+  const timeouts = after.filter((event) => {
+    const output = event.resultOutput ?? event.result?.output
+    return output?.timeout === true
+  })
+  const nonzeroShellExits = after.filter((event) => {
+    if (event.tool !== "shell") return false
+    const output = event.resultOutput ?? event.result?.output
+    return typeof output?.exit === "number" && Number.isFinite(output.exit) && output.exit !== 0
+  })
   const deniedExternalReads = errors.filter((event) => {
     if (event.tool !== "read") return false
     const candidate = event.input?.filePath ?? event.input?.path ?? event.input?.filename
@@ -260,12 +270,28 @@ function toolErrorMetrics(toolEvents, workspace) {
   })
   const byTool = {}
   for (const event of errors) byTool[event.tool] = (byTool[event.tool] ?? 0) + 1
+  const nonzeroShellExitBySession = {}
+  const nonzeroShellExitByRole = { root: 0, child: 0 }
+  for (const event of nonzeroShellExits) {
+    nonzeroShellExitBySession[event.sessionID] = (nonzeroShellExitBySession[event.sessionID] ?? 0) + 1
+    const role = event.sessionID === rootSessionID ? "root" : "child"
+    nonzeroShellExitByRole[role] += 1
+  }
   return {
+    // total and byTool retain their historical hook-status meaning.
     total: errors.length,
+    hookErrorCount: errors.length,
+    hookErrors: errors.length,
+    timeoutCount: timeouts.length,
+    timeouts: timeouts.length,
     byTool,
     deniedExternalReadCount: deniedExternalReads.length,
     otherErrorCount: errors.length - deniedExternalReads.length,
     deniedExternalReadIdentities: deniedExternalReads.map(toolIdentity),
+    nonzeroShellExitCount: nonzeroShellExits.length,
+    nonzeroShellExitBySession,
+    nonzeroShellExitByRole,
+    nonzeroShellExitIdentities: nonzeroShellExits.map(toolIdentity),
   }
 }
 
@@ -277,6 +303,7 @@ export default {
     const registrations = []
     const verificationSnapshots = []
     const activeSessions = new Set()
+    const inspectedSessions = []
     let progressState = {
       phase: "setup",
       scenarioID: null,
@@ -501,6 +528,7 @@ export default {
           const sessionIDs = [root.id, ...outputSessionIDs, ...contexts.slice(contextStart).map((event) => event.sessionID)]
           checkpoint("session-inspection", { scenarioID: scenario.id, rootSessionID: root.id })
           const sessions = await inspectSessions(ctx, sessionIDs, contexts.slice(contextStart), () => stopping)
+          inspectedSessions.push(...clone(sessions))
           if (stopping) throw new Error("routing observer cleanup was requested during session inspection")
           const unresolvedRoot = sessions.find((session) => session.sessionID === root.id && !session.outcome)
           if (unresolvedRoot !== undefined) {
@@ -526,7 +554,7 @@ export default {
             contexts: clone(contexts.slice(contextStart)),
             sessions,
             rootSessionPermissions: clone(fixtureRootPermission),
-            toolErrorMetrics: toolErrorMetrics(scenarioTools, ctx.location.directory),
+            toolErrorMetrics: toolErrorMetrics(scenarioTools, ctx.location.directory, root.id),
             changedFiles,
             verifierChangedFiles,
             verifierControlChangedFiles: verifierControlChanges,
@@ -540,7 +568,7 @@ export default {
               contexts: clone(contexts.slice(contextStart)),
               sessions: clone(sessions),
               rootSessionPermissions: clone(fixtureRootPermission),
-              toolErrorMetrics: clone(toolErrorMetrics(scenarioTools, ctx.location.directory)),
+              toolErrorMetrics: clone(toolErrorMetrics(scenarioTools, ctx.location.directory, root.id)),
               fixtureProblems: clone(fixtureProblems),
               fixtureVerification: clone(fixtureVerification),
               snapshotEvidence: clone(snapshotEvidence),
@@ -587,6 +615,7 @@ export default {
           results,
           tools: clone(tools),
           contexts: clone(contexts),
+          sessions: clone(inspectedSessions),
         }))
       } finally {
         resolveContinuation()

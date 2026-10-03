@@ -156,6 +156,49 @@ describe("routing metrics", () => {
     expect(summary.comparisons[0].ratios.executionMs.tieredOverDirectP50).toBe(4)
   })
 
+  it("keeps four-scenario outcomes separate from arm policy failures", () => {
+    const scenarioIDs = ["trivial", "known-scope", "discover-implement", "discover-analyze"]
+    const makeArtifact = (arm) => ({
+      arm,
+      repetition: 0,
+      errors: ["native evaluator exited with 1"],
+      results: scenarioIDs.map((id) => trace({ id })),
+      reports: scenarioIDs.map((id) => ({
+        id,
+        problems: id === "known-scope" ? ["policy failure"] : [],
+      })),
+    })
+    const summary = summarizeMatchedBenchmark([makeArtifact("direct"), makeArtifact("tiered")], { scenarioIDs })
+
+    const byScenario = new Map(summary.samples.map((sample) => [sample.scenario + "/" + sample.arm, sample]))
+    expect(byScenario.get("trivial/direct")).toMatchObject({ status: "succeeded", success: true })
+    expect(byScenario.get("known-scope/direct")).toMatchObject({ status: "failed", success: false, policyProblems: ["policy failure"] })
+    expect(byScenario.get("discover-analyze/tiered")).toMatchObject({ status: "succeeded", success: true })
+    expect(summary.scenarioSummaries.find((entry) => entry.scenario === "trivial").arms.direct).toMatchObject({ successes: 1, failures: 0 })
+    expect(summary.comparisons.find((entry) => entry.scenario === "trivial").sampleCounts).toMatchObject({ matchedSuccessfulPairs: 1 })
+    expect(summary.comparisons.find((entry) => entry.scenario === "known-scope").sampleCounts).toMatchObject({ matchedSuccessfulPairs: 0 })
+    expect(summary.arms.direct).toMatchObject({ complete: false, incompleteRuns: 1 })
+    expect(summary.arms.direct.armErrors).toEqual([{ repetition: 0, message: "native evaluator exited with 1" }])
+    expect(summary.qualityGate.noPolicyFailures).toBe(false)
+    expect(summary.qualityGate.complete).toBe(false)
+  })
+
+  it("does not certify a result with a transport error and missing root session evidence", () => {
+    const errored = trace({ sessions: [], contexts: [] })
+    const summary = summarizeMatchedBenchmark([{
+      arm: "direct",
+      repetition: 0,
+      errors: ["transport truncated artifact"],
+      results: [errored],
+      reports: [{ id: "known-scope", problems: [] }],
+    }], { scenarioIDs: ["known-scope"] })
+    const sample = summary.samples[0]
+    expect(sample.success).toBe(false)
+    expect(sample.status).toBe("failed")
+    expect(sample.evidenceProblems).toContain("scenario result known-scope is missing root session root")
+    expect(summary.arms.direct.armErrors).toEqual([{ repetition: 0, message: "transport truncated artifact" }])
+  })
+
   it("counterbalances deterministically", () => {
     expect(counterbalancedArmOrder(0)).toEqual(["tiered", "direct"])
     expect(counterbalancedArmOrder(1)).toEqual(["direct", "tiered"])

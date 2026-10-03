@@ -7,9 +7,14 @@ import { modelCatalog, requiredTierOptions, tierModel } from "./tier-fixtures.js
 const models = modelCatalog()
 
 type ContextEvent = { sessionID: string; agent: string; tools: Record<string, unknown>; system: unknown[] }
-type ToolEvent = { tool: string; input: unknown }
+type ToolEvent = { tool: string; agent?: string; input: unknown }
 type FixtureAgent = AgentCatalogEntry & {
   permissions: NonNullable<AgentCatalogEntry["permissions"]>
+  name?: string
+  hidden?: boolean
+  steps?: number
+  request?: unknown
+  color?: string
 }
 
 interface FixtureFailures {
@@ -31,6 +36,11 @@ function makeContext(options: Record<string, unknown>, failures: FixtureFailures
   const agents: FixtureAgent[] = [
     { id: "build", mode: "primary", permissions: [] },
     { id: "all", mode: "all", permissions: [] },
+    {
+      id: "plan",
+      mode: "primary",
+      permissions: [{ action: "subagent", resource: "*", effect: "allow" }],
+    },
   ]
   let agentCatalog = agents
   const hookCallbacks: Array<(event: ContextEvent) => void | Promise<void>> = []
@@ -168,17 +178,111 @@ describe("plugin setup", () => {
 
   it("does not inspect catalogs or register behavior when disabled", async () => {
     const fixture = makeContext({ enabled: false })
+    const customFast: FixtureAgent = {
+      id: "fast",
+      mode: "subagent",
+      permissions: [],
+      hidden: true,
+      steps: 1,
+      request: { settings: { stale: true }, headers: {}, body: {} },
+    }
+    const customMedium: FixtureAgent = {
+      id: "medium",
+      mode: "subagent",
+      permissions: [],
+      hidden: true,
+      steps: 1,
+      request: { settings: { stale: true }, headers: {}, body: {} },
+    }
+    fixture.agents.push(customFast, customMedium)
 
     const cleanup = await plugin.setup(fixture.context)
 
-    expect(cleanup).toBeTypeOf("function")
+    expect(cleanup).toBeUndefined()
     expect(fixture.context.model.list).not.toHaveBeenCalled()
     expect(fixture.context.agent.list).not.toHaveBeenCalled()
-    expect(fixture.context.agent.transform).toHaveBeenCalledOnce()
+    expect(fixture.context.agent.transform).not.toHaveBeenCalled()
     expect(fixture.context.session.hook).not.toHaveBeenCalled()
-    expect(fixture.removedAgents).toEqual(["fast", "medium", "heavy"])
+    expect(fixture.removedAgents).toEqual([])
+    expect(fixture.agents).toContain(customFast)
+    expect(fixture.agents).toContain(customMedium)
+    expect(customFast).toMatchObject({ hidden: true, steps: 1, request: { settings: { stale: true } } })
+    expect(customMedium).toMatchObject({ hidden: true, steps: 1, request: { settings: { stale: true } } })
+    expect(fixture.disposalOrder).toEqual([])
+  })
+
+  it("keeps the native plan out of routing and blocks its mutating tier targets", async () => {
+    const fixture = makeContext(options)
+    const cleanup = await plugin.setup(fixture.context)
+    const plan = fixture.agents.find((agent) => agent.id === "plan")
+    if (!plan) throw new Error("test fixture is missing plan agent")
+
+    expect(plan.permissions).toEqual([
+      { action: "subagent", resource: "*", effect: "allow" },
+      { action: "subagent", resource: "medium", effect: "deny" },
+      { action: "subagent", resource: "heavy", effect: "deny" },
+    ])
+
+    const hook = fixture.hookCallbacks[0]!
+    const planContext = { sessionID: "plan-root", agent: "plan", tools: {}, system: [] as unknown[] }
+    await hook(planContext)
+    expect(planContext.system).toEqual([])
+    expect(fixture.context.agent.list).not.toHaveBeenCalled()
+
+    const guard = fixture.toolHookCallbacks[0]!
+    expect(() => guard({ tool: "subagent", agent: "plan", input: { agent: "fast" } })).not.toThrow()
+    for (const agent of ["medium", "heavy"]) {
+      expect(() => guard({ tool: "subagent", agent: "plan", input: { agent } }))
+        .toThrow(/switch to Build to execute/)
+    }
+    expect(() => guard({ tool: "subagent", agent: "build", input: { agent: "medium" } })).not.toThrow()
+    expect(() => guard({ tool: "subagent", agent: "customactor", input: { agent: "medium" } })).not.toThrow()
+    expect(() => guard({ tool: "subagent", agent: "plan", input: { sessionID: "resumed" } })).not.toThrow()
+
     if (typeof cleanup === "function") await cleanup()
-    expect(fixture.disposalOrder).toEqual(["agent"])
+  })
+
+  it("normalizes every tier execution field without changing cosmetic color", async () => {
+    const fixture = makeContext(options)
+    const colors = new Map<string, string>()
+    for (const tier of ["fast", "medium", "heavy"] as const) {
+      const color = `${tier}-color`
+      colors.set(tier, color)
+      fixture.agents.push({
+        id: tier,
+        mode: "primary",
+        name: `old-${tier}`,
+        hidden: true,
+        steps: 1,
+        request: { settings: { stale: true }, headers: { stale: "true" }, body: { stale: true } },
+        color,
+        permissions: [{ action: "read", resource: "*", effect: "allow" }],
+      })
+    }
+
+    await plugin.setup(fixture.context)
+
+    for (const tier of ["fast", "medium", "heavy"] as const) {
+      const agent = fixture.agents.find((candidate) => candidate.id === tier)
+      if (!agent) throw new Error(`test fixture is missing ${tier} agent`)
+      expect(agent).toMatchObject({
+        name: tier,
+        mode: "subagent",
+        hidden: false,
+        description: expect.any(String),
+        system: expect.any(String),
+        model: tierModel(tier),
+        request: { settings: {}, headers: {}, body: {} },
+        color: colors.get(tier),
+      })
+      expect(agent).not.toHaveProperty("steps")
+      expect(agent.permissions).not.toEqual([{ action: "read", resource: "*", effect: "allow" }])
+    }
+    const fast = fixture.agents.find((candidate) => candidate.id === "fast")
+    const medium = fixture.agents.find((candidate) => candidate.id === "medium")
+    const heavy = fixture.agents.find((candidate) => candidate.id === "heavy")
+    expect(fast?.request).not.toBe(medium?.request)
+    expect(medium?.request).not.toBe(heavy?.request)
   })
 
   it("applies optional tier instructions without injecting routing recursively", async () => {

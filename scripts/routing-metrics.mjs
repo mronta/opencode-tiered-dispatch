@@ -1,4 +1,5 @@
 import { getEncoding } from "js-tiktoken"
+import { classifyRoutingProblems } from "./routing-eval.mjs"
 
 const READ_TOOLS = new Set(["read", "glob", "grep", "webfetch", "websearch"])
 const TOKEN_KEYS = Object.freeze(["input", "output", "reasoning", "cacheRead", "cacheWrite"])
@@ -179,34 +180,77 @@ export function summarizeMatchedBenchmark(runArtifacts, options = {}) {
   if (!Array.isArray(runArtifacts)) throw new TypeError("benchmark artifacts must be an array")
   const scenarioIDs = options.scenarioIDs ?? discoverScenarioIDs(runArtifacts)
   const samples = []
+  const runs = []
 
   for (const artifact of runArtifacts) {
     const arm = artifact?.arm ?? "unknown"
     const repetition = Number.isInteger(artifact?.repetition) ? artifact.repetition : null
-    const runErrors = collectErrors(artifact)
+    const runErrors = [
+      ...collectErrors(artifact),
+      ...artifactShapeProblems(artifact, scenarioIDs),
+    ]
     const results = Array.isArray(artifact?.results) ? artifact.results : []
     const reports = Array.isArray(artifact?.reports) ? artifact.reports : []
+    const runSamples = []
     for (const scenarioID of scenarioIDs) {
-      const result = results.find((candidate) => candidate?.id === scenarioID)
-      const report = reports.find((candidate) => candidate?.id === scenarioID)
+      const resultMatches = results.filter((candidate) => candidate?.id === scenarioID)
+      const reportMatches = reports.filter((candidate) => candidate?.id === scenarioID)
+      const result = resultMatches[0]
+      const report = reportMatches[0]
       const metrics = result === undefined
         ? null
         : { ...summarizeRoutingTrace(result), startupMs: finite(artifact?.startupMs) }
-      const reportProblems = Array.isArray(report?.problems) ? report.problems : []
-      const errors = [...runErrors, ...reportProblems]
-      const success = result !== undefined && runErrors.length === 0 && report !== undefined && reportProblems.length === 0
-      samples.push({
+      const evidenceProblems = scenarioDataProblems({
+        scenarioID,
+        result,
+        resultMatches,
+        report,
+        reportMatches,
+      })
+      const classifiedReport = classifyReportProblems(report)
+      const taskProblems = classifiedReport.taskProblems
+      const policyProblems = classifiedReport.policyProblems
+      evidenceProblems.push(...classifiedReport.evidenceProblems)
+      const problems = [...taskProblems, ...policyProblems, ...evidenceProblems]
+      const success = problems.length === 0
+      const sample = {
         arm,
         repetition,
         scenario: scenarioID,
         status: success ? "succeeded" : "failed",
         success,
-        errors,
+        scenarioSuccess: success,
+        taskSuccess: taskProblems.length === 0,
+        policySuccess: policyProblems.length === 0,
+        evidenceValid: evidenceProblems.length === 0,
+        taskProblems,
+        policyProblems,
+        evidenceProblems,
+        // `problems` is the stable per-scenario aggregate.  `errors` remains
+        // as the older alias; arm/process errors intentionally live on the
+        // run record below instead of being copied to every scenario.
+        problems,
+        errors: problems,
         metrics,
         report: report ?? null,
         result: result ?? null,
-      })
+      }
+      runSamples.push(sample)
+      samples.push(sample)
     }
+    const complete = runErrors.length === 0 && runSamples.every((sample) => sample.success)
+    const run = {
+      arm,
+      repetition,
+      complete,
+      errors: runErrors,
+      armErrors: runErrors,
+      scenarioFailures: runSamples
+        .filter((sample) => !sample.success)
+        .map((sample) => ({ scenario: sample.scenario, problems: sample.problems })),
+    }
+    for (const sample of runSamples) sample.armRunComplete = complete
+    runs.push(run)
   }
 
   const summaryByKey = new Map()
@@ -217,7 +261,13 @@ export function summarizeMatchedBenchmark(runArtifacts, options = {}) {
     pairingByScenario.set(scenarioID, pairing)
     for (const arm of ["direct", "tiered"]) {
       const armSamples = scenarioSamples.filter((sample) => sample.arm === arm)
-      summaryByKey.set(`${scenarioID}/${arm}`, summarizeSamples(scenarioID, arm, armSamples, pairing))
+      summaryByKey.set(`${scenarioID}/${arm}`, summarizeSamples(
+        scenarioID,
+        arm,
+        armSamples,
+        pairing,
+        runs.filter((run) => run.arm === arm),
+      ))
     }
   }
   const scenarioSummaries = scenarioIDs.map((scenario) => ({
@@ -234,22 +284,55 @@ export function summarizeMatchedBenchmark(runArtifacts, options = {}) {
     pairingByScenario.get(scenario),
   ))
 
+  const armSummaries = Object.fromEntries(["direct", "tiered"].map((arm) => {
+    const armRuns = runs.filter((run) => run.arm === arm)
+    const armErrors = armRuns.flatMap((run) => run.armErrors.map((message) => ({
+      repetition: run.repetition,
+      message,
+    })))
+    return [arm, {
+      arm,
+      runs: armRuns.length,
+      completedRuns: armRuns.filter((run) => run.complete).length,
+      incompleteRuns: armRuns.filter((run) => !run.complete).length,
+      complete: armRuns.length > 0 && armRuns.every((run) => run.complete),
+      armErrors,
+      errors: armErrors,
+    }]
+  }))
+  const policyFailureCount = samples.reduce((sum, sample) => sum + sample.policyProblems.length, 0)
+  const taskFailureCount = samples.reduce((sum, sample) => sum + sample.taskProblems.length, 0)
+  const evidenceFailureCount = samples.reduce((sum, sample) => sum + sample.evidenceProblems.length, 0)
+  const allArmsComplete = Object.values(armSummaries).every((arm) => arm.complete)
+  const allPairsComplete = comparisons.every((comparison) => comparison.qualityGate.pairComplete)
+
   return {
     scenarioIDs,
     samples,
+    runs,
+    arms: armSummaries,
     scenarioSummaries,
     comparisons,
     qualityGate: {
       bothArmsPresent: comparisons.every((comparison) => comparison.qualityGate.bothArmsPresent),
       allComparisonsHaveSamples: comparisons.every((comparison) => comparison.qualityGate.matchedSuccessfulPairs > 0),
+      allArmsComplete,
+      allPairsComplete,
+      policyFailureCount,
+      taskFailureCount,
+      evidenceFailureCount,
+      noPolicyFailures: policyFailureCount === 0,
+      complete: allArmsComplete && allPairsComplete && policyFailureCount === 0 && taskFailureCount === 0 && evidenceFailureCount === 0,
       note: "Ratios are descriptive only; they do not establish an improvement claim.",
     },
   }
 }
 
-function summarizeSamples(scenario, arm, samples, pairing) {
+function summarizeSamples(scenario, arm, samples, pairing, armRuns) {
   const successes = samples.filter((sample) => sample.success).length
   const failures = samples.length - successes
+  const complete = armRuns.length > 0 && armRuns.every((run) => run.complete)
+  const armErrors = armRuns.flatMap((run) => run.armErrors.map((message) => ({ repetition: run.repetition, message })))
   return {
     scenario,
     arm,
@@ -268,8 +351,20 @@ function summarizeSamples(scenario, arm, samples, pairing) {
       matchedSuccessfulPairs: pairing.successfulPairs.length,
       note: "Performance quantiles use only successful direct/tiered pairs from the same repetition with a valid metric.",
     },
+    completion: {
+      complete,
+      runs: armRuns.length,
+      completedRuns: armRuns.filter((run) => run.complete).length,
+      incompleteRuns: armRuns.filter((run) => !run.complete).length,
+      armErrors,
+    },
+    armErrors,
     usage: summarizeUsage(samples),
     errors: samples.flatMap((sample) => sample.errors.map((message) => ({ repetition: sample.repetition, message }))),
+    problems: samples.flatMap((sample) => sample.problems.map((message) => ({ repetition: sample.repetition, message }))),
+    taskProblems: samples.flatMap((sample) => sample.taskProblems.map((message) => ({ repetition: sample.repetition, message }))),
+    policyProblems: samples.flatMap((sample) => sample.policyProblems.map((message) => ({ repetition: sample.repetition, message }))),
+    evidenceProblems: samples.flatMap((sample) => sample.evidenceProblems.map((message) => ({ repetition: sample.repetition, message }))),
   }
 }
 
@@ -312,10 +407,106 @@ function compareScenario(scenario, direct, tiered, pairing) {
       matchedAttempts,
       matchedSuccessfulPairs,
       metricPairs,
+      pairComplete: pairing.incompleteMatchedRepetitions.length === 0 && matchedAttempts > 0,
       ratiosRequireBothArmsAndPositiveDirectP50: true,
     },
     ratios,
   }
+}
+
+function scenarioDataProblems({ scenarioID, result, resultMatches, report, reportMatches }) {
+  const problems = []
+  if (resultMatches.length === 0) problems.push(`missing scenario result: ${scenarioID}`)
+  if (resultMatches.length > 1) problems.push(`duplicate scenario result: ${scenarioID}`)
+  if (result !== undefined && !isRecord(result)) problems.push(`scenario result is not an object: ${scenarioID}`)
+  if (isRecord(result)) {
+    if (typeof result.rootSessionID !== "string" || result.rootSessionID.length === 0) {
+      problems.push(`scenario result ${scenarioID} is missing rootSessionID`)
+    } else if (!Array.isArray(result.sessions)) {
+      problems.push(`scenario result ${scenarioID} is missing sessions evidence`)
+    } else {
+      const rootSession = result.sessions.find((session) => session?.sessionID === result.rootSessionID)
+      if (rootSession === undefined) {
+        problems.push(`scenario result ${scenarioID} is missing root session ${result.rootSessionID}`)
+      } else {
+        if (rootSession.inspectionError !== undefined && rootSession.inspectionError !== null) {
+          problems.push(`scenario result ${scenarioID} root session has inspectionError: ${String(rootSession.inspectionError)}`)
+        }
+        if (rootSession.outcome !== undefined && rootSession.outcome !== "succeeded") {
+          problems.push(`scenario result ${scenarioID} root session did not succeed: ${String(rootSession.outcome)}`)
+        }
+      }
+      for (const session of result.sessions) {
+        if (session?.inspectionError !== undefined && session.inspectionError !== null && session?.sessionID !== result.rootSessionID) {
+          problems.push(`scenario result ${scenarioID} session ${String(session?.sessionID)} has inspectionError: ${String(session.inspectionError)}`)
+        }
+        if (session?.sessionID !== result.rootSessionID && session?.outcome !== undefined && session.outcome !== "succeeded") {
+          problems.push(`scenario result ${scenarioID} session ${String(session?.sessionID)} did not succeed: ${String(session.outcome)}`)
+        }
+      }
+    }
+    if (!Array.isArray(result.contexts)) {
+      problems.push(`scenario result ${scenarioID} is missing contexts evidence`)
+    } else if (typeof result.rootSessionID === "string" && !result.contexts.some((context) => context?.sessionID === result.rootSessionID)) {
+      problems.push(`scenario result ${scenarioID} is missing root execution context ${result.rootSessionID}`)
+    }
+  }
+
+  if (reportMatches.length === 0) problems.push(`missing scenario report: ${scenarioID}`)
+  if (reportMatches.length > 1) problems.push(`duplicate scenario report: ${scenarioID}`)
+  if (report !== undefined && (!isRecord(report) || !Array.isArray(report.problems))) {
+    problems.push(`scenario report ${scenarioID} is missing its problems array`)
+  }
+  return problems
+}
+
+function artifactShapeProblems(artifact, scenarioIDs) {
+  const problems = []
+  const values = [
+    ["results", artifact?.results],
+    ["reports", artifact?.reports],
+  ]
+  for (const [label, value] of values) {
+    if (!Array.isArray(value)) {
+      problems.push(`artifact ${label} is missing or is not an array`)
+      continue
+    }
+    const expected = new Set(scenarioIDs)
+    const counts = new Map()
+    for (const entry of value) {
+      const id = entry?.id
+      counts.set(id, (counts.get(id) ?? 0) + 1)
+      if (!expected.has(id)) problems.push(`unexpected artifact ${label} id: ${String(id)}`)
+    }
+    for (const id of scenarioIDs) {
+      const count = counts.get(id) ?? 0
+      if (count === 0) problems.push(`missing artifact ${label} id: ${id}`)
+      if (count > 1) problems.push(`duplicate artifact ${label} id: ${id}`)
+    }
+  }
+  return problems
+}
+
+function classifyReportProblems(report) {
+  const taskProblems = normalizeProblemArray(report?.taskProblems)
+  const policyProblems = normalizeProblemArray(report?.policyProblems)
+  const evidenceProblems = normalizeProblemArray(report?.evidenceProblems)
+  const categorized = new Set([...taskProblems, ...policyProblems, ...evidenceProblems])
+  const aggregate = Array.isArray(report?.problems) ? report.problems : []
+  for (const problem of aggregate) {
+    const message = String(problem)
+    if (categorized.has(message)) continue
+    const classified = classifyRoutingProblems([message])
+    taskProblems.push(...classified.taskProblems)
+    policyProblems.push(...classified.policyProblems)
+    evidenceProblems.push(...classified.evidenceProblems)
+    categorized.add(message)
+  }
+  return { taskProblems, policyProblems, evidenceProblems }
+}
+
+function normalizeProblemArray(value) {
+  return Array.isArray(value) ? value.map((problem) => String(problem)) : []
 }
 
 function summarizeUsage(samples) {
@@ -382,12 +573,16 @@ function pairSuccessfulSamples(samples) {
   }
   const rawMatchedRepetitions = [...byRepetition.values()].filter((arms) => arms.direct.length > 0 && arms.tiered.length > 0).length
   const successfulPairs = []
+  const incompleteMatchedRepetitions = []
   for (const [repetition, arms] of byRepetition) {
     if (arms.direct.length !== 1 || arms.tiered.length !== 1) continue
+    if (arms.direct[0].armRunComplete !== true || arms.tiered[0].armRunComplete !== true) {
+      incompleteMatchedRepetitions.push(repetition)
+    }
     if (!arms.direct[0].success || !arms.tiered[0].success) continue
     successfulPairs.push({ repetition, direct: arms.direct[0], tiered: arms.tiered[0] })
   }
-  return { rawMatchedRepetitions, successfulPairs }
+  return { rawMatchedRepetitions, successfulPairs, incompleteMatchedRepetitions }
 }
 
 function pairedMetricValues(pairing, metric) {

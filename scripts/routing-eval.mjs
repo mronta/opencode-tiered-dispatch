@@ -166,7 +166,7 @@ export function assessRouting(result, expectedRoute = [], tierModels, options = 
   const firstDispatch = dispatches[0]
   const readsBeforeDispatch = primaryReads.filter((event) => firstDispatch === undefined || sequenceOf(event) < sequenceOf(firstDispatch)).length
 
-  return {
+  const report = {
     id: result?.id,
     route,
     elapsedMs: result?.elapsedMs,
@@ -180,6 +180,47 @@ export function assessRouting(result, expectedRoute = [], tierModels, options = 
     problems,
     tokens,
   }
+  // Derive these views from the aggregate so legacy callers that append an
+  // objective failure to report.problems (after assessment) still expose the
+  // correct per-scenario classification.
+  for (const field of ["taskProblems", "policyProblems", "evidenceProblems"]) {
+    Object.defineProperty(report, field, {
+      enumerable: true,
+      get() {
+        return classifyRoutingProblems(problems)[field]
+      },
+    })
+  }
+  return report
+}
+
+/**
+ * Keep the backwards-compatible aggregate problem list while exposing the
+ * three kinds of scenario outcome that the benchmark needs to keep apart.
+ * Objective checks added by older evaluators only arrive in `problems`, so
+ * this intentionally has a conservative fallback: an unrecognised problem
+ * is evaluator policy, never an implementation/task failure.  In particular
+ * an unknown verification command remains a policy violation.
+ */
+export function classifyRoutingProblems(problems) {
+  const taskProblems = []
+  const policyProblems = []
+  const evidenceProblems = []
+  for (const problem of Array.isArray(problems) ? problems : []) {
+    const message = String(problem)
+    if (isTaskProblem(message)) taskProblems.push(problem)
+    else if (isEvidenceProblem(message)) evidenceProblems.push(problem)
+    else policyProblems.push(problem)
+  }
+  return { taskProblems, policyProblems, evidenceProblems }
+}
+
+function isTaskProblem(message) {
+  return /(?:answer was incorrect|answer omitted|failed objective|fixture (?:behavior|tests)|changed-limit behavior)/iu.test(message)
+}
+
+function isEvidenceProblem(message) {
+  return /(?:inspection(?:Error| failed)?|fixture validation evidence|fixture verification evidence|snapshot evidence|execution context|session (?:evidence|info|metadata)|child session|root session|tool (?:event|completion)|native delegation .*?(?:structured|unobserved|correlated|returned|session)|orphan|synchronous sequence|duplicate observed sequence|routing protocol was not observed|protocol was not observed|result set)/iu.test(message)
 }
 
 /**
@@ -323,6 +364,14 @@ function validateSessionEvidence({ result, sessions, contexts, rootSessionID, ti
     }
     if (sessionByID.has(id)) problems.push(`duplicate session record: ${id}`)
     else sessionByID.set(id, session)
+
+    // A successful outcome is not enough to certify a session when the
+    // observer failed to inspect it.  Keep the original diagnostic on the
+    // session record (and therefore in rawTrace); this problem only makes the
+    // evidence fail closed.
+    if (session.inspectionError !== undefined && session.inspectionError !== null) {
+      problems.push(`session ${id} has inspectionError: ${String(session.inspectionError)}`)
+    }
   }
 
   const rootRecords = sessions.filter((session) => session?.sessionID === rootSessionID)

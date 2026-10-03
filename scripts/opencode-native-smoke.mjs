@@ -525,8 +525,10 @@ function verifyRoutingEvaluation(results, evaluationArm = "tiered", tierModels, 
 
 function verifyMaterializedAgents(agents, expectedTiers) {
   for (const [tier, expected] of Object.entries(expectedTiers)) {
-    verifyTierAgent(agents, tier, expected, "materialized")
+    const agent = verifyTierAgent(agents, tier, expected, "materialized")
+    verifyMaterializedAgentFields(agent, tier)
   }
+  verifyPlanPermissions(agents)
 }
 
 function nativeAgents(providerErrorModel) {
@@ -558,6 +560,34 @@ function verifyTierAgent(agents, tier, expected, phase) {
     throw new Error(`native ${tier} was ${phase} with the wrong model: ${JSON.stringify(agent)}`)
   }
   return agent
+}
+
+function verifyMaterializedAgentFields(agent, tier) {
+  if (agent.name !== tier) {
+    throw new Error(`native ${tier} was materialized with the wrong name: ${JSON.stringify(agent)}`)
+  }
+  if (agent.hidden !== false) {
+    throw new Error(`native ${tier} was not materialized as visible: ${JSON.stringify(agent)}`)
+  }
+  if (Object.prototype.hasOwnProperty.call(agent, "steps")) {
+    throw new Error(`native ${tier} retained a steps limit: ${JSON.stringify(agent)}`)
+  }
+  if (JSON.stringify(agent.request) !== JSON.stringify({ settings: {}, headers: {}, body: {} })) {
+    throw new Error(`native ${tier} retained request settings: ${JSON.stringify(agent)}`)
+  }
+}
+
+function verifyPlanPermissions(agents) {
+  const plan = agents.find((candidate) => candidate.id === "plan")
+  if (!plan) return
+  for (const tier of ["medium", "heavy"]) {
+    const rule = [...(plan.permissions ?? [])].reverse().find(
+      (candidate) => candidate.action === "subagent" && candidate.resource === tier,
+    )
+    if (rule?.effect !== "deny") {
+      throw new Error(`native plan can invoke ${tier}: ${JSON.stringify(plan)}`)
+    }
+  }
 }
 
 function observerSource(resultPaths, selectedRootModel, configuredTiers, configuredProviderErrorModel) {

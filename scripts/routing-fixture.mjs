@@ -183,7 +183,11 @@ export function checkFixture(workspace, scenarioID, nodeBinary = process.execPat
 
     const test = scenarioID === "known-scope"
       ? spawnSync(nodeBinary, ["--test", "test/banner.test.js"], processOptions(workspace))
-      : spawnSync(npmBinary(), ["test"], processOptions(workspace))
+      // The verifier owns this invocation.  Do not let an inherited
+      // npm_execpath (for example, an npx shim) replace the command that
+      // establishes fixture evidence.  The primary's exact `npm test`
+      // command remains a separate routing-policy observation.
+      : spawnSync(nodeBinary, ["--test", "test/*.test.js"], processOptions(workspace))
     problems.push(...formatCheckFailure("fixture tests", test))
   } finally {
     rmSync(loaderPath, { force: true })
@@ -253,12 +257,6 @@ export async function load(url, context, nextLoad) {
 
 function processOptions(workspace) {
   return { cwd: workspace, encoding: "utf8", timeout: 30_000 }
-}
-
-function npmBinary() {
-  // Vitest/npx exposes npx-cli.js as npm_execpath.  Invoking it with `test`
-  // asks npx to resolve a package instead of running the fixture's script.
-  return /npx-cli\.js$/u.test(process.env.npm_execpath ?? "") ? "npm" : (process.env.npm_execpath ?? "npm")
 }
 
 function hashFile(filename) {

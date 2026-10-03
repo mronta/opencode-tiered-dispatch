@@ -3,7 +3,7 @@ import type { AgentEditor } from "@opencode/plugin/promise/agent"
 import type { Context } from "@opencode/plugin/promise/plugin"
 import { TIER_AGENT_DEFINITIONS } from "./agents.js"
 import { assertAgentsAvailable, assertModelsAvailable } from "./catalog.js"
-import { tierModelOverrideError } from "./invocation.js"
+import { planMutatingTierError, tierModelOverrideError } from "./invocation.js"
 import { parseOptions, type TierOptions } from "./options.js"
 import { buildRoutingProtocol } from "./protocol.js"
 import { isTierName, TIER_NAMES, type TierName } from "./tiers.js"
@@ -17,12 +17,7 @@ export default Plugin.define({
 
   async setup(ctx) {
     const options = parseOptions(ctx.options)
-    if (!options.enabled) {
-      const agentRegistration = await ctx.agent.transform((editor) => {
-        for (const tier of TIER_NAMES) editor.remove(tier)
-      })
-      return async () => disposeRegistrations([agentRegistration])
-    }
+    if (!options.enabled) return undefined
     const log = options.logging
       ? (...values: unknown[]) => console.error("[tiered-dispatch]", ...values)
       : undefined
@@ -47,21 +42,30 @@ export default Plugin.define({
           const configured = options.tiers[tier]
           editor.update(tier, (agent) => {
             agent.mode = "subagent"
+            if ("name" in agent) agent.name = tier as unknown as typeof agent.name
+            agent.hidden = false
+            agent.request = { settings: {}, headers: {}, body: {} }
+            delete agent.steps
             agent.description = definition.description
             agent.system = definition.system
             agent.model = toAgentModel(configured)
             agent.permissions = definition.permissions.map((rule) => ({ ...rule }))
           })
         }
+        const plan = editor.get("plan")
+        if (plan !== undefined) appendPlanTierDenies(plan)
       }))
 
       registrations.push(await ctx.tool.hook("execute.before", (event) => {
         if (event.tool !== "subagent") return
+        const planViolation = planMutatingTierError(event.agent, event.input)
+        if (planViolation !== undefined) throw new Error(planViolation)
         const violation = tierModelOverrideError(event.input)
         if (violation !== undefined) throw new Error(violation)
       }))
 
       registrations.push(await ctx.session.hook("context", async (event) => {
+        if (event.agent === "plan") return
         const agents = await loadAgents()
         const agent = agents.find((candidate) => candidate.id === event.agent)
         if (isTierName(event.agent)) {
@@ -100,6 +104,19 @@ type ModelInfo = Awaited<ReturnType<Context["model"]["list"]>>["data"][number]
 type AgentInfo = Awaited<ReturnType<Context["agent"]["list"]>>["data"][number]
 type EditableAgent = Parameters<Parameters<AgentEditor["update"]>[1]>[0]
 type AgentModel = NonNullable<EditableAgent["model"]>
+
+const PLAN_BLOCKED_TIERS = ["medium", "heavy"] as const
+
+function appendPlanTierDenies(agent: EditableAgent): void {
+  const permissions = agent.permissions ?? (agent.permissions = [])
+  for (const tier of PLAN_BLOCKED_TIERS) {
+    const lastRule = [...permissions].reverse().find(
+      (rule) => rule.action === "subagent" && rule.resource === tier,
+    )
+    if (lastRule?.effect === "deny") continue
+    permissions.push({ action: "subagent", resource: tier, effect: "deny" })
+  }
+}
 
 function toAgentModel(configured: TierOptions): AgentModel {
   const model = {

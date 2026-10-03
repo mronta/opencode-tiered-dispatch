@@ -197,6 +197,13 @@ describe("spontaneous routing assessment", () => {
     expect(assessRouting(implementationTrace(), ["fast", "medium"], MODELS).problems).toEqual([])
   })
 
+  it("derives problem classes after legacy callers append objective checks", () => {
+    const report = assessRouting(trace("trivial", []), [], MODELS)
+    report.problems.push("trivial answer was incorrect")
+    expect(report.taskProblems).toContain("trivial answer was incorrect")
+    expect(report.policyProblems).not.toContain("trivial answer was incorrect")
+  })
+
   it("rejects dependent delegation that starts before the previous native call returns", () => {
     const discovery = delegation("discover", "fast", "fast-child", 1, "Validation belongs in src/controller.js.")
     const implementation = delegation("implement", "medium", "medium-child", 1, "Implemented.", {
@@ -258,6 +265,8 @@ describe("spontaneous routing assessment", () => {
   it("flags unknown commands exactly rather than applying a shell heuristic", () => {
     const report = assessRouting(knownScopeTrace({ command: "node --input-type=module -e \\\"console.log(1)\\\"" }), ["medium"], MODELS)
     expect(report.problems.some((problem) => problem.startsWith("unknown primary verification command:") && problem.includes("console.log(1)"))).toBe(true)
+    expect(report.policyProblems.some((problem) => problem.startsWith("unknown primary verification command:"))).toBe(true)
+    expect(report.taskProblems).not.toContain(expect.stringContaining("unknown primary verification command:"))
     expect(report.problems).toContain('expected exact fixture verification command was not observed: "node --test test/banner.test.js"')
   })
 
@@ -397,6 +406,20 @@ describe("spontaneous routing assessment", () => {
     expect(assessRouting(metadataModelDisagreement, ["medium"], MODELS).problems).toContain("session metadata for medium-child used an unexpected model or variant")
   })
 
+  it("fails closed when required root or child session inspection records an error", () => {
+    const rootInspectionFailure = knownScopeTrace()
+    rootInspectionFailure.sessions.find((entry) => entry.sessionID === "root").inspectionError = "session context inspection timed out"
+    const rootReport = assessRouting(rootInspectionFailure, ["medium"], MODELS)
+    expect(rootReport.problems).toContain("session root has inspectionError: session context inspection timed out")
+    expect(rootReport.evidenceProblems).toContain("session root has inspectionError: session context inspection timed out")
+
+    const childInspectionFailure = knownScopeTrace()
+    childInspectionFailure.sessions.find((entry) => entry.sessionID === "medium-child").inspectionError = "session inspection timed out"
+    const childReport = assessRouting(childInspectionFailure, ["medium"], MODELS)
+    expect(childReport.problems).toContain("session medium-child has inspectionError: session inspection timed out")
+    expect(childInspectionFailure.sessions.find((entry) => entry.sessionID === "medium-child").inspectionError).toBe("session inspection timed out")
+  })
+
   it("requires fresh and resumed calls to identify the returned child session", () => {
     const first = delegation("first", "medium", "medium-child", 1, "first", { completionSeq: 3 })
     const second = delegation("resume", "medium", "medium-child", 4, "second", { sessionID: "medium-child", completionSeq: 6 })
@@ -520,6 +543,9 @@ describe("routing result and observer seams", () => {
     expect(source).toContain("type: \"scenario-complete\"")
     expect(source).toContain("sessionGetWithTimeout")
     expect(source).toContain("sessionContextWithTimeout")
+    expect(source).toContain("nonzeroShellExitCount")
+    expect(source).toContain("toolErrorMetrics(scenarioTools, ctx.location.directory, root.id)")
+    expect(source).toContain("sessions: clone(inspectedSessions)")
     const directory = mkdtempSync(join(tmpdir(), "routing-observer-source-"))
     const filename = join(directory, "observer.mjs")
     try {
@@ -618,7 +644,14 @@ describe("routing result and observer seams", () => {
     try {
       seedRoutingFixture(workspace)
       writeFileSync(join(workspace, "src", "names", "validate.js"), "import { nameLimit } from '../settings.js'\nexport function validateName(name) { return { ok: name.length > 0 && name.length <= nameLimit, name, limit: nameLimit } }\n")
-      expect(checkFixture(workspace, "discover-implement", process.execPath, { verifierDirectory: control })).toEqual([])
+      const previousNpmExecPath = process.env.npm_execpath
+      process.env.npm_execpath = join(workspace, "arbitrary-npm-execpath.js")
+      try {
+        expect(checkFixture(workspace, "discover-implement", process.execPath, { verifierDirectory: control })).toEqual([])
+      } finally {
+        if (previousNpmExecPath === undefined) delete process.env.npm_execpath
+        else process.env.npm_execpath = previousNpmExecPath
+      }
       expect(existsSync(join(workspace, "routing-limit-loader.mjs"))).toBe(false)
     } finally {
       rmSync(workspace, { recursive: true, force: true })
