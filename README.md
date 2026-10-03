@@ -144,7 +144,12 @@ The primary session receives concise guidance to:
 3. split separable exploration and implementation phases;
 4. serialize overlapping edits;
 5. avoid automatic escalation and provider fallback;
-6. call the native `subagent` tool with a narrow description and complete prompt.
+6. call the native `subagent` tool with a self-contained prompt containing the
+   goal, relevant paths or boundaries when known, constraints, required
+   verification, and the exact result to return.
+7. omit per-call model overrides because each tier owns its validated model and
+   variant;
+8. integrate delegated results and remain responsible for the final answer.
 
 Tier agents do not receive this orchestration protocol. Their own `system`
 instructions and permissions remain focused on execution, so they cannot recurse
@@ -158,8 +163,13 @@ into another subagent call.
 - All tier agents deny the `subagent` action, preventing recursion.
 - Native OpenCode owns child-session creation, foreground waiting, cancellation,
   provider errors, metadata, and inspectability.
-- The plugin owns the routing context-hook and native tier-agent transform;
-  unloading it disposes both registrations.
+- The plugin owns the routing context-hook, native tier-agent transform, and
+  model-override guard; unloading it disposes all registrations.
+- Setup is transactional: if a later registration fails, earlier registrations
+  are rolled back; cleanup attempts every registration and reports failures.
+- Tier invocations must not pass a per-call `subagent.model` override. The
+  selected tier owns its validated model and variant; choose another tier when
+  a different capability level is needed.
 - There is no tier escalation or provider fallback.
 
 ## Troubleshooting
@@ -172,6 +182,9 @@ into another subagent call.
   `provider/model` from `/models`.
 - **A variant is unavailable:** remove the variant or use one listed for that
   exact model.
+- **A tier call is rejected:** remove the per-call `model` field from the native
+  `subagent` invocation and select `fast`, `medium`, or `heavy` according to
+  the required capability level.
 - **Fast can mutate files:** inspect the final `fast.permissions` rules; the
   broad deny must appear before the read-only allows, and no later rule may
   allow `edit`, `shell`, or `subagent`.

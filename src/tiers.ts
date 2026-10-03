@@ -4,6 +4,10 @@ export const TIER_NAMES = ["fast", "medium", "heavy"] as const
 
 export type TierName = (typeof TIER_NAMES)[number]
 
+export function isTierName(value: unknown): value is TierName {
+  return typeof value === "string" && (TIER_NAMES as readonly string[]).includes(value)
+}
+
 export interface RequiredTierModel {
   model: string
   variant?: string

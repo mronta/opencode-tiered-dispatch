@@ -21,11 +21,12 @@ export function buildRoutingProtocol(options: EnabledRouterOptions): string {
     `1. ${directRule}`,
     "2. Split separable work: collect context with fast, then implement with medium or reason with heavy.",
     "3. Do not choose heavy because a task is large; choose it for difficult judgment, high risk, or repeated failed debugging.",
-    "4. Give each delegation a narrow prompt and an explicit expected result.",
+    "4. Give each delegation a self-contained prompt with the goal, relevant paths or boundaries when known, constraints, required verification, and the exact result to return.",
     "5. Serialize medium/heavy delegations that may edit overlapping files. Parallelize only independent work.",
     "6. No tier escalates automatically. Inspect failures and decide what to do next.",
-    "7. You remain responsible for integrating delegated work and presenting the final answer.",
+    "7. Do not pass a per-call model override to a tier; its validated model and variant are owned by the tier. Choose a different tier when you need a different capability level.",
+    "8. You remain responsible for integrating delegated work and presenting the final answer.",
     "",
-    "Use the native `subagent` tool with agent `fast`, `medium`, or `heavy`; provide a short description and a complete delegated prompt.",
+    "Use the native `subagent` tool with agent `fast`, `medium`, or `heavy`; provide a short description and the self-contained delegated prompt described above.",
   ].join("\n")
 }

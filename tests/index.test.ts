@@ -8,24 +8,48 @@ const models = [
   { providerID: "openai", id: "gpt-5.6-sol", enabled: true, capabilities: { tools: true }, variants: [{ id: "medium" }] },
 ]
 
-const agents = [
-  { id: "fast", mode: "subagent" },
-  { id: "medium", mode: "subagent" },
-  { id: "heavy", mode: "subagent" },
-  { id: "build", mode: "primary", permissions: [] },
-  { id: "all", mode: "all", permissions: [] },
-]
+type ContextEvent = { sessionID: string; agent: string; tools: Record<string, unknown>; system: unknown[] }
+type ToolEvent = { tool: string; input: unknown }
 
-function makeContext(options: Record<string, unknown>): {
+interface FixtureFailures {
+  toolHook?: Error
+  contextHook?: Error
+  dispose?: Partial<Record<"agent" | "tool" | "context", Error>>
+}
+
+function makeContext(options: Record<string, unknown>, failures: FixtureFailures = {}): {
   context: Context
-  hookCallbacks: Array<(event: { sessionID: string; agent: string; tools: Record<string, unknown>; system: unknown[] }) => void | Promise<void>>
-  disposes: { hook: ReturnType<typeof vi.fn> }
+  agents: typeof agents
+  hookCallbacks: Array<(event: ContextEvent) => void | Promise<void>>
+  toolHookCallbacks: Array<(event: ToolEvent) => void | Promise<void>>
+  disposes: { agent: ReturnType<typeof vi.fn>; tool: ReturnType<typeof vi.fn>; context: ReturnType<typeof vi.fn> }
+  disposalOrder: string[]
   removedAgents: string[]
 } {
-  const hookCallbacks: Array<(event: { sessionID: string; agent: string; tools: Record<string, unknown>; system: unknown[] }) => void | Promise<void>> = []
+  const agents = [
+    { id: "fast", mode: "subagent" },
+    { id: "medium", mode: "subagent" },
+    { id: "heavy", mode: "subagent" },
+    { id: "build", mode: "primary", permissions: [] },
+    { id: "all", mode: "all", permissions: [] },
+  ]
+  const hookCallbacks: Array<(event: ContextEvent) => void | Promise<void>> = []
+  const toolHookCallbacks: Array<(event: ToolEvent) => void | Promise<void>> = []
   const removedAgents: string[] = []
+  const disposalOrder: string[] = []
   const disposes = {
-    hook: vi.fn(async () => undefined),
+    agent: vi.fn(async () => {
+      disposalOrder.push("agent")
+      if (failures.dispose?.agent) throw failures.dispose.agent
+    }),
+    tool: vi.fn(async () => {
+      disposalOrder.push("tool")
+      if (failures.dispose?.tool) throw failures.dispose.tool
+    }),
+    context: vi.fn(async () => {
+      disposalOrder.push("context")
+      if (failures.dispose?.context) throw failures.dispose.context
+    }),
   }
   const context = {
     options,
@@ -46,7 +70,18 @@ function makeContext(options: Record<string, unknown>): {
           },
           remove: (id: string) => removedAgents.push(id),
         })
-        return { dispose: vi.fn(async () => undefined) }
+        return { dispose: disposes.agent }
+      }),
+    },
+    tool: {
+      hook: vi.fn(async (
+        name: "execute.before",
+        callback: (event: ToolEvent) => void | Promise<void>,
+      ) => {
+        expect(name).toBe("execute.before")
+        if (failures.toolHook) throw failures.toolHook
+        toolHookCallbacks.push(callback)
+        return { dispose: disposes.tool }
       }),
     },
     session: {
@@ -56,15 +91,16 @@ function makeContext(options: Record<string, unknown>): {
       })),
       hook: vi.fn(async (
         name: "context",
-        callback: (event: { sessionID: string; agent: string; tools: Record<string, unknown>; system: unknown[] }) => void | Promise<void>,
+        callback: (event: ContextEvent) => void | Promise<void>,
       ) => {
         expect(name).toBe("context")
+        if (failures.contextHook) throw failures.contextHook
         hookCallbacks.push(callback)
-        return { dispose: disposes.hook }
+        return { dispose: disposes.context }
       }),
     },
   } as unknown as Context
-  return { context, hookCallbacks, disposes, removedAgents }
+  return { context, agents, hookCallbacks, toolHookCallbacks, disposes, disposalOrder, removedAgents }
 }
 
 const options = {
@@ -83,7 +119,7 @@ describe("plugin setup", () => {
 
     expect(fixture.hookCallbacks).toHaveLength(1)
     expect(fixture.context.agent.transform).toHaveBeenCalledOnce()
-    expect(agents[0]).toMatchObject({
+    expect(fixture.agents[0]).toMatchObject({
       description: "Focused read-only exploration and research",
       model: { providerID: "openai", id: "gpt-5.6-luna-fast" },
     })
@@ -108,7 +144,10 @@ describe("plugin setup", () => {
 
     expect(cleanup).toBeTypeOf("function")
     if (typeof cleanup === "function") await cleanup()
-    expect(fixture.disposes.hook).toHaveBeenCalledOnce()
+    expect(fixture.disposalOrder).toEqual(["context", "tool", "agent"])
+    expect(fixture.disposes.context).toHaveBeenCalledOnce()
+    expect(fixture.disposes.tool).toHaveBeenCalledOnce()
+    expect(fixture.disposes.agent).toHaveBeenCalledOnce()
   })
 
   it("does not inspect catalogs or register behavior when disabled", async () => {
@@ -123,6 +162,7 @@ describe("plugin setup", () => {
     expect(fixture.context.session.hook).not.toHaveBeenCalled()
     expect(fixture.removedAgents).toEqual(["fast", "medium", "heavy"])
     if (typeof cleanup === "function") await cleanup()
+    expect(fixture.disposalOrder).toEqual(["agent"])
   })
 
   it("applies optional tier instructions without injecting routing recursively", async () => {
@@ -151,5 +191,66 @@ describe("plugin setup", () => {
     await fixture.hookCallbacks[0]!(root)
 
     expect(root.system).toEqual([])
+  })
+
+  it("rejects per-call model overrides for packaged tier agents", async () => {
+    const fixture = makeContext(options)
+    await plugin.setup(fixture.context)
+
+    const guard = fixture.toolHookCallbacks[0]!
+    for (const agent of ["fast", "medium", "heavy"]) {
+      expect(() => guard({ tool: "subagent", input: { agent, model: "other/model" } }))
+        .toThrow(new RegExp(`Tier agent ${agent} owns its model configuration`))
+    }
+    expect(() => guard({ tool: "subagent", input: { agent: "fast" } })).not.toThrow()
+    expect(() => guard({ tool: "subagent", input: { agent: "custom", model: "other/model" } })).not.toThrow()
+  })
+
+  it("rolls back acquired registrations when tool-hook setup fails", async () => {
+    const fixture = makeContext(options, { toolHook: new Error("tool hook failed") })
+
+    await expect(plugin.setup(fixture.context)).rejects.toThrow("tool hook failed")
+    expect(fixture.disposalOrder).toEqual(["agent"])
+    expect(fixture.context.session.hook).not.toHaveBeenCalled()
+  })
+
+  it("rolls back acquired registrations when context-hook setup fails", async () => {
+    const fixture = makeContext(options, { contextHook: new Error("context hook failed") })
+
+    await expect(plugin.setup(fixture.context)).rejects.toThrow("context hook failed")
+    expect(fixture.disposalOrder).toEqual(["tool", "agent"])
+  })
+
+  it("preserves setup and rollback failures", async () => {
+    const fixture = makeContext(options, {
+      contextHook: new Error("context hook failed"),
+      dispose: { tool: new Error("tool cleanup failed") },
+    })
+
+    let failure: unknown
+    try {
+      await plugin.setup(fixture.context)
+    } catch (error) {
+      failure = error
+    }
+
+    expect(failure).toBeInstanceOf(AggregateError)
+    const errors = (failure as AggregateError).errors
+    expect(errors).toHaveLength(2)
+    expect(errors[0]).toBeInstanceOf(Error)
+    expect((errors[0] as Error).message).toBe("context hook failed")
+    expect(errors[1]).toBeInstanceOf(AggregateError)
+    expect((errors[1] as AggregateError).errors[0]).toBeInstanceOf(Error)
+    expect(((errors[1] as AggregateError).errors[0] as Error).message).toBe("tool cleanup failed")
+    expect(fixture.disposalOrder).toEqual(["tool", "agent"])
+  })
+
+  it("attempts every registration when cleanup fails", async () => {
+    const fixture = makeContext(options, { dispose: { context: new Error("context cleanup failed") } })
+    const cleanup = await plugin.setup(fixture.context)
+
+    if (typeof cleanup !== "function") throw new Error("test setup did not return cleanup")
+    await expect(cleanup()).rejects.toThrow("could not dispose every registration")
+    expect(fixture.disposalOrder).toEqual(["context", "tool", "agent"])
   })
 })
