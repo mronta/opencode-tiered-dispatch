@@ -12,7 +12,8 @@ const CHILD_GUARDS: readonly PermissionRule[] = [
   { action: "tiered_dispatch", resource: "*", effect: "deny" },
 ]
 
-const FAST_READ_ACTIONS = new Set(["grep", "glob", "webfetch", "websearch", "read"])
+const FAST_READ_ACTIONS = ["grep", "glob", "webfetch", "websearch", "read"] as const
+const FAST_READ_ACTION_SET = new Set<string>(FAST_READ_ACTIONS)
 
 const FAST_READ_ONLY_RULES: readonly PermissionRule[] = [
   { action: "*", resource: "*", effect: "deny" },
@@ -34,15 +35,22 @@ export function buildDelegatedPermissions(
   const callerRules = [...(callerAgentRules ?? []), ...(callerSessionRules ?? [])]
   if (tier !== "fast") return [...callerRules, ...CHILD_GUARDS]
 
-  // Session rules are last-match-wins. Keep caller denies and read-only asks
-  // after the fast baseline so it cannot weaken a caller restriction, while
-  // write-related caller asks/allows cannot grant mutation access.
+  // Session rules are last-match-wins. Start with a read-only baseline, then
+  // replay caller rules only for read-capable actions. Wildcard caller
+  // asks/denies are expanded instead of replayed as wildcards: a wildcard ask
+  // must not turn fast's deny-all mutation guard into an approval prompt.
   return [
-    ...callerRules,
     ...FAST_READ_ONLY_RULES,
-    ...callerRules.filter(
-      (rule) => rule.effect === "deny" || (rule.effect === "ask" && FAST_READ_ACTIONS.has(rule.action)),
-    ),
+    ...callerRules.flatMap((rule) => {
+      if (FAST_READ_ACTION_SET.has(rule.action)) return [rule]
+      if (rule.action === "*") {
+        if (rule.effect === "allow") return []
+        return FAST_READ_ACTIONS.map((action) => ({ ...rule, action }))
+      }
+      // A caller deny is compatible with fast's stronger read-only guard.
+      // A caller ask for a mutation must not weaken that guard into ask.
+      return rule.effect === "deny" ? [rule] : []
+    }),
     ...CHILD_GUARDS,
   ]
 }

@@ -152,11 +152,21 @@ provider-consuming checks are available when stronger verification is needed:
 
 ```bash
 npm run smoke:opencode:delegate          # real child session and result
+npm run smoke:opencode:tiers              # all three configured tiers
 npm run smoke:opencode:permissions       # fast read-only; medium/heavy edits
+npm run smoke:opencode:cancel             # cancellation interrupts an admitted child
+npm run smoke:opencode:unload             # unload interrupts an active child
+npm run smoke:opencode:reload             # dispose/reload with changed tier config
+npm run smoke:opencode:provider-error    # structured provider failure; no fallback
+npm run smoke:opencode:disabled          # enabled:false remains inert
 npm run smoke:opencode:packed:delegate  # activate the packed tarball itself
 npm run eval:routing                     # fast/medium/heavy/direct/split cases
 ```
 
 These checks consume provider usage and require credentials for the configured
-models. `eval:routing` is deliberately opt-in because model responses can vary;
-it fails if the observed choices do not match the expected routing taxonomy.
+models. They run the plugin inside a real OpenCode V2 server, verify the actual
+child model/agent/location/metadata, inspect child results, and use a temporary
+fixture for the routing cases. `eval:routing` runs each acceptance case in its
+own temporary server and fails if the observed choices do not match the
+expected routing taxonomy or if a child/root result was not successfully
+integrated.

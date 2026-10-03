@@ -22,11 +22,11 @@ type CapturedTool = {
 function makeContext(options: Record<string, unknown>): {
   context: Context
   addedTools: CapturedTool[]
-  hookCallbacks: Array<(event: { agent: string; tools: Record<string, unknown>; system: unknown[] }) => void>
+  hookCallbacks: Array<(event: { sessionID: string; agent: string; tools: Record<string, unknown>; system: unknown[] }) => void | Promise<void>>
   disposes: { tool: ReturnType<typeof vi.fn>; hook: ReturnType<typeof vi.fn> }
 } {
   const addedTools: CapturedTool[] = []
-  const hookCallbacks: Array<(event: { agent: string; tools: Record<string, unknown>; system: unknown[] }) => void> = []
+  const hookCallbacks: Array<(event: { sessionID: string; agent: string; tools: Record<string, unknown>; system: unknown[] }) => void | Promise<void>> = []
   const disposes = {
     tool: vi.fn(async () => undefined),
     hook: vi.fn(async () => undefined),
@@ -52,7 +52,7 @@ function makeContext(options: Record<string, unknown>): {
     session: {
       hook: vi.fn(async (
         name: "context",
-        callback: (event: { agent: string; tools: Record<string, unknown>; system: unknown[] }) => void,
+        callback: (event: { sessionID: string; agent: string; tools: Record<string, unknown>; system: unknown[] }) => void | Promise<void>,
       ) => {
         expect(name).toBe("context")
         hookCallbacks.push(callback)
@@ -88,11 +88,11 @@ describe("plugin setup", () => {
     expect(fixture.addedTools.map((tool) => tool.name)).toEqual(["tiered_dispatch"])
     expect(fixture.hookCallbacks).toHaveLength(1)
     const hook = fixture.hookCallbacks[0]!
-    const root = { agent: "build", tools: { tiered_dispatch: {} }, system: [] as unknown[] }
-    hook(root)
+    const root = { sessionID: "root", agent: "build", tools: { tiered_dispatch: {} }, system: [] as unknown[] }
+    await hook(root)
     expect(root.system).toHaveLength(1)
-    const child = { agent: "explore", tools: { tiered_dispatch: {} }, system: [] as unknown[] }
-    hook(child)
+    const child = { sessionID: "child", agent: "explore", tools: { tiered_dispatch: {} }, system: [] as unknown[] }
+    await hook(child)
     expect(child.tools).toEqual({})
     expect(child.system).toEqual([])
     expect(cleanup).toBeTypeOf("function")
@@ -111,6 +111,31 @@ describe("plugin setup", () => {
     expect(fixture.context.agent.list).not.toHaveBeenCalled()
     expect(fixture.context.tool.transform).not.toHaveBeenCalled()
     expect(fixture.context.session.hook).not.toHaveBeenCalled()
+  })
+
+  it("keeps metadata-owned sessions isolated even after an agent switch", async () => {
+    const fixture = makeContext({
+      tiers: {
+        fast: { model: "p/fast" },
+        medium: { model: "p/medium" },
+        heavy: { model: "p/heavy" },
+      },
+    })
+    vi.mocked(fixture.context.session.get).mockImplementation(async ({ sessionID }: { sessionID: string }) => (
+      sessionID === "owned"
+        ? { id: sessionID, location: { directory: "/workspace" }, metadata: { plugin: "tiered-dispatch" } }
+        : { id: sessionID, location: { directory: "/workspace" } }
+    ) as never)
+    const cleanup = await plugin.setup(fixture.context)
+    const hook = fixture.hookCallbacks[0]
+    if (!hook) throw new Error("context hook was not registered")
+    const owned = { sessionID: "owned", agent: "build", tools: { tiered_dispatch: {} }, system: [] as unknown[] }
+
+    await hook(owned)
+
+    expect(owned.tools).toEqual({})
+    expect(owned.system).toEqual([])
+    if (typeof cleanup === "function") await cleanup()
   })
 
   it("executes through the V2 runtime adapter with fast-tier restrictions", async () => {

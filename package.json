@@ -23,7 +23,13 @@
     "smoke:package": "node scripts/package-smoke.mjs",
     "smoke:opencode": "node scripts/opencode-smoke.mjs",
     "smoke:opencode:delegate": "node scripts/opencode-smoke.mjs --delegate",
+    "smoke:opencode:tiers": "node scripts/opencode-smoke.mjs --tiers",
     "smoke:opencode:permissions": "node scripts/opencode-smoke.mjs --delegate --permissions",
+    "smoke:opencode:cancel": "node scripts/opencode-smoke.mjs --cancel",
+    "smoke:opencode:unload": "node scripts/opencode-smoke.mjs --unload",
+    "smoke:opencode:reload": "node scripts/opencode-smoke.mjs --reload",
+    "smoke:opencode:provider-error": "node scripts/opencode-smoke.mjs --provider-error",
+    "smoke:opencode:disabled": "node scripts/opencode-smoke.mjs --disabled",
     "smoke:opencode:packed": "node scripts/opencode-smoke.mjs --packed",
     "smoke:opencode:packed:delegate": "node scripts/opencode-smoke.mjs --packed --delegate",
     "eval:routing": "node scripts/routing-evaluation.mjs"

@@ -40,4 +40,28 @@ describe("buildDelegatedPermissions", () => {
     expect(rules.findLastIndex((rule) => rule.action === "shell")).toBeLessThan(wildcardDeny)
     expect(rules[wildcardDeny]?.effect).toBe("deny")
   })
+
+  it("preserves wildcard caller asks for read actions without asking for mutations", () => {
+    const rules = buildDelegatedPermissions(
+      "fast",
+      [{ action: "*", resource: "*", effect: "ask" }],
+      [],
+    )
+    expect(rules.findLast((rule) => rule.action === "read")?.effect).toBe("ask")
+    expect(rules.findLast((rule) => rule.action === "edit")?.effect).toBeUndefined()
+    expect(rules.findLast((rule) => rule.action === "*")?.effect).toBe("deny")
+  })
+
+  it("keeps caller read exceptions while retaining fast secret-file prompts by default", () => {
+    const rules = buildDelegatedPermissions(
+      "fast",
+      [
+        { action: "read", resource: "*", effect: "deny" },
+        { action: "read", resource: "docs/*", effect: "allow" },
+      ],
+      [],
+    )
+    expect(rules.findLast((rule) => rule.resource === "docs/*")?.effect).toBe("allow")
+    expect(buildDelegatedPermissions("fast", [], []).findLast((rule) => rule.resource === "*.env")?.effect).toBe("ask")
+  })
 })

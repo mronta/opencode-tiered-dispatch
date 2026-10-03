@@ -22,6 +22,42 @@ describe("delegation result extraction", () => {
     }
   })
 
+  it("preserves failures recorded on compaction messages", () => {
+    const providerError = { type: "rate_limit", message: "compaction rate limited", status: 429 }
+    expect(() => assertSuccessfulOutcome("failed", [
+      { type: "assistant", content: [{ type: "text", text: "partial" }] },
+      { type: "compaction", status: "failed", error: providerError },
+      { type: "idle", outcome: "failed" },
+    ])).toThrow()
+    try {
+      assertSuccessfulOutcome("failed", [
+        { type: "compaction", status: "failed", error: providerError },
+      ])
+    } catch (error) {
+      expect(error).toBe(providerError)
+    }
+  })
+
+  it("preserves failures recorded on tool content", () => {
+    const providerError = { type: "provider_error", message: "tool request failed", status: 502 }
+    expect(() => assertSuccessfulOutcome("failed", [
+      {
+        type: "assistant",
+        content: [{ type: "tool", state: { status: "error", error: providerError } }],
+      },
+    ])).toThrow()
+    try {
+      assertSuccessfulOutcome("failed", [
+        {
+          type: "assistant",
+          content: [{ type: "tool", state: { status: "error", error: providerError } }],
+        },
+      ])
+    } catch (error) {
+      expect(error).toBe(providerError)
+    }
+  })
+
   it("rejects empty output", () => {
     expect(() => extractFinalText([{ type: "assistant", content: [] }])).toThrow(/without assistant text/)
   })

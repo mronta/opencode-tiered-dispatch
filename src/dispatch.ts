@@ -6,6 +6,8 @@ import { buildDelegatedPermissions, type PermissionRule } from "./permissions.js
 import { assertSuccessfulOutcome, extractFinalText } from "./result.js"
 import { DEFAULT_TIER_INSTRUCTIONS, TIER_AGENTS, type TierName } from "./tiers.js"
 
+const CLEANUP_DRAIN_TIMEOUT_MS = 1_000
+
 export interface DelegateInput {
   tier: TierName
   description: string
@@ -31,6 +33,7 @@ export interface SessionRecord {
   location: { directory: string }
   subpath?: string
   permissions?: readonly PermissionRule[]
+  metadata?: Readonly<Record<string, unknown>>
   outcome?: "succeeded" | "failed" | "interrupted"
 }
 
@@ -51,7 +54,7 @@ export interface DispatchRuntime {
     metadata: Readonly<Record<string, string | boolean>>
     permissions: readonly PermissionRule[]
   }): Promise<SessionRecord>
-  prompt(sessionID: string, text: string): Promise<void>
+  prompt(sessionID: string, text: string, signal: AbortSignal): Promise<void>
   wait(sessionID: string, signal: AbortSignal): Promise<void>
   context(sessionID: string): Promise<readonly { type: string }[]>
   interrupt(sessionID: string): Promise<void>
@@ -63,6 +66,7 @@ export interface Dispatcher {
     output: DelegateOutput
     metadata: Omit<DelegateOutput, "text">
   }>
+  isOwnedSession(sessionID: string): Promise<boolean>
   cleanup(): Promise<void>
 }
 
@@ -72,7 +76,10 @@ export function createDispatcher(
   subagentIDs: ReadonlySet<string>,
 ): Dispatcher {
   const inFlight = new Set<string>()
+  const ownedSessionIDs = new Set<string>()
+  const nonOwnedSessionIDs = new Set<string>()
   const activeOperations = new Set<Promise<unknown>>()
+  const cleanupFailures: unknown[] = []
   let closing = false
   let cleanupPromise: Promise<void> | undefined
 
@@ -129,35 +136,55 @@ export function createDispatcher(
       permissions,
     })
     inFlight.add(child.id)
+    ownedSessionIDs.add(child.id)
     log("delegation started", { tier: input.tier, model: tierOptions.model, sessionID: child.id })
 
-    let interruption: Promise<void> | undefined
+    let interruptionChain = Promise.resolve()
+    let primaryFailure: unknown
+    let interruptionFailureReported = false
     const interrupt = (): Promise<void> => {
-      interruption ??= runtime.interrupt(child.id).catch(() => undefined)
-      return interruption
+      const attempt = interruptionChain.then(async () => {
+        try {
+          await runtime.interrupt(child.id)
+        } catch (error) {
+          cleanupFailures.push(error)
+          throw error
+        }
+      })
+      interruptionChain = attempt.catch(() => undefined)
+      return attempt
+    }
+    const requestInterrupt = async (): Promise<void> => {
+      try {
+        await interrupt()
+      } catch (error) {
+        interruptionFailureReported = true
+        console.error(`[tiered-dispatch] failed to interrupt child ${child.id}`, { error })
+      }
     }
     const abort = (): void => {
-      void interrupt()
+      void interrupt().catch(() => undefined)
     }
     context.signal.addEventListener("abort", abort, { once: true })
     let finished = false
 
     try {
       if (closing || context.signal.aborted) {
-        await interrupt()
+        await requestInterrupt()
         throwIfAborted(context.signal)
         throw new DispatchError("Tiered Dispatch is unloading")
       }
 
-      await runtime.prompt(child.id, buildChildPrompt(input, tierOptions.instructions))
-      if (closing) {
-        await interrupt()
+      await runtime.prompt(child.id, buildChildPrompt(input, tierOptions.instructions), context.signal)
+      if (closing || context.signal.aborted) {
+        await requestInterrupt()
+        throwIfAborted(context.signal)
         throw new DispatchError("Tiered Dispatch is unloading")
       }
       await runtime.wait(child.id, context.signal)
       throwIfAborted(context.signal)
       if (closing) {
-        await interrupt()
+        await requestInterrupt()
         throw new DispatchError("Tiered Dispatch is unloading")
       }
 
@@ -165,6 +192,11 @@ export function createDispatcher(
         runtime.getSession(child.id),
         runtime.context(child.id),
       ])
+      throwIfAborted(context.signal)
+      if (closing) {
+        await requestInterrupt()
+        throw new DispatchError("Tiered Dispatch is unloading")
+      }
       assertSuccessfulOutcome(completed.outcome, messages)
       const text = extractFinalText(messages)
       const output: DelegateOutput = {
@@ -180,10 +212,39 @@ export function createDispatcher(
         output,
         metadata: { tier: output.tier, model: output.model, sessionID: output.sessionID },
       }
+    } catch (error) {
+      if (options.logging) console.error("[tiered-dispatch] delegation failed", {
+        error,
+        aborted: context.signal.aborted,
+        closing,
+        childID: child.id,
+      })
+      if (context.signal.aborted) {
+        try {
+          throwIfAborted(context.signal)
+        } catch (cancellation) {
+          primaryFailure = cancellation
+          throw cancellation
+        }
+      }
+      primaryFailure = error
+      throw error
     } finally {
       context.signal.removeEventListener("abort", abort)
-      if (!finished) await interrupt()
-      if (interruption) await interruption
+      if (!finished) {
+        try {
+          await interrupt()
+        } catch (error) {
+          if (primaryFailure === undefined) throw error
+          if (!interruptionFailureReported) {
+            console.error(`[tiered-dispatch] failed to interrupt child ${child.id}`, {
+              error,
+              cause: primaryFailure,
+            })
+          }
+        }
+      }
+      await interruptionChain
       inFlight.delete(child.id)
     }
   }
@@ -203,6 +264,18 @@ export function createDispatcher(
     return operation
   }
 
+  const isOwnedSession = async (sessionID: string): Promise<boolean> => {
+    if (ownedSessionIDs.has(sessionID)) return true
+    if (nonOwnedSessionIDs.has(sessionID)) return false
+    const session = await runtime.getSession(sessionID)
+    if (session.metadata?.plugin === "tiered-dispatch") {
+      ownedSessionIDs.add(sessionID)
+      return true
+    }
+    nonOwnedSessionIDs.add(sessionID)
+    return false
+  }
+
   const cleanup = (): Promise<void> => {
     if (cleanupPromise) return cleanupPromise
     cleanupPromise = (async () => {
@@ -210,15 +283,39 @@ export function createDispatcher(
       while (activeOperations.size > 0 || inFlight.size > 0) {
         const operations = [...activeOperations]
         const sessions = [...inFlight]
-        await Promise.allSettled(sessions.map((sessionID) => runtime.interrupt(sessionID)))
-        await Promise.allSettled(operations)
+        const interruptions = await Promise.allSettled(sessions.map((sessionID) => runtime.interrupt(sessionID)))
+        for (const interruption of interruptions) {
+          if (interruption.status === "rejected") cleanupFailures.push(interruption.reason)
+        }
+        const drained = await settleWithin(operations, CLEANUP_DRAIN_TIMEOUT_MS)
+        if (!drained) {
+          cleanupFailures.push(new DispatchError(
+            `Timed out while draining ${inFlight.size} tiered delegation session${inFlight.size === 1 ? "" : "s"}`,
+          ))
+          break
+        }
       }
       inFlight.clear()
+      if (cleanupFailures.length > 0) {
+        throw new AggregateError(cleanupFailures, "Tiered Dispatch could not interrupt every child session")
+      }
     })()
     return cleanupPromise
   }
 
-  return { execute, cleanup }
+  return { execute, isOwnedSession, cleanup }
+}
+
+async function settleWithin(promises: readonly Promise<unknown>[], timeoutMs: number): Promise<boolean> {
+  if (promises.length === 0) return true
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const drained = Promise.allSettled(promises).then(() => true)
+  const timedOut = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(false), timeoutMs)
+  })
+  const result = await Promise.race([drained, timedOut])
+  if (timer !== undefined) clearTimeout(timer)
+  return result
 }
 
 function validateInput(input: unknown): DelegateInput {

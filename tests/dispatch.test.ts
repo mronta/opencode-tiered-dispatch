@@ -142,6 +142,47 @@ describe("dispatcher", () => {
     await expect(execution).rejects.toThrow(/cancelled/)
   })
 
+  it("interrupts again after a cancelled prompt is admitted", async () => {
+    const runtime = makeRuntime()
+    const controller = new AbortController()
+    const promptGate = deferred<void>()
+    vi.mocked(runtime.prompt).mockReturnValue(promptGate.promise)
+    const dispatcher = createDispatcher(runtime, parsed, new Set(["explore", "general"]))
+
+    const execution = dispatcher.execute(
+      { tier: "medium", description: "Implement", prompt: "Implement" },
+      { ...toolContext(), signal: controller.signal },
+    )
+    await flushAsyncWork()
+    controller.abort(new DOMException("cancelled", "AbortError"))
+    await flushAsyncWork()
+    expect(runtime.interrupt).toHaveBeenCalledOnce()
+
+    promptGate.resolve()
+    await expect(execution).rejects.toThrow(/cancelled/)
+    expect(vi.mocked(runtime.interrupt).mock.calls.length).toBeGreaterThanOrEqual(2)
+  })
+
+  it("rejects when cancellation arrives while collecting the child result", async () => {
+    const runtime = makeRuntime()
+    const controller = new AbortController()
+    const contextGate = deferred<readonly { type: string }[]>()
+    vi.mocked(runtime.context).mockReturnValue(contextGate.promise)
+    const dispatcher = createDispatcher(runtime, parsed, new Set(["explore", "general"]))
+
+    const execution = dispatcher.execute(
+      { tier: "medium", description: "Inspect", prompt: "Inspect" },
+      { ...toolContext(), signal: controller.signal },
+    )
+    await flushAsyncWork()
+    expect(runtime.context).toHaveBeenCalledWith("ses_child")
+    controller.abort(new DOMException("cancelled", "AbortError"))
+    contextGate.resolve([{ type: "assistant" }])
+
+    await expect(execution).rejects.toThrow(/cancelled/)
+    expect(runtime.interrupt).toHaveBeenCalledWith("ses_child")
+  })
+
   it("interrupts a child when prompting fails", async () => {
     const runtime = makeRuntime()
     vi.mocked(runtime.prompt).mockRejectedValue(new Error("prompt failed"))
@@ -152,6 +193,42 @@ describe("dispatcher", () => {
       toolContext(),
     )).rejects.toThrow("prompt failed")
     expect(runtime.interrupt).toHaveBeenCalledWith("ses_child")
+  })
+
+  it("surfaces an interruption failure during unload", async () => {
+    const runtime = makeRuntime()
+    const waiting = deferred<void>()
+    vi.mocked(runtime.wait).mockReturnValue(waiting.promise)
+    vi.mocked(runtime.interrupt).mockImplementation(async () => {
+      waiting.resolve()
+      throw new Error("interrupt unavailable")
+    })
+    const dispatcher = createDispatcher(runtime, parsed, new Set(["explore", "general"]))
+
+    const execution = dispatcher.execute(
+      { tier: "heavy", description: "Analyze", prompt: "Analyze" },
+      toolContext(),
+    )
+    await flushAsyncWork()
+    const cleanup = dispatcher.cleanup()
+    await expect(execution).rejects.toThrow(/unloading/)
+    await expect(cleanup).rejects.toThrow(/could not interrupt/)
+  })
+
+  it("bounds cleanup when an interrupted child never settles", async () => {
+    const runtime = makeRuntime()
+    vi.mocked(runtime.wait).mockReturnValue(new Promise<void>(() => undefined))
+    vi.mocked(runtime.interrupt).mockRejectedValue(new Error("interrupt unavailable"))
+    const dispatcher = createDispatcher(runtime, parsed, new Set(["explore", "general"]))
+
+    void dispatcher.execute(
+      { tier: "heavy", description: "Hang", prompt: "Hang" },
+      toolContext(),
+    )
+    await flushAsyncWork()
+
+    await expect(dispatcher.cleanup()).rejects.toThrow(/could not interrupt/)
+    expect(runtime.interrupt).toHaveBeenCalled()
   })
 
   it("keeps concurrent tier results and child sessions isolated", async () => {
