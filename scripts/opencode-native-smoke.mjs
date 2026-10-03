@@ -89,12 +89,7 @@ function verifyMaterializedAgents(agents, expectedTiers) {
     if (!agent || agent.mode !== "subagent") {
       throw new Error(`native ${tier} was not materialized as a subagent: ${JSON.stringify(agent)}`)
     }
-    const separator = expected.model.indexOf("/")
-    if (
-      agent.model?.providerID !== expected.model.slice(0, separator)
-      || agent.model?.id !== expected.model.slice(separator + 1)
-      || normalizedVariant(agent.model?.variant, expected.variant) !== (expected.variant ?? undefined)
-    ) {
+    if (!matchesExpectedModel(agent.model, expected)) {
       throw new Error(`native ${tier} was materialized with the wrong model: ${JSON.stringify(agent)}`)
     }
   }
@@ -118,6 +113,14 @@ function nativeAgents(providerErrorModel) {
       system: "Return the requested result if possible. Do not delegate further.",
     },
   }
+}
+
+function matchesExpectedModel(actual, expected) {
+  if (!actual) return false
+  const configured = modelRef(expected)
+  return actual.providerID === configured.providerID
+    && actual.id === configured.id
+    && normalizedVariant(actual.variant, expected.variant) === (expected.variant ?? undefined)
 }
 
 function observerSource(resultPaths, selectedRootModel, configuredTiers, configuredProviderErrorModel) {
@@ -291,12 +294,7 @@ function verify(result, agents, workspace, configuredProviderErrorModel) {
     if (!child.model?.providerID || !child.model?.id) throw new Error(`native ${tier} child has no resolved model`)
     if (child.toolNames.includes("subagent")) throw new Error(`native ${tier} child can recurse`)
     const expected = result.expected[tier]
-    const expectedSeparator = expected.model.indexOf("/")
-    if (
-      child.model.providerID !== expected.model.slice(0, expectedSeparator)
-      || child.model.id !== expected.model.slice(expectedSeparator + 1)
-      || normalizedVariant(child.model.variant, expected.variant) !== (expected.variant ?? undefined)
-    ) {
+    if (!matchesExpectedModel(child.model, expected)) {
       throw new Error(`native ${tier} used the wrong model: ${JSON.stringify({ expected, actual: child.model })}`)
     }
     if (result.outputs[tier]?.childText !== `NATIVE_${tier.toUpperCase()}_OK`) {
@@ -308,11 +306,7 @@ function verify(result, agents, workspace, configuredProviderErrorModel) {
     }
     const agent = agents.find((candidate) => candidate.id === tier)
     if (!agent || agent.mode !== "subagent") throw new Error(`native ${tier} is not a subagent agent`)
-    if (
-      agent.model?.providerID !== expected.model.slice(0, expected.model.indexOf("/"))
-      || agent.model?.id !== expected.model.slice(expected.model.indexOf("/") + 1)
-      || normalizedVariant(agent.model?.variant, expected.variant) !== (expected.variant ?? undefined)
-    ) {
+    if (!matchesExpectedModel(agent.model, expected)) {
       throw new Error(`native ${tier} has the wrong configured model: ${JSON.stringify(agent)}`)
     }
     const permissions = agent.permissions ?? []
