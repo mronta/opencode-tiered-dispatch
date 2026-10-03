@@ -1,5 +1,5 @@
 import { ConfigurationError } from "./errors.js"
-import { REQUIRED_TIER_MODELS, TIER_NAMES, type TierName } from "./tiers.js"
+import { assertRequiredTierModel, TIER_NAMES, type TierName } from "./tiers.js"
 
 export interface ModelReference {
   providerID: string
@@ -74,13 +74,7 @@ function parseTier(value: unknown, tier: TierName, enforceRequiredModel = true):
     ? undefined
     : nonEmptyString(input.instructions, `${path}.instructions`)
   if (enforceRequiredModel) {
-    const required = REQUIRED_TIER_MODELS[tier]
-    if (model !== required.model || variant !== required.variant) {
-      const requiredReference = required.variant === undefined
-        ? required.model
-        : `${required.model}#${required.variant}`
-      throw new ConfigurationError(`${path} must use model ${requiredReference}`)
-    }
+    assertRequiredTierModel(tier, model, variant, path)
   }
   return {
     model,

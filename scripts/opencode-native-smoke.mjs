@@ -19,6 +19,7 @@ const tiers = {
   medium: tier("TIERED_DISPATCH_MEDIUM_MODEL", "TIERED_DISPATCH_MEDIUM_VARIANT"),
   heavy: tier("TIERED_DISPATCH_HEAVY_MODEL", "TIERED_DISPATCH_HEAVY_VARIANT"),
 }
+const providerErrorModel = "openai/__tiered_dispatch_missing_model__"
 const rootModel = modelRef(tiers.medium)
 const options = {
   enabled: true,
@@ -29,10 +30,10 @@ mkdirSync(join(workspace, ".opencode", "plugins"), { recursive: true })
 writeFileSync(join(workspace, "opencode.jsonc"), JSON.stringify({
   $schema: "https://opencode.ai/config.json",
   model: modelString(tiers.medium),
-  agents: nativeAgents(tiers),
+  agents: nativeAgents(tiers, providerErrorModel),
   plugins: [{ package: root, options }],
 }, null, 2) + "\n")
-writeFileSync(join(workspace, ".opencode", "plugins", "native-smoke-observer.js"), observerSource(paths, rootModel, tiers))
+writeFileSync(join(workspace, ".opencode", "plugins", "native-smoke-observer.js"), observerSource(paths, rootModel, tiers, providerErrorModel))
 
 const port = await freePort()
 const password = `native-smoke-${Date.now()}`
@@ -60,14 +61,15 @@ try {
     }
   }, 30_000, () => logs)
   await waitFor(() => existsSync(paths.marker) || existsSync(paths.failure), 180_000, () => logs)
-  if (existsSync(paths.failure)) throw new Error(readFileSync(paths.failure, "utf8"))
+  if (existsSync(paths.failure)) throw new Error(formatFailure(readFileSync(paths.failure, "utf8"), logs))
 
-  await waitFor(() => existsSync(paths.result), 600_000, () => logs)
+  await waitFor(() => existsSync(paths.result) || existsSync(paths.failure), 600_000, () => logs)
+  if (existsSync(paths.failure)) throw new Error(formatFailure(readFileSync(paths.failure, "utf8"), logs))
   const result = JSON.parse(readFileSync(paths.result, "utf8"))
   const agentResponse = await fetch(`http://127.0.0.1:${port}/api/agent`, { headers: { authorization } })
   if (!agentResponse.ok) throw new Error(`could not read native agent catalog: HTTP ${agentResponse.status}`)
   const agentPayload = await agentResponse.json()
-  verify(result, agentPayload.data ?? agentPayload)
+  verify(result, agentPayload.data ?? agentPayload, workspace, providerErrorModel)
   console.log(`OpenCode native-agent smoke passed: ${Object.keys(result.tiers).join(", ")}`)
 } finally {
   await stopProcess(child)
@@ -80,6 +82,10 @@ function tier(modelVariable, variantVariable) {
   if (!model) throw new Error(`${modelVariable} is required for the native-agent smoke test`)
   const variant = process.env[variantVariable]
   return variant ? { model, variant } : { model }
+}
+
+function formatFailure(failure, logs) {
+  return `${failure}\nOpenCode logs:\n${logs}`
 }
 
 function modelRef(config) {
@@ -95,7 +101,7 @@ function modelString(config) {
   return config.variant === undefined ? config.model : `${config.model}#${config.variant}`
 }
 
-function nativeAgents(configured) {
+function nativeAgents(configured, providerErrorModel) {
   return {
     fast: {
       mode: "subagent",
@@ -116,6 +122,13 @@ function nativeAgents(configured) {
       description: "Architecture, security, difficult debugging, and high-risk reasoning",
       model: modelString(configured.heavy),
       system: "Act as a senior architecture and difficult-debugging specialist. Analyze evidence carefully, state trade-offs, and give a concrete recommendation or requested implementation. Do not delegate further.",
+      permissions: implementationPermissions(),
+    },
+    "provider-error": {
+      mode: "subagent",
+      description: "Native provider-error smoke agent",
+      model: providerErrorModel,
+      system: "Return the requested result if possible. Do not delegate further.",
       permissions: implementationPermissions(),
     },
   }
@@ -148,7 +161,7 @@ function implementationPermissions() {
   ]
 }
 
-function observerSource(resultPaths, selectedRootModel, configuredTiers) {
+function observerSource(resultPaths, selectedRootModel, configuredTiers, configuredProviderErrorModel) {
   return [
     `import { writeFileSync } from "node:fs"`,
     `const markerPath = ${JSON.stringify(resultPaths.marker)}`,
@@ -156,6 +169,7 @@ function observerSource(resultPaths, selectedRootModel, configuredTiers) {
     `const failurePath = ${JSON.stringify(resultPaths.failure)}`,
     `const rootModel = ${JSON.stringify(selectedRootModel)}`,
     `const expectedTiers = ${JSON.stringify(configuredTiers)}`,
+    `const providerErrorModel = ${JSON.stringify(configuredProviderErrorModel)}`,
     `const tiers = ${JSON.stringify(["fast", "medium", "heavy"])}`,
     "",
     "function snapshot(event) {",
@@ -183,10 +197,15 @@ function observerSource(resultPaths, selectedRootModel, configuredTiers) {
     "    setImmediate(() => {",
     "      void (async () => {",
     "        try {",
+    "          const childPrompts = {",
+    "            fast: \"Use the native subagent tool exactly once. Select agent fast, set a short description, and ask it to return exactly NATIVE_FAST_OK without using tools. After it returns, reply exactly NATIVE_ROOT_FAST_OK. Do not call any other tools.\",",
+    "            medium: \"Use the native subagent tool exactly once. Select agent medium and ask it to use the patch tool exactly once to create native-smoke-medium.txt containing exactly MEDIUM_EDIT_OK, then return exactly NATIVE_MEDIUM_OK. After it returns, reply exactly NATIVE_ROOT_MEDIUM_OK. Do not call any other tools.\",",
+    "            heavy: \"Use the native subagent tool exactly once. Select agent heavy and ask it to use the shell tool exactly once to run printf HEAVY_SHELL_OK > native-smoke-heavy.txt, then return exactly NATIVE_HEAVY_OK. After it returns, reply exactly NATIVE_ROOT_HEAVY_OK. Do not call any other tools.\",",
+    "          }",
     "          const results = {}",
     "          for (const tier of tiers) {",
     "            const root = await ctx.session.create({ title: `[native smoke] ${tier}`, agent: \"build\", model: rootModel, location: { directory: ctx.location.directory } })",
-    "            await ctx.session.prompt({ sessionID: root.id, text: `Use the native subagent tool exactly once. Select agent ${tier}, set a short description, and ask it to return exactly NATIVE_${tier.toUpperCase()}_OK without using tools. After it returns, reply exactly NATIVE_ROOT_${tier.toUpperCase()}_OK. Do not call any other tools.` })",
+    "            await ctx.session.prompt({ sessionID: root.id, text: childPrompts[tier] })",
     "            await ctx.session.wait({ sessionID: root.id })",
     "            results[tier] = root.id",
     "          }",
@@ -198,9 +217,10 @@ function observerSource(resultPaths, selectedRootModel, configuredTiers) {
     "            const rootMessages = await ctx.session.context({ sessionID: results[tier] })",
     "            outputs[tier] = { childSessionID: child?.sessionID, childText: messageText(childMessages), rootText: messageText(rootMessages) }",
     "          }",
+    "          await exerciseNativeTools(ctx, events)",
     "          const delegationEvents = events.slice()",
-    "          const lifecycle = await exerciseNativeLifecycle(ctx, tiers.fast, events)",
-    "          writeFileSync(resultPath, JSON.stringify({ expected: expectedTiers, tiers: results, outputs, lifecycle, delegationEvents, events }))",
+    "          const lifecycle = await exerciseNativeLifecycle(ctx, events)",
+    "          writeFileSync(resultPath, JSON.stringify({ expected: expectedTiers, expectedProviderErrorModel: providerErrorModel, tiers: results, outputs, lifecycle, delegationEvents, events }))",
     "        } catch (error) {",
     "          writeFileSync(failurePath, JSON.stringify({ message: error?.message ?? String(error), stack: error?.stack, events }))",
     "        }",
@@ -209,33 +229,90 @@ function observerSource(resultPaths, selectedRootModel, configuredTiers) {
     "  },",
     "}",
     "",
-    "async function exerciseNativeLifecycle(ctx, fastModel, events) {",
-    "  const cancellation = await ctx.session.create({ title: \"[native smoke] cancellation\", agent: \"fast\", model: fastModel, location: { directory: ctx.location.directory } })",
-    "  let cancellationError",
-    "  const cancellationPrompt = ctx.session.prompt({ sessionID: cancellation.id, text: \"Think through a long, detailed research answer. Do not finish quickly.\" }).catch((error) => { cancellationError = String(error) })",
-    "  await new Promise((resolve) => setTimeout(resolve, 50))",
-    "  await ctx.session.interrupt({ sessionID: cancellation.id, resume: false })",
-    "  await Promise.race([cancellationPrompt, new Promise((resolve) => setTimeout(resolve, 30_000))])",
-    "  const cancellationInfo = await ctx.session.get({ sessionID: cancellation.id })",
-    "  const providerFailure = {}",
-    "  try {",
-    "    const invalid = await ctx.session.create({ title: \"[native smoke] provider error\", agent: \"build\", model: { providerID: \"openai\", id: \"__tiered_dispatch_missing_model__\" }, location: { directory: ctx.location.directory } })",
-    "    await ctx.session.prompt({ sessionID: invalid.id, text: \"Return exactly PROVIDER_ERROR_SHOULD_NOT_SUCCEED.\" })",
-    "    await ctx.session.wait({ sessionID: invalid.id })",
-    "    providerFailure.outcome = (await ctx.session.get({ sessionID: invalid.id })).outcome",
-    "  } catch (error) {",
-    "    providerFailure.error = String(error)",
+    "async function exerciseNativeTools(ctx, events) {",
+    "  const checks = {",
+    "    medium: \"Tool-access test: your response is invalid unless you call the patch tool now. Apply this exact patch before saying anything: *** Begin Patch\\n*** Add File: native-smoke-medium.txt\\n+MEDIUM_EDIT_OK\\n*** End Patch. After the patch succeeds, reply exactly TOOL_CHECK_MEDIUM_OK.\",",
+    "    heavy: \"Tool-access test: your response is invalid unless you call the shell tool now. Run exactly this command before saying anything: printf HEAVY_SHELL_OK > native-smoke-heavy.txt. After the command succeeds, reply exactly TOOL_CHECK_HEAVY_OK.\",",
     "  }",
-    "  return { cancellation: { outcome: cancellationInfo.outcome, error: cancellationError }, providerFailure, lifecycleEventCount: events.length }",
+    "  for (const [agent, text] of Object.entries(checks)) {",
+    "    const child = [...events].reverse().find((event) => event.agent === agent)",
+    "    if (!child) throw new Error(`native smoke did not observe ${agent} child for tool check`)",
+    "    await ctx.session.prompt({ sessionID: child.sessionID, text })",
+    "    await ctx.session.wait({ sessionID: child.sessionID })",
+    "  }",
+    "}",
+    "",
+    "async function exerciseNativeLifecycle(ctx, events) {",
+    "  const cancellationStart = events.length",
+    "  const cancellationRoot = await ctx.session.create({ title: \"[native smoke] cancellation\", agent: \"build\", model: rootModel, location: { directory: ctx.location.directory } })",
+    "  let cancellationError",
+    "  const cancellationPrompt = ctx.session.prompt({ sessionID: cancellationRoot.id, text: \"Use the native subagent tool exactly once. Select agent fast and ask it to spend a long time producing a detailed research answer. Do not answer until the child returns.\" }).catch((error) => { cancellationError = String(error) })",
+    "  const cancellationChild = await waitForAgentEvent(events, cancellationStart, \"fast\")",
+    "  const cancellationInterrupt = await withTimeout(ctx.session.interrupt({ sessionID: cancellationRoot.id, resume: false }), 30_000)",
+    "  await withTimeout(cancellationPrompt, 30_000)",
+    "  const cancellationRootInfo = await waitForOutcome(ctx, cancellationRoot.id, \"interrupted\", 30_000)",
+    "  const cancellationChildInfo = await waitForOutcome(ctx, cancellationChild.sessionID, \"interrupted\", 30_000)",
+    "  const providerStart = events.length",
+    "  const providerRoot = await ctx.session.create({ title: \"[native smoke] provider error\", agent: \"build\", model: rootModel, location: { directory: ctx.location.directory } })",
+    "  let providerPromptError",
+    "  const providerPrompt = ctx.session.prompt({ sessionID: providerRoot.id, text: \"Use the native subagent tool exactly once. Select agent provider-error and ask it to return exactly PROVIDER_ERROR_SHOULD_NOT_SUCCEED. Do not select another agent or retry with another model.\" }).catch((error) => { providerPromptError = String(error) })",
+    "  await withTimeout(providerPrompt, 30_000)",
+    "  const providerRootInfo = await waitForCompletion(ctx, providerRoot.id, 30_000)",
+    "  const fallbackEvents = events.slice(providerStart).filter((event) => [\"fast\", \"medium\", \"heavy\"].includes(event.agent))",
+    "  const providerMessages = await ctx.session.context({ sessionID: providerRoot.id })",
+    "  const providerToolErrors = failedSubagentErrors(providerMessages)",
+    "  return {",
+    "    cancellation: { rootSessionID: cancellationRoot.id, childSessionID: cancellationChild.sessionID, interrupt: cancellationInterrupt, rootOutcome: cancellationRootInfo.outcome, childOutcome: cancellationChildInfo.outcome, error: cancellationError },",
+    "    providerFailure: { rootSessionID: providerRoot.id, rootOutcome: providerRootInfo.outcome, error: providerPromptError ?? messageErrors(providerMessages), toolErrors: providerToolErrors, fallbackEvents },",
+    "  }",
+    "}",
+    "",
+    "async function waitForAgentEvent(events, start, agent) {",
+    "  return poll(() => events.slice(start).find((candidate) => candidate.agent === agent), Boolean, 30_000, `native smoke did not observe agent ${agent}`)",
+    "}",
+    "",
+    "async function waitForOutcome(ctx, sessionID, expected, timeout) {",
+    "  return poll(() => ctx.session.get({ sessionID }), (session) => session.outcome === expected, timeout, `session ${sessionID} did not reach outcome ${expected}`)",
+    "}",
+    "",
+    "async function waitForCompletion(ctx, sessionID, timeout) {",
+    "  return poll(() => ctx.session.get({ sessionID }), (session) => Boolean(session.outcome), timeout, `session ${sessionID} did not complete`)",
+    "}",
+    "",
+    "async function poll(read, matches, timeout, failureMessage) {",
+    "  const deadline = Date.now() + timeout",
+    "  let latest",
+    "  while (Date.now() < deadline) {",
+    "    latest = await read()",
+    "    if (matches(latest)) return latest",
+    "    await new Promise((resolve) => setTimeout(resolve, 100))",
+    "  }",
+    "  throw new Error(`${failureMessage}: ${JSON.stringify(latest)}`)",
+    "}",
+    "",
+    "async function withTimeout(promise, timeout) {",
+    "  return Promise.race([promise, new Promise((_, reject) => setTimeout(() => reject(new Error(\"native smoke operation timed out\")), timeout))])",
+    "}",
+    "",
+    "function messageErrors(messages) {",
+    "  return messages.flatMap((message) => [message.error, message.retry?.error, ...(message.content ?? []).flatMap((part) => [part.error, part.state?.error])]).filter(Boolean).map((error) => String(error.message ?? error)).join(\"\\n\")",
+    "}",
+    "",
+    "function failedSubagentErrors(messages) {",
+    "  return messages.flatMap((message) => (message.content ?? []).filter((part) => part.type === \"tool\" && part.name === \"subagent\" && part.state?.status === \"error\").map((part) => part.state.error)).filter(Boolean)",
     "}",
   ].join("\n")
 }
 
-function verify(result, agents) {
+function verify(result, agents, workspace, configuredProviderErrorModel) {
+  const fileChecks = {
+    medium: { path: join(workspace, "native-smoke-medium.txt"), content: "MEDIUM_EDIT_OK\n", action: "edit" },
+    heavy: { path: join(workspace, "native-smoke-heavy.txt"), content: "HEAVY_SHELL_OK", action: "run a shell command" },
+  }
   for (const tier of ["fast", "medium", "heavy"]) {
     const events = result.delegationEvents.filter((event) => event.agent === tier)
     if (events.length === 0) throw new Error(`native ${tier} agent was never invoked: ${JSON.stringify(result)}`)
-    if (events.length !== 1 || new Set(events.map((event) => event.sessionID)).size !== 1) {
+    if (new Set(events.map((event) => event.sessionID)).size !== 1) {
       throw new Error(`native ${tier} was invoked more than once: ${JSON.stringify(events)}`)
     }
     const child = events.at(-1)
@@ -257,7 +334,10 @@ function verify(result, agents) {
     if (result.outputs[tier]?.rootText !== `NATIVE_ROOT_${tier.toUpperCase()}_OK`) {
       throw new Error(`native ${tier} returned the wrong primary result: ${JSON.stringify(result.outputs[tier])}`)
     }
-
+    const fileCheck = fileChecks[tier]
+    if (fileCheck && (!existsSync(fileCheck.path) || readFileSync(fileCheck.path, "utf8") !== fileCheck.content)) {
+      throw new Error(`native ${tier} could not ${fileCheck.action}: ${JSON.stringify(result.outputs[tier])}`)
+    }
     const agent = agents.find((candidate) => candidate.id === tier)
     if (!agent || agent.mode !== "subagent") throw new Error(`native ${tier} is not a subagent agent`)
     if (
@@ -305,10 +385,29 @@ function verify(result, agents) {
   const primary = result.events.find((event) => event.agent === "build" && event.hasProtocol)
   if (!primary) throw new Error(`primary routing protocol was not observed: ${JSON.stringify(result.events)}`)
   if (!primary.toolNames.includes("subagent")) throw new Error("primary session did not expose the native subagent tool")
-  if (result.lifecycle?.cancellation?.outcome !== "interrupted") {
+  if (
+    result.lifecycle?.cancellation?.interrupt?.interrupted !== true
+    || result.lifecycle?.cancellation?.rootOutcome !== "interrupted"
+    || result.lifecycle?.cancellation?.childOutcome !== "interrupted"
+  ) {
     throw new Error(`native cancellation was not preserved: ${JSON.stringify(result.lifecycle)}`)
   }
-  if (result.lifecycle?.providerFailure?.outcome !== "failed" && !result.lifecycle?.providerFailure?.error) {
+  const providerExpected = modelRef({ model: configuredProviderErrorModel })
+  const providerAgent = agents.find((candidate) => candidate.id === "provider-error")
+  const providerFailure = result.lifecycle?.providerFailure
+  if (
+    result.expectedProviderErrorModel !== configuredProviderErrorModel
+    || !["succeeded", "failed"].includes(providerFailure?.rootOutcome)
+    || providerAgent?.mode !== "subagent"
+    || providerAgent.model?.providerID !== providerExpected.providerID
+    || providerAgent.model?.id !== providerExpected.id
+    || !providerFailure.error
+    || !providerFailure.error.includes(configuredProviderErrorModel)
+    || !Array.isArray(providerFailure.toolErrors)
+    || providerFailure.toolErrors.length === 0
+    || !providerFailure.toolErrors.some((error) => String(error?.message ?? error).includes(configuredProviderErrorModel))
+    || providerFailure.fallbackEvents?.length !== 0
+  ) {
     throw new Error(`native provider failure was not surfaced: ${JSON.stringify(result.lifecycle)}`)
   }
 }

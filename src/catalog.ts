@@ -1,6 +1,6 @@
 import { ConfigurationError } from "./errors.js"
 import type { EnabledRouterOptions, TierOptions } from "./options.js"
-import { REQUIRED_TIER_MODELS, TIER_NAMES, type TierName } from "./tiers.js"
+import { assertRequiredTierModel, TIER_NAMES, type TierName } from "./tiers.js"
 
 const FAST_READ_ACTIONS = new Set(["grep", "glob", "webfetch", "websearch", "read"])
 const IMPLEMENTATION_ACTIONS = ["edit", "write", "shell"] as const
@@ -25,18 +25,8 @@ export function assertModelsAvailable(
   models: readonly ModelCatalogEntry[],
 ): void {
   for (const tier of TIER_NAMES) {
-    assertRequiredTierModel(tier, options.tiers[tier])
+    assertRequiredTierModel(tier, options.tiers[tier].model, options.tiers[tier].variant)
     assertModelAvailable(tier, options.tiers[tier], models)
-  }
-}
-
-function assertRequiredTierModel(tier: TierName, configured: TierOptions): void {
-  const required = REQUIRED_TIER_MODELS[tier]
-  if (configured.model !== required.model || configured.variant !== required.variant) {
-    const requiredReference = required.variant === undefined
-      ? required.model
-      : `${required.model}#${required.variant}`
-    throw new ConfigurationError(`options.tiers.${tier} must use model ${requiredReference}`)
   }
 }
 
