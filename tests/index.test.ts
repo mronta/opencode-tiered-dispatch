@@ -27,9 +27,6 @@ function makeContext(options: Record<string, unknown>, failures: FixtureFailures
   removedAgents: string[]
 } {
   const agents = [
-    { id: "fast", mode: "subagent" },
-    { id: "medium", mode: "subagent" },
-    { id: "heavy", mode: "subagent" },
     { id: "build", mode: "primary", permissions: [] },
     { id: "all", mode: "all", permissions: [] },
   ]
@@ -64,8 +61,8 @@ function makeContext(options: Record<string, unknown>, failures: FixtureFailures
           get: (id: string) => agents.find((agent) => agent.id === id),
           default: () => undefined,
           update: (id: string, update: (agent: any) => void) => {
-            const agent = agents.find((candidate) => candidate.id === id)
-            if (!agent) throw new Error(`missing agent ${id}`)
+            const agent = agents.find((candidate) => candidate.id === id) ?? { id, mode: "primary", permissions: [] }
+            if (!agents.includes(agent)) agents.push(agent)
             update(agent)
           },
           remove: (id: string) => removedAgents.push(id),
@@ -119,7 +116,8 @@ describe("plugin setup", () => {
 
     expect(fixture.hookCallbacks).toHaveLength(1)
     expect(fixture.context.agent.transform).toHaveBeenCalledOnce()
-    expect(fixture.agents[0]).toMatchObject({
+    expect(fixture.agents.find((agent) => agent.id === "fast")).toMatchObject({
+      mode: "subagent",
       description: "Focused read-only exploration and research",
       model: { providerID: "openai", id: "gpt-5.6-luna-fast" },
     })

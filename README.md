@@ -15,22 +15,24 @@ agent file, fallback chain, or persistent routing state.
 
 ## Requirements
 
-- OpenCode V2 `2.0.18` with `@opencode/plugin` `2.0.18`;
+- OpenCode V2 `2.0.19` with `@opencode/plugin` `2.0.18` (the tested
+  host/API combination);
 - the native V2 `subagent` tool;
 - one enabled, tool-capable model for each tier;
-- three project or global V2 agent definitions named `fast`, `medium`, and `heavy`.
+- a plugin entry in the project or global OpenCode configuration.
 
-V2 plugins can update and remove agents, but the `2.0.18` plugin API cannot add
-new agents. The three definitions therefore belong in `opencode.jsonc`; the
-plugin supplies the routing protocol and validates the required model mapping,
-permissions, and agent modes.
+The V2 `AgentEditor` exposes `update` rather than `add`. On the tested
+OpenCode `2.0.19` host, updating a missing agent materializes it, so the plugin
+owns the complete tier-agent definitions without configuration stubs. Hosts
+that do not provide this upsert behavior should use the compatibility fallback
+described below.
 
 ## Quick start
 
 1. Build or install the plugin.
 2. Authenticate providers with `/connect`.
 3. Confirm the required model IDs and variants are available in `/models`.
-4. Add the plugin and three minimal native tier-agent stubs to `opencode.jsonc`.
+4. Add the plugin to `opencode.jsonc`.
 5. Restart OpenCode and start a new session.
 6. Ask the primary agent to delegate a small task and verify that the child is
    shown as `fast`, `medium`, or `heavy` rather than as `explore` or `general`.
@@ -45,16 +47,11 @@ npm install
 npm run build
 ```
 
-Then configure the package directory and the three native agent stubs:
+Then configure the package directory:
 
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
-  "agents": {
-    "fast": { "mode": "subagent" },
-    "medium": { "mode": "subagent" },
-    "heavy": { "mode": "subagent" }
-  },
   "plugins": [
     { "package": "/home/me/Workspace/opencode-tiered-dispatch" }
   ]
@@ -63,9 +60,9 @@ Then configure the package directory and the three native agent stubs:
 
 The checkout is a local plugin directory. Its root `index.js` is the required
 OpenCode directory entrypoint and re-exports compiled `dist/`; do not point
-`package` at `dist/index.js`.
-The plugin fills the three stubs with their model, system instructions,
-descriptions, and permission policies at runtime.
+`package` at `dist/index.js`. The plugin materializes and configures the three
+tier agents with their model, system instructions, descriptions, and
+permission policies at runtime.
 
 The plugin's default OpenAI mapping is:
 
@@ -87,8 +84,8 @@ For a published package:
 opencode plugin add opencode-tiered-dispatch
 ```
 
-Use `"package": "opencode-tiered-dispatch"` in the same plugin object and
-keep only the three native agent stubs. For a local package archive, use the
+Use `"package": "opencode-tiered-dispatch"` in the same plugin object. For a
+local package archive, use the
 archive or installed package directory as the `package` value. Credentials and
 provider subscriptions are never bundled.
 
@@ -130,10 +127,9 @@ required mapping.
 Custom taxonomy entries extend the defaults and are deduplicated
 case-insensitively. Unknown fields are rejected. With `enabled: false`, the
 plugin removes the reserved tier agents through the runtime transform and does
-not inject routing guidance or validate model availability. The reserved agent
-entries remain in `opencode.jsonc` so re-enabling restores them. If the plugin
-entry itself is removed, also remove the three reserved agent entries: a plugin
-that is no longer loaded cannot transform them away.
+not inject routing guidance or validate model availability. If the plugin entry
+itself is removed, its transform is disposed and the generated tier agents
+disappear; no generated agent files or persistent router state remain.
 
 ## Routing protocol
 
@@ -176,8 +172,18 @@ into another subagent call.
 
 - **The plugin is inactive:** run `opencode api get /api/plugin` and check that
   `tiered-dispatch` is `active`. Restart after changing configuration.
-- **A tier is missing:** define `fast`, `medium`, and `heavy` with
-  `mode: "subagent"` in the same project/global configuration.
+- **A tier is missing:** restart OpenCode and verify that the host provides the
+  tested `2.0.19` behavior where `agent.update` creates missing entries. On an
+  older host whose agent transform only updates existing entries, add these
+  temporary compatibility stubs and restart:
+
+  ```jsonc
+  "agents": {
+    "fast": { "mode": "subagent" },
+    "medium": { "mode": "subagent" },
+    "heavy": { "mode": "subagent" }
+  }
+  ```
 - **A model is unavailable:** authenticate with `/connect` and copy the exact
   `provider/model` from `/models`.
 - **A variant is unavailable:** remove the variant or use one listed for that
@@ -201,11 +207,12 @@ npm pack --dry-run
 npm run smoke:package
 ```
 
-The real OpenCode smoke uses the standard `opencode.jsonc` package entry. It
-starts a primary session and verifies native foreground calls to all three
-agents, their resolved models, the primary routing protocol, and the absence of
-that protocol from tier children. It also verifies native cancellation and
-provider-error outcomes without fallback:
+The real OpenCode smoke uses the standard `opencode.jsonc` package entry with no
+tier-agent stubs. It starts a primary session and verifies that the plugin
+materializes the three native agents, then exercises foreground calls to all
+three agents, their resolved models, the primary routing protocol, and the
+absence of that protocol from tier children. It also verifies native
+cancellation and provider-error outcomes without fallback:
 
 ```bash
 npm run smoke:opencode
@@ -225,6 +232,5 @@ opencode plugin remove opencode-tiered-dispatch
 ```
 
 For a local checkout, rebuild after pulling updates and restart OpenCode. Remove
-the plugin object and the three reserved native agent entries from
-`opencode.jsonc` to remove the complete routing setup. No generated files or
-persistent router state remain.
+the plugin object from `opencode.jsonc` to remove the complete routing setup. No
+generated agent files or persistent router state remain.

@@ -48,6 +48,7 @@ export default Plugin.define({
           const definition = TIER_AGENT_DEFINITIONS[tier]
           const configured = options.tiers[tier]
           editor.update(tier, (agent) => {
+            agent.mode = "subagent"
             agent.description = definition.description
             agent.system = definition.system
             agent.model = {

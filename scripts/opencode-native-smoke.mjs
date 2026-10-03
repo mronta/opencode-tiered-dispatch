@@ -91,15 +91,6 @@ function modelRef(config) {
 
 function nativeAgents(providerErrorModel) {
   return {
-    fast: {
-      mode: "subagent",
-    },
-    medium: {
-      mode: "subagent",
-    },
-    heavy: {
-      mode: "subagent",
-    },
     "provider-error": {
       mode: "subagent",
       description: "Native provider-error smoke agent",
