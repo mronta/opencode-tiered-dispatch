@@ -18,6 +18,38 @@ persist routing state, switch presets, or fall back silently to another model.
 - the built-in `explore` and `general` subagent agents;
 - one available, tool-capable model for each configured tier.
 
+## Quick start: activate the plugin
+
+The plugin is activated by adding it to the OpenCode configuration for the
+project you want to use it in. The reliable setup sequence is:
+
+1. **Build or install the plugin.** For a local checkout:
+
+   ```bash
+   cd /home/me/Workspace/opencode-tiered-dispatch
+   npm install
+   npm run build
+   ```
+
+2. **Authenticate the model providers.** Start OpenCode in the target project,
+   run `/connect`, and complete the provider login or API-key setup.
+
+3. **Find exact model and variant IDs.** Run `/models` in OpenCode. Copy the
+   IDs exactly as displayed; model references use `provider/model`. A variant is
+   optional and should only be configured when `/models` lists that variant.
+
+4. **Add the plugin configuration.** For one project, edit that project's
+   `opencode.jsonc`. For a global configuration, use the config path printed by
+   `opencode debug paths config`.
+
+5. **Restart OpenCode.** The plugin validates the catalog and registers
+   `tiered_dispatch` when it loads. A missing model, variant, or required agent
+   is reported during startup rather than silently replaced.
+
+6. **Verify activation.** Start a new session and confirm that the primary
+   agent can use the `tiered_dispatch` tool. For a stronger provider-consuming
+   check, use the live smoke commands in [Development](#development).
+
 ## Install from a local checkout
 
 Build the package first:
@@ -36,18 +68,16 @@ Then add it to `opencode.jsonc`:
     {
       "package": "/home/me/Workspace/opencode-tiered-dispatch",
       "options": {
+        "enabled": true,
         "tiers": {
           "fast": {
-            "model": "opencode/gpt-6-luna",
-            "variant": "low"
+            "model": "provider/model-fast"
           },
           "medium": {
-            "model": "opencode/gpt-5.6-luna",
-            "variant": "medium"
+            "model": "provider/model-medium"
           },
           "heavy": {
-            "model": "opencode/gpt-5.6-sol",
-            "variant": "high"
+            "model": "provider/model-heavy"
           }
         }
       }
@@ -56,10 +86,10 @@ Then add it to `opencode.jsonc`:
 }
 ```
 
-Model IDs and variants are workstation-specific. Check the active catalog with
-`opencode api get /api/model` and replace the examples when necessary. Authenticate
-each required provider through the normal OpenCode provider setup on every
-workstation; credentials and subscriptions are not bundled with this package.
+Model IDs and variants are workstation-specific. Use `/connect` to authenticate
+each required provider and `/models` to inspect the active catalog. Replace the
+placeholder references before starting a session; credentials and subscriptions
+are not bundled with this package.
 
 For an npm installation, publish or pack this project and use the resulting
 package name in the plugin entry. The package exports compiled `dist/` output.
@@ -72,12 +102,29 @@ configuration entry:
 opencode plugin add opencode-tiered-dispatch
 ```
 
+Then set `package` to `opencode-tiered-dispatch` in the plugin entry and restart
+OpenCode. The same `options.tiers` configuration applies to local and published
+installations.
+
 For a project-local installation, keep the plugin entry in that project's
 `opencode.jsonc` and point `package` at the installed package or checkout.
 Set `"enabled": false` to keep the package configured but inactive, or remove
 the entry to unload it completely. Update a global installation with
 `opencode plugin update opencode-tiered-dispatch`; remove it with
 `opencode plugin remove opencode-tiered-dispatch`.
+
+### Activation troubleshooting
+
+- **Model unavailable:** authenticate the provider with `/connect`, then copy
+  the exact model ID from `/models`. The plugin requires all three configured
+  models to be enabled and tool-capable.
+- **Variant unavailable:** remove `variant` to use the model default, or use a
+  variant listed for that exact model in `/models`.
+- **Missing agent:** this release requires OpenCode's built-in `explore` and
+  `general` subagents.
+- **No visible change:** verify that the plugin entry is in the configuration
+  for the project you opened, that `enabled` is not `false`, and restart
+  OpenCode after editing the file.
 
 ## Configuration
 
