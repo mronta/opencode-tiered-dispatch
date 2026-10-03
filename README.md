@@ -210,6 +210,9 @@ into another subagent call.
   provider errors, metadata, and inspectability.
 - The plugin owns the routing context-hook, native tier-agent transform, and
   model-override guard; unloading it disposes all registrations.
+- The routing context callback reads the current agent catalog on every
+  callback, so it revalidates the effective primary/child mode, model/variant,
+  and permissions instead of relying on a stale setup-time snapshot.
 - Setup is transactional: if a later registration fails, earlier registrations
   are rolled back; cleanup attempts every registration and reports failures.
 - Tier invocations must not pass a per-call `subagent.model` override. The
@@ -284,39 +287,157 @@ configured models.
 
 ```bash
 npm run eval:routing
+# Optional direct arm and machine-readable artifact (the default arm is tiered).
+npm run eval:routing -- --arm direct --output /tmp/opencode/routing-direct.json
+# Optional single-scenario diagnosis with an explicit timeout.
+node scripts/opencode-native-smoke.mjs --routing-eval --arm tiered \
+  --scenario discover-implement --timeout-ms 240000 \
+  --output /tmp/opencode/routing-discover-implement.json
 ```
 
 This optional, provider-consuming evaluation uses ordinary requests without
 asking the model to delegate: trivial arithmetic, a known-scope edit, discovery
 followed by implementation, and discovery followed by security analysis. It
-records native call order/completion, shared file-path evidence in handoffs, primary read
-counts, exact repeated-read inputs across tiers, latency and reported token usage,
-and checks fixture behavior/tests immediately after each edit scenario. Focused
-discovery/resume cycles are accepted. No-edit snapshots cover workspace files
-outside `.git` and `node_modules`, not external paths or a security sandbox.
-Handoff checks are structural, not proof that all findings were understood.
-Repeated reads are diagnostic, not necessarily
-redundant (for example, rereading after an edit can be necessary).
+records native call order/completion, structured child-session/model evidence,
+shared file-path evidence in handoffs, primary and repeated-read categories,
+latency and reported token usage, and checks fixture behavior/tests immediately
+after each edit scenario. Focused discovery/resume cycles are accepted only
+when the native result identifies the same child session and returns a
+completed foreground structured result. Each call must expose `result.output`
+with the child session ID, `status`, and text, plus matching per-call
+`result.metadata`; a `running` or background result is not evidence that
+delegated work finished. A resume is valid only with an explicit continuation
+`sessionID` for an already established child owned by the same tier.
+
+Before each scenario the observer restores a pristine fixture manifest. It
+preserves only immutable `opencode.jsonc` and `.opencode` infrastructure,
+rejects infrastructure changes, runs the behavior/test verifier from a
+separate control directory, and checks that the verifier itself did not modify
+either workspace. No-edit snapshots cover the fixture workspace, not external
+paths or a security sandbox; the recorded manifests use relative paths with
+SHA-256 file hashes (and hashed symlink targets). Handoff checks are
+structural, not proof that all findings were understood. Repeated reads are
+diagnostic: a cache-freshness lookup or a read after an edit can be necessary,
+so repeated-read counts are overhead signals rather than an automatic defect.
+For headless fixture isolation, every root session in both the tiered and direct
+arms receives the native session-scoped
+`{ permission: "external_directory", pattern: "*", action: "deny" }` rule;
+the V2 session rule is inherited by native children after the tier definitions
+are materialized. This is an evaluator control only: ordinary native smoke and
+the normal plugin keep the host's `ask` behavior, and the harness does not
+overwrite tier definitions or auto-allow external paths. A denied outside read
+is retained as tool evidence and an error metric; the structural assessment
+does not silently discard failed tool completions.
 It exits nonzero when observed routing misses the expected route, the primary
 uses a tool before its first nontrivial delegation, or the primary executes a
 disallowed tool after delegation. After delegation, the primary allowlist is
 limited to native `subagent`/`skill` orchestration, read/search tools (`read`,
-`glob`, `grep`, `webfetch`, and `websearch`), and standalone test/check
-commands for integration or final verification. Mutation commands and other
-command execution remain delegated. The report also shows all primary reads,
-including integration verification, so over-exploration can be distinguished
-from final verification.
+`glob`, `grep`, `webfetch`, and `websearch`), and the exact scenario-declared
+fixture verification command. For an accepted command, omitted `cwd`/`workdir`
+means the fixture workspace and relative values resolve beneath it; conflicting
+cwd/workdir aliases or an outside directory fail the assessment. Unknown
+commands fail the assessment; there is no safe arbitrary-script or shell-regex
+allowlist. Mutation commands and other command execution remain delegated. The
+report also shows all primary reads, including integration verification, so
+over-exploration can be distinguished from final verification.
+This restriction applies to the tiered assessment. The direct control is
+deliberately permissive about ordinary primary-native tools (including shell)
+and only rejects child delegation plus its trivial-control overuse check; it is
+not a shell-safety measurement.
 It is intentionally separate from the smoke test: nondeterministic model
 compliance is not a structural plugin test. Passing examples do not guarantee
 general splitting or establish net cost savings. It inherits the host's global
 configuration and credentials; its files live in a temporary fixture workspace.
 
-After fixing the user's malformed global `opencode.jsonc`, the host consistently
-loaded all three tier agents. Repeated runs produced both composite routes;
-adding an explicit rule for multi-step known-scope edits produced the expected
-`medium`, `fast → medium`, and `fast → heavy` routes in the latest run. Primary
-integration reads and repeated reads remained diagnostic warnings, so this is
-improved advisory routing—not a hard guarantee.
+Any prior passing evaluation output is historical evidence for that particular
+provider/configuration snapshot, not proof of current routing behavior or cost
+savings.
+
+### Matched routing benchmark
+
+```bash
+# Builds once, then runs each arm in a fresh foreground native process.
+npm run benchmark:routing -- --runs 1 --output /tmp/opencode/routing-benchmark.json
+```
+
+The runner interleaves and counterbalances `tiered,direct` then
+`direct,tiered`; it never runs provider calls in parallel and never retries a
+failed run. Each arm executes the same four scenario prompts with the same
+medium root model. The **direct** control explicitly passes plugin
+`options.enabled:false`, denies the root `build` agent's `subagent` permission,
+and the independent `.opencode/plugins` observer hides that tool as a final
+guard. This is a deliberate control difference: it measures direct completion
+without tier routing, not an assertion that tier permissions block a root
+implementation. Unrelated global plugin configuration remains a host-level
+caveat.
+
+The native evaluator writes one machine-readable artifact per arm containing
+the arm, root/tier model references, host version when obtainable, startup
+time, reports, results/raw traces, and errors. Failed artifacts are written
+before temporary evaluator cleanup; the benchmark keeps them under
+`<output>.runs/<unique-run-id>/` and exits nonzero if any arm attempt fails.
+Timeout artifacts retain the pre-shutdown progress checkpoint separately from
+any post-SIGTERM state, including completed scenarios, active phase/root ID,
+bounded context/tool events, and a best-effort partial trace. If artifact
+serialization itself fails, the temporary control/workspace evidence is copied
+to a sibling `.evidence-*` directory instead of being destroyed.
+Previous invocation directories are retained; a child that fails before
+writing cannot reuse an older arm artifact. The output distinguishes requested
+repetitions, arm attempts, completed/failed arm attempts, attempted pairs, and
+completed pairs (both arms successful for the same repetition). It measures startup,
+scenario execution, verifier time, harness overhead, and total time separately.
+The verifier requires root outcomes/contexts (the routing protocol is present
+for tiered and explicitly absent for direct), complete tool identity tuples and
+successful completions, objective fixture behavior/isolation, and exactly four
+scenario results for both arms. Direct assessment bypasses tier-route and
+primary orchestration policy checks, except that the trivial control remains a
+natural at-most-one-tool check; tiered checks are not loosened.
+
+`routing-metrics.mjs` keeps input/output/reasoning/cache-read/cache-write
+components separate and treats missing token fields and missing/non-numeric
+`Money.USD` costs as unknown (`null`); a captured numeric zero remains zero.
+Reasoning is not added to output
+tokens as a billing estimate. It also reports root versus child usage, model
+call counts, time to first delegation, per-dispatch durations, handoff
+character counts and `o200k_base` tokenizer-proxy tokens, plus primary and
+repeated-read categories, and actual usage/cost attribution by captured
+provider/model/variant and request identity; missing identities remain in an
+explicit `unknown` bucket. Matched performance quantiles and ratios use only
+successful, same-repetition direct/tiered pairs with valid metrics. Raw arm
+sample counts, failures, errors, and usage totals still include failed runs, so
+a failed run's reported cost is not silently dropped from accounting. Costs
+are reported `Money.USD` values from the host, not a price-list or savings
+calculation; a subscription/free model may legitimately report `0`, and an
+unavailable value remains unknown.
+
+The default `--runs 1` is a small smoke comparison. Use at least 10 repetitions
+for meaningful tail quantiles; p95 with a small sample is provisional. Provider
+variance, warm caches, fixed scenario order within an arm, process startup, and
+the lack of a separate warm-up phase limit causal interpretation. The benchmark
+does not turn a small artifact into a live-provider reliability, performance, or
+cost claim.
+
+One retained one-pair observation was generated at
+`2026-10-03T06:23:45.930Z` and is available at
+`/tmp/opencode/tiered-dispatch-final-benchmark.json` (raw arm artifacts are in
+its `.runs/` directory):
+
+| Scenario | Direct execution ms | Tiered execution ms |
+|---|---:|---:|
+| trivial | 1,844 | 2,041 |
+| known-scope | 14,492 | 54,670 |
+| discover-implement | 96,331 | 138,705 |
+| discover-analyze | 111,593 | 208,675 |
+
+All recorded roots and tier children ended with `succeeded`, but the tiered
+arm's evaluator report still rejected three unknown primary verification
+commands in `known-scope` and two in `discover-analyze`; therefore the pair did
+not pass the quality gate. This was `n=1`, not p95 evidence. Every reported
+host cost was numeric `Money.USD` zero, so it cannot compare prices or savings.
+The metrics code applies no `10^12` scaling: captured session costs are direct
+`MoneyUSD` (`Money.USD`) values. Model catalog price fields are the separate
+`MoneyUSDPerMillionTokens` type, and this benchmark does not derive cost from
+them.
 
 ### Prompt token budgets
 

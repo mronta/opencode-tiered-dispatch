@@ -27,6 +27,7 @@
     "smoke:opencode": "npm run build && node scripts/opencode-native-smoke.mjs",
     "smoke:opencode:config": "npm run smoke:opencode",
     "eval:routing": "npm run build && node scripts/opencode-native-smoke.mjs --routing-eval",
+    "benchmark:routing": "npm run build && node scripts/routing-benchmark.mjs",
     "measure:prompts": "npm run build && node scripts/prompt-size.mjs"
   },
   "keywords": [
