@@ -6,8 +6,9 @@ configured model tiers. The primary remains responsible for the final answer;
 the tiers perform bounded work so the primary does less expensive execution and
 total cost may be lower, without promising the cheapest or fastest result.
 
-This checkout is **unpublished** and is intended for local use only. Configure
-the absolute checkout directory; there is no registry installation command.
+This package is not published yet and is intended for local use only. Install it
+from a local checkout by using the absolute checkout directory in the
+configuration below.
 
 ## Requirements
 
@@ -171,8 +172,8 @@ When the local files change, update the checkout using the method by which you
 obtained it—no remote or `git pull` is assumed—then run `npm run build` and
 restart the OpenCode service. Set `"enabled": false` for a no-op, or remove
 only this checkout's plugin object to remove it; leave other plugin entries in
-place. This project is not published to a package registry, so do not use
-published-package add, update, or remove commands.
+place. The package is not published yet, so keep the plugin configured with the
+absolute checkout directory.
 
 ## Further reading
 
