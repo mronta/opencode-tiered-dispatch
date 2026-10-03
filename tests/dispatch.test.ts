@@ -40,6 +40,24 @@ const toolContext = () => ({
   progress: vi.fn(async () => undefined),
 })
 
+function deferred<T>(): {
+  promise: Promise<T>
+  resolve(value: T): void
+  reject(error: unknown): void
+} {
+  let resolvePromise: (value: T) => void = () => undefined
+  let rejectPromise: (error: unknown) => void = () => undefined
+  const promise = new Promise<T>((resolve, reject) => {
+    resolvePromise = resolve
+    rejectPromise = reject
+  })
+  return { promise, resolve: resolvePromise, reject: rejectPromise }
+}
+
+async function flushAsyncWork(): Promise<void> {
+  await new Promise<void>((resolve) => setImmediate(resolve))
+}
+
 describe("dispatcher", () => {
   it("creates the exact tier session and returns structured output", async () => {
     const runtime = makeRuntime()
@@ -99,5 +117,154 @@ describe("dispatcher", () => {
       { ...toolContext(), signal: controller.signal },
     )).rejects.toThrow(/cancelled/)
     expect(runtime.interrupt).toHaveBeenCalledWith("ses_child")
+  })
+
+  it("waits for cancellation interruption before rejecting", async () => {
+    const runtime = makeRuntime()
+    const controller = new AbortController()
+    const interruption = deferred<void>()
+    vi.mocked(runtime.wait).mockImplementation(async () => {
+      controller.abort(new DOMException("cancelled", "AbortError"))
+    })
+    vi.mocked(runtime.interrupt).mockReturnValue(interruption.promise)
+    const dispatcher = createDispatcher(runtime, parsed, new Set(["explore", "general"]))
+
+    let settled = false
+    const execution = dispatcher.execute(
+      { tier: "heavy", description: "Analyze", prompt: "Analyze" },
+      { ...toolContext(), signal: controller.signal },
+    ).finally(() => { settled = true })
+    await flushAsyncWork()
+    expect(runtime.interrupt).toHaveBeenCalledWith("ses_child")
+    expect(settled).toBe(false)
+
+    interruption.resolve()
+    await expect(execution).rejects.toThrow(/cancelled/)
+  })
+
+  it("keeps concurrent tier results and child sessions isolated", async () => {
+    const runtime = makeRuntime()
+    let nextID = 0
+    vi.mocked(runtime.createSession).mockImplementation(async (input) => ({
+      id: `ses_child_${++nextID}`,
+      location: input.location,
+    }))
+    vi.mocked(runtime.context).mockImplementation(async (sessionID) => [
+      { type: "assistant", content: [{ type: "text", text: `answer for ${sessionID}` }] },
+      { type: "idle", outcome: "succeeded" },
+    ])
+    const dispatcher = createDispatcher(runtime, parsed, new Set(["explore", "general"]))
+
+    const [fast, heavy] = await Promise.all([
+      dispatcher.execute({ tier: "fast", description: "Find", prompt: "Find" }, toolContext()),
+      dispatcher.execute({ tier: "heavy", description: "Reason", prompt: "Reason" }, toolContext()),
+    ])
+
+    expect(fast.output).toMatchObject({ tier: "fast", model: "p/fast:low", sessionID: "ses_child_1", text: "answer for ses_child_1" })
+    expect(heavy.output).toMatchObject({ tier: "heavy", model: "p/heavy", sessionID: "ses_child_2", text: "answer for ses_child_2" })
+    expect(runtime.createSession).toHaveBeenCalledTimes(2)
+    expect(runtime.createSession).toHaveBeenNthCalledWith(1, expect.objectContaining({ agent: "explore", model: { providerID: "p", id: "fast", variant: "low" } }))
+    expect(runtime.createSession).toHaveBeenNthCalledWith(2, expect.objectContaining({ agent: "general", model: { providerID: "p", id: "heavy" } }))
+  })
+
+  it("surfaces provider error details without falling back", async () => {
+    const runtime = makeRuntime()
+    vi.mocked(runtime.getSession).mockImplementation(async (id) => id === "root"
+      ? { id, location: { directory: "/workspace" }, permissions: [] }
+      : { id, location: { directory: "/workspace" }, outcome: "failed" as const })
+    const providerError = { type: "rate_limit", message: "provider refused", status: 429 }
+    vi.mocked(runtime.context).mockResolvedValue([
+      { type: "assistant", content: [], error: providerError },
+    ] as never)
+    const dispatcher = createDispatcher(runtime, parsed, new Set(["explore", "general"]))
+
+    await expect(dispatcher.execute(
+      { tier: "fast", description: "Fail", prompt: "Trigger failure" },
+      toolContext(),
+    )).rejects.toMatchObject({
+      name: "TieredDispatchProviderError",
+      message: "rate_limit: provider refused",
+      cause: providerError,
+      providerError,
+    })
+    expect(runtime.createSession).toHaveBeenCalledOnce()
+    expect(runtime.createSession).toHaveBeenCalledWith(expect.objectContaining({ agent: "explore" }))
+  })
+
+  it("drains a child that is created while cleanup is waiting", async () => {
+    const runtime = makeRuntime()
+    const creation = deferred<{ id: string; location: { directory: string } }>()
+    vi.mocked(runtime.createSession).mockReturnValue(creation.promise)
+    const dispatcher = createDispatcher(runtime, parsed, new Set(["explore", "general"]))
+
+    const execution = dispatcher.execute(
+      { tier: "medium", description: "Implement", prompt: "Implement it" },
+      toolContext(),
+    )
+    await flushAsyncWork()
+    expect(runtime.createSession).toHaveBeenCalledOnce()
+
+    const cleanup = dispatcher.cleanup()
+    creation.resolve({ id: "ses_late", location: { directory: "/workspace" } })
+
+    await expect(execution).rejects.toThrow(/unloading/)
+    await cleanup
+    expect(runtime.interrupt).toHaveBeenCalledWith("ses_late")
+  })
+
+  it("waits for an active child to stop before cleanup resolves", async () => {
+    const runtime = makeRuntime()
+    const waiting = deferred<void>()
+    vi.mocked(runtime.wait).mockReturnValue(waiting.promise)
+    vi.mocked(runtime.interrupt).mockImplementation(async () => {
+      waiting.resolve()
+    })
+    const dispatcher = createDispatcher(runtime, parsed, new Set(["explore", "general"]))
+
+    const execution = dispatcher.execute(
+      { tier: "heavy", description: "Analyze", prompt: "Analyze" },
+      toolContext(),
+    )
+    await flushAsyncWork()
+    expect(runtime.wait).toHaveBeenCalledWith("ses_child", expect.any(AbortSignal))
+
+    const cleanup = dispatcher.cleanup()
+    await expect(execution).rejects.toThrow(/unloading/)
+    await cleanup
+    expect(runtime.interrupt).toHaveBeenCalledWith("ses_child")
+  })
+
+  it("interrupts a child created after the caller is cancelled", async () => {
+    const runtime = makeRuntime()
+    const creation = deferred<{ id: string; location: { directory: string } }>()
+    vi.mocked(runtime.createSession).mockReturnValue(creation.promise)
+    const controller = new AbortController()
+    const dispatcher = createDispatcher(runtime, parsed, new Set(["explore", "general"]))
+
+    const execution = dispatcher.execute(
+      { tier: "fast", description: "Find", prompt: "Find it" },
+      { ...toolContext(), signal: controller.signal },
+    )
+    await flushAsyncWork()
+    controller.abort(new DOMException("cancelled", "AbortError"))
+    creation.resolve({ id: "ses_cancelled", location: { directory: "/workspace" } })
+
+    await expect(execution).rejects.toThrow(/cancelled/)
+    expect(runtime.interrupt).toHaveBeenCalledWith("ses_cancelled")
+  })
+
+  it("makes cleanup idempotent and rejects new work after unload", async () => {
+    const runtime = makeRuntime()
+    const dispatcher = createDispatcher(runtime, parsed, new Set(["explore", "general"]))
+
+    const first = dispatcher.cleanup()
+    const second = dispatcher.cleanup()
+    expect(second).toBe(first)
+    await Promise.all([first, second])
+    await expect(dispatcher.execute(
+      { tier: "fast", description: "late", prompt: "late" },
+      toolContext(),
+    )).rejects.toThrow(/unloading/)
+    expect(runtime.createSession).not.toHaveBeenCalled()
   })
 })

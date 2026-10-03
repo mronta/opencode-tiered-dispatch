@@ -72,107 +72,150 @@ export function createDispatcher(
   subagentIDs: ReadonlySet<string>,
 ): Dispatcher {
   const inFlight = new Set<string>()
+  const activeOperations = new Set<Promise<unknown>>()
   let closing = false
+  let cleanupPromise: Promise<void> | undefined
 
   const log = (message: string, metadata?: Record<string, unknown>): void => {
     if (options.logging) console.info(`[tiered-dispatch] ${message}`, metadata ?? {})
   }
 
-  return {
-    async execute(rawInput, context) {
-      const input = validateInput(rawInput)
-      if (closing) throw new DispatchError("Tiered Dispatch is unloading")
-      if (subagentIDs.has(context.agent)) {
-        throw new DispatchError("Nested tiered dispatch is not allowed from a subagent")
-      }
-      throwIfAborted(context.signal)
+  const executeOperation = async (rawInput: unknown, context: ToolExecutionContext) => {
+    const input = validateInput(rawInput)
+    if (closing) throw new DispatchError("Tiered Dispatch is unloading")
+    if (subagentIDs.has(context.agent)) {
+      throw new DispatchError("Nested tiered dispatch is not allowed from a subagent")
+    }
+    throwIfAborted(context.signal)
 
-      const tierOptions = options.tiers[input.tier]
-      assertModelsAvailable(options, await runtime.listModels(), "dispatch", input.tier)
+    const tierOptions = options.tiers[input.tier]
+    assertModelsAvailable(options, await runtime.listModels(), "dispatch", input.tier)
+    if (closing) throw new DispatchError("Tiered Dispatch is unloading")
 
-      const [callerSession, callerAgent] = await Promise.all([
-        runtime.getSession(context.sessionID),
-        runtime.getAgent(context.agent),
-      ])
-      throwIfAborted(context.signal)
+    const [callerSession, callerAgent] = await Promise.all([
+      runtime.getSession(context.sessionID),
+      runtime.getAgent(context.agent),
+    ])
+    throwIfAborted(context.signal)
+    if (closing) throw new DispatchError("Tiered Dispatch is unloading")
 
-      const permissions = buildDelegatedPermissions(
-        input.tier,
-        callerAgent.permissions,
-        callerSession.permissions,
-      )
-      const directory = callerSession.subpath
-        ? resolve(callerSession.location.directory, callerSession.subpath)
-        : callerSession.location.directory
-      const model = {
-        ...tierOptions.modelRef,
-        ...(tierOptions.variant === undefined ? {} : { variant: tierOptions.variant }),
-      }
+    const permissions = buildDelegatedPermissions(
+      input.tier,
+      callerAgent.permissions,
+      callerSession.permissions,
+    )
+    const directory = callerSession.subpath
+      ? resolve(callerSession.location.directory, callerSession.subpath)
+      : callerSession.location.directory
+    const model = {
+      ...tierOptions.modelRef,
+      ...(tierOptions.variant === undefined ? {} : { variant: tierOptions.variant }),
+    }
 
-      await context.progress({ status: `Starting ${input.tier} delegation` })
-      const child = await runtime.createSession({
-        title: `[${input.tier}] ${input.description.slice(0, 100)}`,
-        agent: TIER_AGENTS[input.tier],
-        model,
-        location: { directory },
-        metadata: {
-          plugin: "tiered-dispatch",
-          parentSessionID: context.sessionID,
-          parentAgent: context.agent,
-          tier: input.tier,
-        },
-        permissions,
-      })
-      inFlight.add(child.id)
-      log("delegation started", { tier: input.tier, model: tierOptions.model, sessionID: child.id })
+    if (closing) throw new DispatchError("Tiered Dispatch is unloading")
+    await context.progress({ status: `Starting ${input.tier} delegation` })
+    if (closing) throw new DispatchError("Tiered Dispatch is unloading")
+    const child = await runtime.createSession({
+      title: `[${input.tier}] ${input.description.slice(0, 100)}`,
+      agent: TIER_AGENTS[input.tier],
+      model,
+      location: { directory },
+      metadata: {
+        plugin: "tiered-dispatch",
+        parentSessionID: context.sessionID,
+        parentAgent: context.agent,
+        tier: input.tier,
+      },
+      permissions,
+    })
+    inFlight.add(child.id)
+    log("delegation started", { tier: input.tier, model: tierOptions.model, sessionID: child.id })
 
-      const abort = (): void => {
-        void runtime.interrupt(child.id).catch(() => undefined)
-      }
-      context.signal.addEventListener("abort", abort, { once: true })
+    let interruption: Promise<void> | undefined
+    const interrupt = (): Promise<void> => {
+      interruption ??= runtime.interrupt(child.id).catch(() => undefined)
+      return interruption
+    }
+    const abort = (): void => {
+      void interrupt()
+    }
+    context.signal.addEventListener("abort", abort, { once: true })
 
-      try {
-        if (closing || context.signal.aborted) {
-          abort()
-          throwIfAborted(context.signal)
-          throw new DispatchError("Tiered Dispatch is unloading")
-        }
-
-        await runtime.prompt(child.id, buildChildPrompt(input, tierOptions.instructions))
-        await runtime.wait(child.id, context.signal)
+    try {
+      if (closing || context.signal.aborted) {
+        await interrupt()
         throwIfAborted(context.signal)
-
-        const [completed, messages] = await Promise.all([
-          runtime.getSession(child.id),
-          runtime.context(child.id),
-        ])
-        assertSuccessfulOutcome(completed.outcome, messages)
-        const text = extractFinalText(messages)
-        const output: DelegateOutput = {
-          tier: input.tier,
-          model: formatModel(tierOptions.model, tierOptions.variant),
-          sessionID: child.id,
-          text,
-        }
-        log("delegation completed", { tier: input.tier, model: output.model, sessionID: child.id })
-        return {
-          content: text,
-          output,
-          metadata: { tier: output.tier, model: output.model, sessionID: output.sessionID },
-        }
-      } finally {
-        context.signal.removeEventListener("abort", abort)
-        inFlight.delete(child.id)
+        throw new DispatchError("Tiered Dispatch is unloading")
       }
-    },
 
-    async cleanup() {
-      closing = true
-      const sessions = [...inFlight]
-      await Promise.allSettled(sessions.map((sessionID) => runtime.interrupt(sessionID)))
-      inFlight.clear()
-    },
+      await runtime.prompt(child.id, buildChildPrompt(input, tierOptions.instructions))
+      if (closing) {
+        await interrupt()
+        throw new DispatchError("Tiered Dispatch is unloading")
+      }
+      await runtime.wait(child.id, context.signal)
+      throwIfAborted(context.signal)
+      if (closing) {
+        await interrupt()
+        throw new DispatchError("Tiered Dispatch is unloading")
+      }
+
+      const [completed, messages] = await Promise.all([
+        runtime.getSession(child.id),
+        runtime.context(child.id),
+      ])
+      assertSuccessfulOutcome(completed.outcome, messages)
+      const text = extractFinalText(messages)
+      const output: DelegateOutput = {
+        tier: input.tier,
+        model: formatModel(tierOptions.model, tierOptions.variant),
+        sessionID: child.id,
+        text,
+      }
+      log("delegation completed", { tier: input.tier, model: output.model, sessionID: child.id })
+      return {
+        content: text,
+        output,
+        metadata: { tier: output.tier, model: output.model, sessionID: output.sessionID },
+      }
+    } finally {
+      context.signal.removeEventListener("abort", abort)
+      if (interruption) await interruption
+      inFlight.delete(child.id)
+    }
   }
+
+  const execute = (rawInput: unknown, context: ToolExecutionContext): Promise<{
+    content: string
+    output: DelegateOutput
+    metadata: Omit<DelegateOutput, "text">
+  }> => {
+    if (closing) return Promise.reject(new DispatchError("Tiered Dispatch is unloading"))
+    const operation = executeOperation(rawInput, context)
+    activeOperations.add(operation)
+    void operation.then(
+      () => activeOperations.delete(operation),
+      () => activeOperations.delete(operation),
+    )
+    return operation
+  }
+
+  const cleanup = (): Promise<void> => {
+    if (cleanupPromise) return cleanupPromise
+    cleanupPromise = (async () => {
+      closing = true
+      while (activeOperations.size > 0 || inFlight.size > 0) {
+        const operations = [...activeOperations]
+        const sessions = [...inFlight]
+        await Promise.allSettled(sessions.map((sessionID) => runtime.interrupt(sessionID)))
+        await Promise.allSettled(operations)
+      }
+      inFlight.clear()
+    })()
+    return cleanupPromise
+  }
+
+  return { execute, cleanup }
 }
 
 function validateInput(input: unknown): DelegateInput {

@@ -21,7 +21,12 @@
     "test:watch": "vitest",
     "prepack": "npm run build",
     "smoke:package": "node scripts/package-smoke.mjs",
-    "smoke:opencode": "node scripts/opencode-smoke.mjs"
+    "smoke:opencode": "node scripts/opencode-smoke.mjs",
+    "smoke:opencode:delegate": "node scripts/opencode-smoke.mjs --delegate",
+    "smoke:opencode:permissions": "node scripts/opencode-smoke.mjs --delegate --permissions",
+    "smoke:opencode:packed": "node scripts/opencode-smoke.mjs --packed",
+    "smoke:opencode:packed:delegate": "node scripts/opencode-smoke.mjs --packed --delegate",
+    "eval:routing": "node scripts/routing-evaluation.mjs"
   },
   "keywords": [
     "opencode",

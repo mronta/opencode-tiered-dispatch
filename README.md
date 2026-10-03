@@ -13,7 +13,8 @@ persist routing state, switch presets, or fall back silently to another model.
 
 ## Requirements
 
-- OpenCode V2 with `@opencode/plugin` `2.0.x` support;
+- OpenCode V2 `2.0.18` (the version tested by this release) with
+  `@opencode/plugin` `2.0.18`;
 - the built-in `explore` and `general` subagent agents;
 - one available, tool-capable model for each configured tier.
 
@@ -56,10 +57,13 @@ Then add it to `opencode.jsonc`:
 ```
 
 Model IDs and variants are workstation-specific. Check the active catalog with
-`opencode api get /api/model` and replace the examples when necessary.
+`opencode api get /api/model` and replace the examples when necessary. Authenticate
+each required provider through the normal OpenCode provider setup on every
+workstation; credentials and subscriptions are not bundled with this package.
 
 For an npm installation, publish or pack this project and use the resulting
 package name in the plugin entry. The package exports compiled `dist/` output.
+No agent Markdown files or project files are generated.
 
 For a published package, install it globally through OpenCode and add the same
 configuration entry:
@@ -143,5 +147,16 @@ npm run smoke:opencode
 ```
 
 Set `TIERED_DISPATCH_*_VARIANT` variables when the configured models require a
-variant. The smoke test does not send a provider prompt; real-provider tests
-should be run separately because they consume model usage.
+variant. The registration smoke does not send a provider prompt. Optional
+provider-consuming checks are available when stronger verification is needed:
+
+```bash
+npm run smoke:opencode:delegate          # real child session and result
+npm run smoke:opencode:permissions       # fast read-only; medium/heavy edits
+npm run smoke:opencode:packed:delegate  # activate the packed tarball itself
+npm run eval:routing                     # fast/medium/heavy/direct/split cases
+```
+
+These checks consume provider usage and require credentials for the configured
+models. `eval:routing` is deliberately opt-in because model responses can vary;
+it fails if the observed choices do not match the expected routing taxonomy.

@@ -11,14 +11,19 @@ describe("delegation result extraction", () => {
   })
 
   it("reports provider failures", () => {
-    const providerError = { type: "rate_limit", message: "rate limited" }
+    const providerError = { type: "rate_limit", message: "rate limited", status: 429 }
     try {
       assertSuccessfulOutcome("failed", [
         { type: "assistant", content: [], error: providerError },
       ])
       throw new Error("expected provider failure")
     } catch (error) {
-      expect(error).toMatchObject({ message: "rate_limit: rate limited", cause: providerError })
+      expect(error).toMatchObject({
+        name: "TieredDispatchProviderError",
+        message: "rate_limit: rate limited",
+        cause: providerError,
+        providerError,
+      })
     }
   })
 
