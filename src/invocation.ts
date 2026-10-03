@@ -1,14 +1,5 @@
 import { isTierName } from "./tiers.js"
 
-const PLAN_MUTATING_TIERS = new Set(["medium", "heavy"])
-
-export function planMutatingTierError(caller: unknown, input: unknown): string | undefined {
-  if (caller !== "plan" || !isRecord(input) || typeof input.agent !== "string") return undefined
-  if (!PLAN_MUTATING_TIERS.has(input.agent)) return undefined
-
-  return `Plan cannot invoke plugin tier ${input.agent} directly; switch to Build to execute mutating work`
-}
-
 export function tierModelOverrideError(input: unknown): string | undefined {
   if (!isRecord(input) || !isTierName(input.agent)) return undefined
   if (typeof input.model !== "string" || input.model.trim() === "") return undefined

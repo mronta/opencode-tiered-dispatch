@@ -123,13 +123,18 @@ guarantee that every request creates a child session.
   applies their canonical hidden/step/request behavior, model, instructions,
   and permissions, overwriting user values in those behavioral fields.
   Cosmetic `color` configuration is preserved.
-- The built-in `Plan` agent receives no execution protocol. Native permissions
-  and the hook guard prevent it from calling the plugin's `medium` or `heavy`
-  tiers; it may use `fast` for read-only discovery. `Build` and the current
-  primary keep the host's normal custom permissions.
-- `fast` is read-only. `medium` and `heavy` can edit, write, and run the tools
-  allowed by the host. Native permissions constrain tool use but are not a
-  security sandbox; the primary still has its normal host tools.
+- The built-in `Plan` agent receives no execution protocol and can invoke all
+  three plugin tiers. Before dispatch, the plugin applies native session-scoped
+  read-only rules (preserving existing restrictions); child sessions inherit
+  them. Plan-originated children may read/search and use safe tier
+  orchestration, but cannot edit, write, patch, run shell commands, or mutate
+  the workspace. `Build` and the current primary keep the host's normal custom
+  permissions.
+- `fast` is read-only. `medium` and `heavy` retain their canonical edit, write,
+  and shell permissions when invoked from `Build`; the Plan session policy does
+  not globally change those tier definitions. Native permissions constrain tool
+  use but are not a security sandbox; the primary still has its normal host
+  tools.
 
 ## Configuration
 

@@ -3,8 +3,14 @@ import type { AgentEditor } from "@opencode/plugin/promise/agent"
 import type { Context } from "@opencode/plugin/promise/plugin"
 import { TIER_AGENT_DEFINITIONS } from "./agents.js"
 import { assertAgentsAvailable, assertModelsAvailable } from "./catalog.js"
-import { planMutatingTierError, tierModelOverrideError } from "./invocation.js"
+import { tierModelOverrideError } from "./invocation.js"
 import { parseOptions, type TierOptions } from "./options.js"
+import {
+  enforcePlanSessionPermissions,
+  findPlanSession,
+  PLAN_READONLY_INSTRUCTION,
+  PLAN_READONLY_TOOLS,
+} from "./plan-safety.js"
 import { buildRoutingProtocol } from "./protocol.js"
 import { isTierName, TIER_NAMES, type TierName } from "./tiers.js"
 
@@ -28,6 +34,7 @@ export default Plugin.define({
     assertModelsAvailable(options, models)
 
     const routingProtocol = buildRoutingProtocol(options)
+    const planSessionIDs = new Set<string>()
     const loadAgents = async (): Promise<readonly ReturnType<typeof toAgentCatalogEntry>[]> => {
       const catalog = await ctx.agent.list()
       const agents = catalog.data.map(toAgentCatalogEntry)
@@ -52,20 +59,51 @@ export default Plugin.define({
             agent.permissions = definition.permissions.map((rule) => ({ ...rule }))
           })
         }
-        const plan = editor.get("plan")
-        if (plan !== undefined) appendPlanTierDenies(plan)
       }))
 
-      registrations.push(await ctx.tool.hook("execute.before", (event) => {
+      registrations.push(await ctx.tool.hook("execute.before", async (event) => {
+        const planSession = event.sessionID === undefined
+          ? undefined
+          : await findPlanSession(ctx, event.sessionID, event.agent, planSessionIDs)
+        if (planSession?.owned && !PLAN_READONLY_TOOLS.has(event.tool)) {
+          throw new Error(`Plan-originated sessions are read-only; tool ${event.tool} is not permitted`)
+        }
+
         if (event.tool !== "subagent") return
-        const planViolation = planMutatingTierError(event.agent, event.input)
-        if (planViolation !== undefined) throw new Error(planViolation)
         const violation = tierModelOverrideError(event.input)
         if (violation !== undefined) throw new Error(violation)
+
+        if (!planSession?.owned || event.sessionID === undefined) return
+        await enforcePlanSessionPermissions(ctx, event.sessionID, planSession.session)
+
+        const input = asRecord(event.input)
+        const continuedSessionID = input?.sessionID
+        if (typeof continuedSessionID !== "string" || continuedSessionID === event.sessionID) return
+        const continued = await findPlanSession(ctx, continuedSessionID, undefined, planSessionIDs)
+        if (!continued.owned) {
+          throw new Error("Plan can continue only a session whose read-only ancestry can be verified")
+        }
+        await enforcePlanSessionPermissions(ctx, continuedSessionID, continued.session)
       }))
 
       registrations.push(await ctx.session.hook("context", async (event) => {
-        if (event.agent === "plan") return
+        let planSession: Awaited<ReturnType<typeof findPlanSession>> | undefined
+        try {
+          planSession = await findPlanSession(ctx, event.sessionID, event.agent, planSessionIDs)
+        } catch (error) {
+          if (event.agent === "plan" || isTierName(event.agent)) throw error
+          log?.("could not inspect session ancestry; routing guidance omitted", error)
+          return
+        }
+        if (planSession.owned) {
+          await enforcePlanSessionPermissions(ctx, event.sessionID, planSession.session)
+          if (isTierName(event.agent)) {
+            const instructions = options.tiers[event.agent as TierName].instructions
+            if (instructions !== undefined) event.system.push({ type: "text", text: instructions })
+            event.system.push({ type: "text", text: PLAN_READONLY_INSTRUCTION })
+          }
+          return
+        }
         const agents = await loadAgents()
         const agent = agents.find((candidate) => candidate.id === event.agent)
         if (isTierName(event.agent)) {
@@ -73,16 +111,13 @@ export default Plugin.define({
           if (instructions !== undefined) event.system.push({ type: "text", text: instructions })
           return
         }
-        let session: Awaited<ReturnType<Context["session"]["get"]>>
-        try {
-          session = await ctx.session.get({ sessionID: event.sessionID })
-        } catch (error) {
-          log?.("could not inspect session ancestry; routing guidance omitted", error)
-          return
-        }
         // Fail closed when the current agent cannot be classified. Injecting an
         // orchestration protocol into an unknown child is worse than omitting it.
-        if (!agent || session.parentID !== undefined || (agent.mode !== "primary" && agent.mode !== "all")) {
+        if (
+          !agent
+          || planSession.session.parentID !== undefined
+          || (agent.mode !== "primary" && agent.mode !== "all")
+        ) {
           return
         }
         event.system.push({ type: "text", text: routingProtocol })
@@ -104,19 +139,6 @@ type ModelInfo = Awaited<ReturnType<Context["model"]["list"]>>["data"][number]
 type AgentInfo = Awaited<ReturnType<Context["agent"]["list"]>>["data"][number]
 type EditableAgent = Parameters<Parameters<AgentEditor["update"]>[1]>[0]
 type AgentModel = NonNullable<EditableAgent["model"]>
-
-const PLAN_BLOCKED_TIERS = ["medium", "heavy"] as const
-
-function appendPlanTierDenies(agent: EditableAgent): void {
-  const permissions = agent.permissions ?? (agent.permissions = [])
-  for (const tier of PLAN_BLOCKED_TIERS) {
-    const lastRule = [...permissions].reverse().find(
-      (rule) => rule.action === "subagent" && rule.resource === tier,
-    )
-    if (lastRule?.effect === "deny") continue
-    permissions.push({ action: "subagent", resource: tier, effect: "deny" })
-  }
-}
 
 function toAgentModel(configured: TierOptions): AgentModel {
   const model = {
@@ -154,6 +176,12 @@ function toAgentCatalogEntry(agent: AgentInfo) {
       }),
     permissions: agent.permissions,
   }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined
 }
 
 async function rollbackRegistrations(registrations: readonly Registration[], setupError: unknown): Promise<never> {

@@ -2,12 +2,13 @@ import type { Context } from "@opencode/plugin/promise/plugin"
 import { describe, expect, it, vi } from "vitest"
 import type { AgentCatalogEntry } from "../src/catalog.js"
 import plugin from "../src/index.js"
+import { PLAN_READONLY_INSTRUCTION } from "../src/plan-safety.js"
 import { modelCatalog, requiredTierOptions, tierModel } from "./tier-fixtures.js"
 
 const models = modelCatalog()
 
 type ContextEvent = { sessionID: string; agent: string; tools: Record<string, unknown>; system: unknown[] }
-type ToolEvent = { tool: string; agent?: string; input: unknown }
+type ToolEvent = { tool: string; sessionID?: string; agent?: string; input: unknown }
 type FixtureAgent = AgentCatalogEntry & {
   permissions: NonNullable<AgentCatalogEntry["permissions"]>
   name?: string
@@ -27,6 +28,8 @@ function makeContext(options: Record<string, unknown>, failures: FixtureFailures
   context: Context
   agents: FixtureAgent[]
   setAgentCatalog: (agents: FixtureAgent[]) => void
+  setSession: (sessionID: string, session: { parentID?: string; agent?: string }) => void
+  setSessionPermissions: (sessionID: string, permissions: FixtureAgent["permissions"]) => void
   hookCallbacks: Array<(event: ContextEvent) => void | Promise<void>>
   toolHookCallbacks: Array<(event: ToolEvent) => void | Promise<void>>
   disposes: { agent: ReturnType<typeof vi.fn>; tool: ReturnType<typeof vi.fn>; context: ReturnType<typeof vi.fn> }
@@ -43,6 +46,14 @@ function makeContext(options: Record<string, unknown>, failures: FixtureFailures
     },
   ]
   let agentCatalog = agents
+  const sessionInfo = new Map<string, { parentID?: string; agent?: string }>([
+    ["root", { agent: "build" }],
+    ["root-all", { agent: "all" }],
+    ["plan-root", { agent: "plan" }],
+    ["child", { parentID: "root", agent: "fast" }],
+    ["plan-child", { parentID: "plan-root", agent: "medium" }],
+  ])
+  const sessionPermissions = new Map<string, FixtureAgent["permissions"]>()
   const hookCallbacks: Array<(event: ContextEvent) => void | Promise<void>> = []
   const toolHookCallbacks: Array<(event: ToolEvent) => void | Promise<void>> = []
   const removedAgents: string[] = []
@@ -97,8 +108,18 @@ function makeContext(options: Record<string, unknown>, failures: FixtureFailures
     session: {
       get: vi.fn(async ({ sessionID }: { sessionID: string }) => ({
         id: sessionID,
-        parentID: sessionID === "child" ? "root" : undefined,
+        ...sessionInfo.get(sessionID),
+        permissions: sessionPermissions.get(sessionID),
       })),
+      update: vi.fn(async ({
+        sessionID,
+        permissions,
+      }: {
+        sessionID: string
+        permissions: FixtureAgent["permissions"]
+      }) => {
+        sessionPermissions.set(sessionID, permissions)
+      }),
       hook: vi.fn(async (
         name: "context",
         callback: (event: ContextEvent) => void | Promise<void>,
@@ -114,6 +135,8 @@ function makeContext(options: Record<string, unknown>, failures: FixtureFailures
     context,
     agents,
     setAgentCatalog: (next) => { agentCatalog = next },
+    setSession: (sessionID, session) => { sessionInfo.set(sessionID, session) },
+    setSessionPermissions: (sessionID, permissions) => { sessionPermissions.set(sessionID, permissions) },
     hookCallbacks,
     toolHookCallbacks,
     disposes,
@@ -211,16 +234,16 @@ describe("plugin setup", () => {
     expect(fixture.disposalOrder).toEqual([])
   })
 
-  it("keeps the native plan out of routing and blocks its mutating tier targets", async () => {
+  it("lets Plan dispatch every tier while making its sessions read-only", async () => {
     const fixture = makeContext(options)
     const cleanup = await plugin.setup(fixture.context)
     const plan = fixture.agents.find((agent) => agent.id === "plan")
     if (!plan) throw new Error("test fixture is missing plan agent")
 
-    expect(plan.permissions).toEqual([
-      { action: "subagent", resource: "*", effect: "allow" },
-      { action: "subagent", resource: "medium", effect: "deny" },
-      { action: "subagent", resource: "heavy", effect: "deny" },
+    expect(plan.permissions).toEqual([{ action: "subagent", resource: "*", effect: "allow" }])
+    fixture.setSessionPermissions("plan-root", [
+      { action: "read", resource: "private.txt", effect: "deny" },
+      { action: "edit", resource: "*", effect: "allow" },
     ])
 
     const hook = fixture.hookCallbacks[0]!
@@ -229,16 +252,67 @@ describe("plugin setup", () => {
     expect(planContext.system).toEqual([])
     expect(fixture.context.agent.list).not.toHaveBeenCalled()
 
-    const guard = fixture.toolHookCallbacks[0]!
-    expect(() => guard({ tool: "subagent", agent: "plan", input: { agent: "fast" } })).not.toThrow()
-    for (const agent of ["medium", "heavy"]) {
-      expect(() => guard({ tool: "subagent", agent: "plan", input: { agent } }))
-        .toThrow(/switch to Build to execute/)
-    }
-    expect(() => guard({ tool: "subagent", agent: "build", input: { agent: "medium" } })).not.toThrow()
-    expect(() => guard({ tool: "subagent", agent: "customactor", input: { agent: "medium" } })).not.toThrow()
-    expect(() => guard({ tool: "subagent", agent: "plan", input: { sessionID: "resumed" } })).not.toThrow()
+    const planRules = vi.mocked(fixture.context.session.update).mock.calls[0]?.[0].permissions
+    expect(planRules).toEqual(expect.arrayContaining([
+      { action: "read", resource: "private.txt", effect: "deny" },
+      { action: "edit", resource: "*", effect: "allow" },
+      { action: "*", resource: "*", effect: "deny" },
+      { action: "read", resource: "*", effect: "allow" },
+      { action: "subagent", resource: "medium", effect: "allow" },
+      { action: "subagent", resource: "heavy", effect: "allow" },
+    ]))
+    if (!planRules) throw new Error("Plan session permissions were not updated")
+    expect([...planRules].reverse().find((rule) => rule.action === "edit" || rule.action === "*")?.effect)
+      .toBe("deny")
+    expect([...planRules].reverse().find(
+      (rule) => rule.action === "read" && (rule.resource === "private.txt" || rule.resource === "*"),
+    )?.effect).toBe("deny")
 
+    const guard = fixture.toolHookCallbacks[0]!
+    for (const agent of ["fast", "medium", "heavy"]) {
+      await expect(guard({ tool: "subagent", sessionID: "plan-root", agent: "plan", input: { agent } }))
+        .resolves.toBeUndefined()
+    }
+    await expect(guard({ tool: "subagent", sessionID: "root", agent: "build", input: { agent: "medium" } }))
+      .resolves.toBeUndefined()
+    await expect(guard({ tool: "subagent", sessionID: "root", agent: "customactor", input: { agent: "medium" } }))
+      .resolves.toBeUndefined()
+
+    const childContext = { sessionID: "plan-child", agent: "medium", tools: {}, system: [] as unknown[] }
+    await hook(childContext)
+    expect(childContext.system).toEqual([{
+      type: "text",
+      text: PLAN_READONLY_INSTRUCTION,
+    }])
+    await expect(guard({ tool: "read", sessionID: "plan-child", agent: "medium", input: {} }))
+      .resolves.toBeUndefined()
+    await expect(guard({ tool: "subagent", sessionID: "plan-child", agent: "medium", input: { agent: "fast" } }))
+      .resolves.toBeUndefined()
+    for (const tool of ["edit", "write", "shell", "patch"]) {
+      await expect(guard({ tool, sessionID: "plan-child", agent: "medium", input: {} }))
+        .rejects.toThrow(/sessions are read-only/)
+    }
+
+    await expect(guard({
+      tool: "subagent",
+      sessionID: "plan-root",
+      agent: "plan",
+      input: { sessionID: "plan-child", agent: "heavy" },
+    })).resolves.toBeUndefined()
+
+    if (typeof cleanup === "function") await cleanup()
+  })
+
+  it("uses the native permission rule setter when the host exposes it", async () => {
+    const fixture = makeContext(options)
+    const rules = vi.fn(async () => {})
+    ;(fixture.context as unknown as { permission: { rules: typeof rules } }).permission = { rules }
+    const cleanup = await plugin.setup(fixture.context)
+
+    await fixture.hookCallbacks[0]!({ sessionID: "plan-root", agent: "plan", tools: {}, system: [] })
+
+    expect(rules).toHaveBeenCalledOnce()
+    expect(fixture.context.session.update).not.toHaveBeenCalled()
     if (typeof cleanup === "function") await cleanup()
   })
 
@@ -408,11 +482,12 @@ describe("plugin setup", () => {
 
     const guard = fixture.toolHookCallbacks[0]!
     for (const agent of ["fast", "medium", "heavy"]) {
-      expect(() => guard({ tool: "subagent", input: { agent, model: "other/model" } }))
-        .toThrow(new RegExp(`Tier agent ${agent} owns its model configuration`))
+      await expect(guard({ tool: "subagent", input: { agent, model: "other/model" } }))
+        .rejects.toThrow(new RegExp(`Tier agent ${agent} owns its model configuration`))
     }
-    expect(() => guard({ tool: "subagent", input: { agent: "fast" } })).not.toThrow()
-    expect(() => guard({ tool: "subagent", input: { agent: "custom", model: "other/model" } })).not.toThrow()
+    await expect(guard({ tool: "subagent", input: { agent: "fast" } })).resolves.toBeUndefined()
+    await expect(guard({ tool: "subagent", input: { agent: "custom", model: "other/model" } }))
+      .resolves.toBeUndefined()
   })
 
   it("rolls back acquired registrations when tool-hook setup fails", async () => {

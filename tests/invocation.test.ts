@@ -1,20 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { planMutatingTierError, tierModelOverrideError } from "../src/invocation.js"
-
-describe("planMutatingTierError", () => {
-  it("rejects only explicit plan calls to mutating packaged tiers", () => {
-    expect(planMutatingTierError("plan", { agent: "medium" })).toContain("switch to Build to execute")
-    expect(planMutatingTierError("plan", { agent: "heavy" })).toContain("switch to Build to execute")
-    expect(planMutatingTierError("plan", { agent: "fast" })).toBeUndefined()
-    expect(planMutatingTierError("build", { agent: "medium" })).toBeUndefined()
-    expect(planMutatingTierError("customactor", { agent: "medium" })).toBeUndefined()
-  })
-
-  it("does not infer a target for resumed calls whose input omits agent", () => {
-    expect(planMutatingTierError("plan", { sessionID: "resumed", prompt: "continue" })).toBeUndefined()
-    expect(planMutatingTierError("plan", { prompt: "continue" })).toBeUndefined()
-  })
-})
+import { tierModelOverrideError } from "../src/invocation.js"
 
 describe("tierModelOverrideError", () => {
   it("rejects a model override for every packaged tier", () => {

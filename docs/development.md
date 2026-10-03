@@ -41,6 +41,11 @@ primary-to-`medium` native call, confirms that tier children do not receive the
 primary execution protocol, and checks native cancellation and provider-error
 outcomes without fallback.
 
+Plan dispatch is covered structurally by the unit suite: Plan may target any
+reserved tier, while its session-scoped read-only rules and inherited child
+context prevent edit, write, patch, and shell tools. The canonical `medium` and
+`heavy` permissions remain unchanged for Build-originated children.
+
 Run it with provider credentials and the configured models available:
 
 ```bash
@@ -138,6 +143,11 @@ session-scoped deny rule for external directories. Native children inherit that
 control. It is an evaluator control, not the normal plugin's permission policy:
 ordinary use keeps the host's `ask` behavior and does not auto-allow outside
 paths. A denied outside read remains tool evidence and an error metric.
+
+The plugin uses the host's native session permission setter for Plan sessions
+before dispatch, merging the current rules rather than replacing them. If the
+host cannot expose a supported setter, the dispatch hook fails closed instead of
+allowing an unverified Plan child.
 
 After a tiered delegation, the primary allowlist is native orchestration,
 read/search tools (`read`, `glob`, `grep`, `webfetch`, and `websearch`), and the
