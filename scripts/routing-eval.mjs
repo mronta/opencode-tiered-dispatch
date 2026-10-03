@@ -1,5 +1,8 @@
 import { mkdirSync, writeFileSync } from "node:fs"
 import { dirname, join } from "node:path"
+import { spawnSync } from "node:child_process"
+
+const READ_TOOLS = new Set(["read", "glob", "grep", "webfetch", "websearch"])
 
 export const scenarios = [
   { id: "trivial", text: "What is 2 + 2? Reply with just the number.", route: [] },
@@ -41,16 +44,42 @@ export function seedRoutingFixture(workspace) {
   }
 }
 
+export function checkFixture(workspace, scenarioID, nodeBinary = "node") {
+  if (!["known-scope", "discover-implement"].includes(scenarioID)) return []
+  const checks = {
+    "known-scope": "import { banner } from './src/banner.js'; assert.equal(banner('Ada'), 'Hello, Ada!')",
+    "discover-implement": `
+      import { saveName } from './src/controller.js'
+      assert.equal(saveName('   ').ok, false)
+      assert.equal(saveName(' abcdefghijklm ').ok, false)
+      assert.deepEqual(saveName(' abcdefghijkl '), { ok: true, name: 'abcdefghijkl', limit: 12 })
+    `,
+  }
+  const behavior = spawnSync(nodeBinary, ["--input-type=module", "-e", "import assert from 'node:assert/strict';\n" + checks[scenarioID]], { cwd: workspace, encoding: "utf8", timeout: 30_000 })
+  const args = scenarioID === "known-scope" ? ["--test", "test/banner.test.js"] : ["--test"]
+  const tests = spawnSync(nodeBinary, args, { cwd: workspace, encoding: "utf8", timeout: 30_000 })
+  return [behavior, tests].filter(result => result.status !== 0).map(result => `fixture verification failed: ${result.error?.message ?? result.stderr}\n${result.stdout}`)
+}
+
 export function routingObserverSource(paths, model) {
   // A test observer only: records native calls, never rewrites prompts or routes work.
   return `
-import { readFileSync, readdirSync, writeFileSync } from "node:fs"
+import { readFileSync, readdirSync, readlinkSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
+import { checkFixture } from ${JSON.stringify(import.meta.url)}
 function snapshotFiles(directory) {
-  return Object.fromEntries(["src", "test"].flatMap(base => readdirSync(join(directory, base), { recursive: true, withFileTypes: true }).filter(entry => entry.isFile()).map(entry => {
-    const filename = join(entry.parentPath, entry.name)
-    return [filename, readFileSync(filename, "utf8")]
-  })))
+  const files = {}
+  function visit(base) {
+    for (const entry of readdirSync(base, { withFileTypes: true })) {
+      const filename = join(base, entry.name)
+      if (entry.isDirectory()) {
+        if (!["node_modules", ".git"].includes(entry.name)) visit(filename)
+      } else if (entry.isSymbolicLink()) files[filename] = "symlink:" + readlinkSync(filename)
+      else if (entry.isFile()) files[filename] = readFileSync(filename).toString("base64")
+    }
+  }
+  visit(directory)
+  return files
 }
 export default {
   id: "tiered-routing-eval",
@@ -63,7 +92,7 @@ export default {
     }))
     for (const phase of ["before", "after"]) {
       registrations.push(await ctx.tool.hook("execute." + phase, event => {
-        tools.push({ phase, time: Date.now(), id: event.id, sessionID: event.sessionID, agent: event.agent, tool: event.tool, input: event.input, status: event.status })
+        tools.push({ phase, time: Date.now(), id: event.id, sessionID: event.sessionID, agent: event.agent, tool: event.tool, input: event.input, status: event.status, resultText: event.status === "completed" ? JSON.stringify(event.result) : undefined })
       }))
     }
     writeFileSync(${JSON.stringify(paths.marker)}, "ready")
@@ -88,7 +117,9 @@ export default {
           }
           const afterFiles = snapshotFiles(ctx.location.directory)
           const changedFiles = [...new Set([...Object.keys(beforeFiles), ...Object.keys(afterFiles)])].filter(path => beforeFiles[path] !== afterFiles[path])
-          results.push({ id: scenario.id, rootSessionID: root.id, elapsedMs: Date.now() - start, tools: tools.slice(toolStart), contexts: contexts.slice(contextStart), sessions, changedFiles })
+          const fixtureProblems = checkFixture(ctx.location.directory, scenario.id, ${JSON.stringify(process.execPath)})
+          if (scenario.id === "known-scope" && changedFiles.some(path => ![join(ctx.location.directory, "src/banner.js"), join(ctx.location.directory, "test/banner.test.js")].includes(path))) fixtureProblems.push("known-scope edit changed unrelated files")
+          results.push({ id: scenario.id, rootSessionID: root.id, elapsedMs: Date.now() - start, tools: tools.slice(toolStart), contexts: contexts.slice(contextStart), sessions, changedFiles, fixtureProblems })
         }
         writeFileSync(${JSON.stringify(paths.result)}, JSON.stringify(results))
       } catch (error) {
@@ -104,18 +135,33 @@ export default {
 export function assessRouting(result, expectedRoute) {
   const dispatches = result.tools.filter(event => event.phase === "before" && event.tool === "subagent" && event.sessionID === result.rootSessionID)
   const route = dispatches.map(event => event.input?.agent)
-  const problems = []
-  if (JSON.stringify(route) !== JSON.stringify(expectedRoute)) problems.push(`expected ${expectedRoute.join("→") || "direct"}; observed ${route.join("→") || "direct"}`)
+  const problems = [...(result.fixtureProblems ?? [])]
+  const executionTier = expectedRoute.at(-1)
+  const matchesRoute = expectedRoute.length === 0 ? route.length === 0
+    : route[0] === expectedRoute[0] && route.at(-1) === executionTier
+      && route.every(tier => tier === "fast" || tier === executionTier)
+  if (!matchesRoute) problems.push(`expected ${expectedRoute.join("→") || "direct"} (focused discovery/resume cycles allowed); observed ${route.join("→") || "direct"}`)
   if (result.sessions.some(session => session.outcome !== "succeeded")) problems.push("one or more sessions did not succeed")
   if (result.contexts && !result.contexts.some(event => event.sessionID === result.rootSessionID && event.hasProtocol)) problems.push("primary routing protocol was not observed")
-  for (let index = 1; index < dispatches.length; index++) {
-    const previous = dispatches[index - 1]
-    const completed = result.tools.findIndex(event => event.phase === "after" && event.id === previous.id && event.status === "completed")
-    if (completed < 0 || completed >= result.tools.indexOf(dispatches[index])) problems.push("dependent phases overlapped or discovery failed")
+  for (const dispatch of dispatches) {
+    const completion = result.tools.find(event => event.phase === "after" && event.id === dispatch.id && event.status === "completed")
+    if (!completion || result.tools.indexOf(completion) <= result.tools.indexOf(dispatch)) problems.push("native delegation did not complete")
+    if (dispatch.input?.agent === "fast") continue
+    const discoveryCalls = dispatches.filter(previous => previous.input?.agent === "fast" && result.tools.indexOf(previous) < result.tools.indexOf(dispatch))
+    for (const discovery of discoveryCalls) {
+      const completed = result.tools.findIndex(event => event.phase === "after" && event.id === discovery.id && event.status === "completed")
+      if (completed < 0 || completed >= result.tools.indexOf(dispatch)) problems.push("dependent phases overlapped or discovery failed")
+    }
+    const discovery = discoveryCalls.at(-1)
+    if (discovery) {
+      const evidence = result.tools.find(event => event.phase === "after" && event.id === discovery.id)?.resultText ?? ""
+      const paths = (evidence.match(/src\/[\w./-]+/g) ?? []).map(path => path.replace(/\.+$/, ""))
+      if (!paths.some(path => dispatch.input?.prompt?.includes(path))) problems.push("execution prompt did not carry discovered file evidence")
+    }
   }
-  if (dispatches.length >= 2 && expectedRoute.length === 2 && !/src\//.test(dispatches[1]?.input?.prompt ?? "")) problems.push("execution prompt did not carry discovered file paths")
   if (result.tools.some(event => event.phase === "after" && event.tool === "subagent" && event.status === "error")) problems.push("a native delegation failed")
-  const primaryReads = result.tools.filter(event => event.phase === "before" && event.sessionID === result.rootSessionID && ["read", "glob", "grep", "webfetch", "websearch"].includes(event.tool))
+  const readCalls = result.tools.filter(event => event.phase === "before" && READ_TOOLS.has(event.tool))
+  const primaryReads = readCalls.filter(event => event.sessionID === result.rootSessionID)
   const directReads = primaryReads.length
   if (directReads > 2) problems.push(`primary exceeded discovery budget: ${directReads} calls`)
   const usage = result.sessions.flatMap(session => session.usage)
@@ -127,7 +173,6 @@ export function assessRouting(result, expectedRoute) {
   }, { input: 0, output: 0, reasoning: 0, cachedRead: 0 })
   const firstDispatchIndex = dispatches.length > 0 ? result.tools.indexOf(dispatches[0]) : result.tools.length
   const readsBeforeDispatch = primaryReads.filter(event => result.tools.indexOf(event) < firstDispatchIndex).length
-  const readCalls = result.tools.filter(event => event.phase === "before" && ["read", "glob", "grep", "webfetch", "websearch"].includes(event.tool))
   const readFingerprints = readCalls.map(event => `${event.tool}:${JSON.stringify(event.input)}`)
   const repeatedReads = readFingerprints.length - new Set(readFingerprints).size
   return { id: result.id, route, elapsedMs: result.elapsedMs, directReads, readsBeforeDispatch, repeatedReads, toolCalls: result.tools.filter(event => event.phase === "before").length, problems, tokens }

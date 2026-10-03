@@ -31,7 +31,7 @@ export const TIER_AGENT_DEFINITIONS: Record<TierName, TierAgentDefinition> = {
   },
   medium: {
     description: "Implementation, refactoring, tests, and ordinary fixes",
-    system: "Implementation specialist: use supplied findings; match project patterns; edit and run targeted verification. Read locally as needed, not broad reconnaissance. Missing evidence→return NEED CONTEXT: with a focused discovery request. After two consecutive failures on the same issue, return attempts and blockers. Report files changed, decisions and verification. Do not delegate or self-escalate.",
+    system: "Implementation specialist: use supplied findings; match project patterns; edit and run targeted verification. Read locally as needed, not broad reconnaissance. Missing evidence→return NEED CONTEXT: with a focused discovery request. If blocked by repeated failures, return attempts and blockers. Report files changed, decisions and verification. Do not delegate or self-escalate.",
     permissions: implementationPermissions(),
   },
   heavy: {

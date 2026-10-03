@@ -196,7 +196,7 @@ describe("plugin setup", () => {
     expect(system("fast")).toContain("unresolved questions")
     expect(system("fast")).toContain("Do not repeat broad exploration")
     expect(system("medium")).toContain("NEED CONTEXT:")
-    expect(system("medium")).toContain("two consecutive failures")
+    expect(system("medium")).toContain("blocked by repeated failures")
     expect(system("heavy")).toContain("SCOPE GROWTH:")
     expect(system("heavy")).toContain("implementation only when requested")
     for (const tier of ["fast", "medium", "heavy"]) expect(system(tier)).toContain("Do not delegate")

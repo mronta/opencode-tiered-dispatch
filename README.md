@@ -168,7 +168,7 @@ Tier instructions provide model-facing handoffs:
 - `fast`: stop once the ask is satisfied; report evidence and unresolved questions,
   or `NEED MORE:` with missing evidence.
 - `medium`: use supplied findings; return `NEED CONTEXT:` rather than doing broad
-  reconnaissance. Stop and report attempts after two consecutive failures.
+  reconnaissance. Report attempts and blockers when repeated failures prevent progress.
 - `heavy`: use supplied evidence; return `SCOPE GROWTH:` when more discovery is
   needed. Implement only when requested.
 
@@ -280,11 +280,18 @@ npm run eval:routing
 This optional, provider-consuming evaluation uses ordinary requests without
 asking the model to delegate: trivial arithmetic, a known-scope edit, discovery
 followed by implementation, and discovery followed by security analysis. It
-records native call order/completion, file-path handoff hints, primary read
+records native call order/completion, shared file-path evidence in handoffs, primary read
 counts, exact repeated-read inputs across tiers, latency and reported token usage,
-and checks fixture behavior/tests. Repeated reads are diagnostic, not necessarily
+and checks fixture behavior/tests immediately after each edit scenario. Focused
+discovery/resume cycles are accepted. No-edit snapshots cover workspace files
+outside `.git` and `node_modules`, not external paths or a security sandbox.
+Handoff checks are structural, not proof that all findings were understood.
+Repeated reads are diagnostic, not necessarily
 redundant (for example, rereading after an edit can be necessary).
 It exits nonzero when observed routing misses the expected route or read budget.
+The read-budget flag conservatively counts all primary read-only calls, including
+integration verification; the report separately shows reads before the first
+delegation so over-exploration can be distinguished from final verification.
 It is intentionally separate from the smoke test: nondeterministic model
 compliance is not a structural plugin test. Passing examples do not guarantee
 general splitting or establish net cost savings. It inherits the host's global
@@ -292,7 +299,8 @@ configuration and credentials; its files live in a temporary fixture workspace.
 
 Initial live evaluation with a medium-tier primary produced both composite
 routes (`fast → medium` and `fast → heavy`), but performed the known-scope edit
-directly and exceeded primary read budgets. This remains an advisory-routing
+directly and exceeded primary read budgets. A later run executed both composites
+directly too: decomposition is not repeatable yet. This remains an advisory-routing
 limitation; the evaluator reports it rather than forcing a passing outcome.
 
 ### Prompt token budgets
@@ -302,7 +310,7 @@ npm run measure:prompts
 ```
 
 The default plugin-added primary protocol measures 361 tokens; tier instructions
-measure 62–71 tokens with `o200k_base`. The previous primary protocol was 440
+measure 62–68 tokens with `o200k_base`. The previous primary protocol was 440
 tokens with the same encoding (~18% reduction despite added handoff contracts).
 Tests budget 380 primary tokens and 85 per tier. Custom taxonomy/instructions
 can increase these sizes. The encoding is a reproducible proxy, not a verified

@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
-import { spawn, spawnSync } from "node:child_process"
+import { spawn } from "node:child_process"
 import net from "node:net"
 import { assessRouting, routingObserverSource, scenarios, seedRoutingFixture } from "./routing-eval.mjs"
 
@@ -73,7 +73,7 @@ try {
   if (!agentResponse.ok) throw new Error(`could not read native agent catalog: HTTP ${agentResponse.status}`)
   const agentPayload = await agentResponse.json()
   try {
-    if (routingEval) verifyRoutingEvaluation(result, workspace)
+    if (routingEval) verifyRoutingEvaluation(result)
     else verify(result, agentPayload.data ?? agentPayload, workspace, providerErrorModel)
   } catch (error) {
     throw new Error(`${error?.message ?? String(error)}\nOpenCode logs:\n${logs}`)
@@ -89,36 +89,24 @@ function formatFailure(failure, logs) {
   return `${failure}\nOpenCode logs:\n${logs}`
 }
 
-function verifyRoutingEvaluation(results, workspace) {
+function verifyRoutingEvaluation(results) {
   const reports = scenarios.map(scenario => {
     const result = results.find(candidate => candidate.id === scenario.id)
     if (!result) throw new Error(`routing evaluation missing scenario ${scenario.id}`)
     return assessRouting(result, scenario.route)
   })
+  const reportByID = new Map(reports.map(report => [report.id, report]))
   const trivial = results.find(result => result.id === "trivial")
   if (trivial.sessions.find(session => session.sessionID === trivial.rootSessionID)?.text.trim() !== "4") {
-    reports[0].problems.push("trivial answer was incorrect")
+    reportByID.get("trivial").problems.push("trivial answer was incorrect")
   }
   const analysis = results.find(result => result.id === "discover-analyze")
   const answer = analysis.sessions.find(session => session.sessionID === analysis.rootSessionID)?.text ?? ""
   if (!/replay/i.test(answer) || !/forg|unauthenticated|signature/i.test(answer) || !/src\/auth\//.test(answer)) {
-    reports.at(-1).problems.push("security answer omitted replay, identity forgery or file evidence")
+    reportByID.get("discover-analyze").problems.push("security answer omitted replay, identity forgery or file evidence")
   }
   if (analysis.changedFiles.length > 0) {
-    reports.at(-1).problems.push("analysis modified fixture files despite no-edit request")
-  }
-  const check = spawnSync(process.execPath, ["--input-type=module", "-e", `
-    import assert from 'node:assert/strict'
-    import { banner } from './src/banner.js'
-    import { saveName } from './src/controller.js'
-    assert.equal(banner('Ada'), 'Hello, Ada!')
-    assert.equal(saveName('   ').ok, false)
-    assert.equal(saveName(' abcdefghijklm ').ok, false)
-    assert.deepEqual(saveName(' abcdefghijkl '), { ok: true, name: 'abcdefghijkl', limit: 12 })
-  `], { cwd: workspace, encoding: "utf8" })
-  const tests = spawnSync("npm", ["test"], { cwd: workspace, encoding: "utf8" })
-  if (check.status !== 0 || tests.status !== 0) {
-    reports[2].problems.push(`fixture verification failed: ${check.stderr}\n${tests.stdout}\n${tests.stderr}`)
+    reportByID.get("discover-analyze").problems.push("analysis modified fixture files despite no-edit request")
   }
   console.log(JSON.stringify(reports, null, 2))
   if (reports.some(report => report.problems.length > 0)) {
