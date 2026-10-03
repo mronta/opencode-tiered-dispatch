@@ -362,15 +362,13 @@ function verify(result, agents, workspace, configuredProviderErrorModel) {
   ) {
     throw new Error(`native cancellation was not preserved: ${JSON.stringify(result.lifecycle)}`)
   }
-  const providerExpected = modelRef({ model: configuredProviderErrorModel })
   const providerAgent = agents.find((candidate) => candidate.id === "provider-error")
   const providerFailure = result.lifecycle?.providerFailure
   if (
     result.expectedProviderErrorModel !== configuredProviderErrorModel
     || !["succeeded", "failed"].includes(providerFailure?.rootOutcome)
     || providerAgent?.mode !== "subagent"
-    || providerAgent.model?.providerID !== providerExpected.providerID
-    || providerAgent.model?.id !== providerExpected.id
+    || !matchesExpectedModel(providerAgent?.model, { model: configuredProviderErrorModel })
     || !providerFailure.error
     || !providerFailure.error.includes(configuredProviderErrorModel)
     || !Array.isArray(providerFailure.toolErrors)
