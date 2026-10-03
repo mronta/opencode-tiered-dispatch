@@ -1,0 +1,8 @@
+node_modules/
+dist/
+/.dist-stage-*
+/.dist-backup-*
+/.dist-replacement.lock
+coverage/
+*.tgz
+.DS_Store

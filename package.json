@@ -1,0 +1,55 @@
+{
+  "name": "opencode-tiered-dispatch",
+  "version": "0.1.0",
+  "description": "Native tiered model delegation for OpenCode V2",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "index.js",
+    "dist/",
+    "src/",
+    "tiers.json",
+    "README.md",
+    "docs/",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepack": "npm run build",
+    "smoke:package": "node scripts/package-smoke.mjs",
+    "smoke:opencode": "npm run build && node scripts/opencode-native-smoke.mjs",
+    "smoke:opencode:config": "npm run smoke:opencode",
+    "eval:routing": "npm run build && node scripts/opencode-native-smoke.mjs --routing-eval",
+    "benchmark:routing": "npm run build && node scripts/routing-benchmark.mjs",
+    "measure:prompts": "npm run build && node scripts/prompt-size.mjs"
+  },
+  "keywords": [
+    "opencode",
+    "plugin",
+    "model-routing",
+    "delegation"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.19.0",
+    "opencode": ">=2.0.19 <3"
+  },
+  "dependencies": {
+    "@opencode/plugin": "2.0.19"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "js-tiktoken": "^1.0.21",
+    "typescript": "^5.8.2",
+    "vitest": "^4.1.11"
+  }
+}
