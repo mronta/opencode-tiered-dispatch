@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest"
 import type { AgentCatalogEntry } from "../src/catalog.js"
 import plugin from "../src/index.js"
 import { PLAN_READONLY_INSTRUCTION } from "../src/plan-safety.js"
-import { modelCatalog, requiredTierOptions, tierModel } from "./tier-fixtures.js"
+import { modelCatalog, defaultTierOptions, tierModel } from "./tier-fixtures.js"
 
 const models = modelCatalog()
 
@@ -25,7 +25,11 @@ interface FixtureFailures {
   dispose?: Partial<Record<"agent" | "tool" | "prompt" | "context", Error>>
 }
 
-function makeContext(options: Record<string, unknown>, failures: FixtureFailures = {}): {
+function makeContext(
+  options: Record<string, unknown>,
+  failures: FixtureFailures = {},
+  availableModels = models,
+): {
   context: Context
   agents: FixtureAgent[]
   setAgentCatalog: (agents: FixtureAgent[]) => void
@@ -88,7 +92,7 @@ function makeContext(options: Record<string, unknown>, failures: FixtureFailures
   const context = {
     options,
     model: {
-      list: vi.fn(async () => ({ data: models })),
+      list: vi.fn(async () => ({ data: availableModels })),
     },
     agent: {
       list: vi.fn(async () => ({ data: agentCatalog })),
@@ -164,7 +168,7 @@ function makeContext(options: Record<string, unknown>, failures: FixtureFailures
 }
 
 const options = {
-  tiers: requiredTierOptions(),
+  tiers: defaultTierOptions(),
 }
 
 describe("plugin setup", () => {
@@ -218,6 +222,54 @@ describe("plugin setup", () => {
     expect(fixture.disposes.prompt).toHaveBeenCalledOnce()
     expect(fixture.disposes.tool).toHaveBeenCalledOnce()
     expect(fixture.disposes.agent).toHaveBeenCalledOnce()
+  })
+
+  it("materializes transformed agents with resolved custom mappings", async () => {
+    const customOptions = {
+      tiers: {
+        fast: { model: "provider/custom-fast", variant: "balanced" },
+        medium: { model: "provider/custom-medium" },
+        heavy: { variant: "careful" },
+      },
+    }
+    const heavyDefault = tierModel("heavy")
+    const customModels = [
+      {
+        providerID: "provider",
+        id: "custom-fast",
+        enabled: true,
+        capabilities: { tools: true },
+        variants: [{ id: "balanced" }],
+      },
+      {
+        providerID: "provider",
+        id: "custom-medium",
+        enabled: true,
+        capabilities: { tools: true },
+        variants: [],
+      },
+      {
+        providerID: heavyDefault.providerID,
+        id: heavyDefault.id,
+        enabled: true,
+        capabilities: { tools: true },
+        variants: [{ id: "careful" }],
+      },
+    ]
+    const fixture = makeContext(customOptions, {}, customModels)
+
+    await plugin.setup(fixture.context)
+
+    expect(fixture.agents.find((agent) => agent.id === "fast")).toMatchObject({
+      model: { providerID: "provider", id: "custom-fast", variant: "balanced" },
+    })
+    expect(fixture.agents.find((agent) => agent.id === "medium")).toMatchObject({
+      model: { providerID: "provider", id: "custom-medium" },
+    })
+    expect(fixture.agents.find((agent) => agent.id === "medium")?.model).not.toHaveProperty("variant")
+    expect(fixture.agents.find((agent) => agent.id === "heavy")).toMatchObject({
+      model: { providerID: heavyDefault.providerID, id: heavyDefault.id, variant: "careful" },
+    })
   })
 
   it("does not inspect catalogs or register behavior when disabled", async () => {
@@ -554,7 +606,7 @@ describe("plugin setup", () => {
       ...options,
       tiers: {
         ...options.tiers,
-        medium: { ...requiredTierOptions().medium, instructions: "Keep the patch minimal" },
+        medium: { ...defaultTierOptions().medium, instructions: "Keep the patch minimal" },
       },
     })
     await plugin.setup(fixture.context)

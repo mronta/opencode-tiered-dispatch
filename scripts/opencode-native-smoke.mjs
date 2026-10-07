@@ -76,7 +76,7 @@ async function runNativeSmoke(argv = process.argv.slice(2)) {
   // CLI-only runtime dependencies are loaded after argument parsing/import of
   // this module.  The pure parser and evidence helpers are also used by the
   // pre-build test suite, where dist/ intentionally does not exist yet.
-  const [{ modelSelection }, { REQUIRED_TIER_MODELS }] = await Promise.all([
+  const [{ modelSelection }, { DEFAULT_TIER_MODELS }] = await Promise.all([
     import("../dist/options.js"),
     import("../dist/tiers.js"),
   ])
@@ -96,9 +96,9 @@ async function runNativeSmoke(argv = process.argv.slice(2)) {
     controlDirectory: control,
   }
 
-  const requiredTierModels = REQUIRED_TIER_MODELS
+  const defaultTierModels = DEFAULT_TIER_MODELS
   const providerErrorModel = "openai/__tiered_dispatch_missing_model__"
-  const rootModel = runtimeModelSelection(requiredTierModels.medium.model, requiredTierModels.medium.variant)
+  const rootModel = runtimeModelSelection(defaultTierModels.medium.model, defaultTierModels.medium.variant)
   const hostVersion = detectHostVersion()
   let startupMs = null
   let observedResults
@@ -130,7 +130,7 @@ async function runNativeSmoke(argv = process.argv.slice(2)) {
   if (routingEval) seedRoutingFixture(workspace)
   writeFileSync(join(workspace, ".opencode", "plugins", "native-smoke-observer.js"), routingEval
     ? routingObserverSource(paths, rootModel, { nodeBinary: process.execPath, arm, hideRootSubagent: arm === "direct", scenarios: selectedScenarios })
-    : observerSource(paths, rootModel, requiredTierModels, providerErrorModel, runDeadline))
+    : observerSource(paths, rootModel, defaultTierModels, providerErrorModel, runDeadline))
 
   const port = await freePort()
   const password = `native-smoke-${Date.now()}`
@@ -184,7 +184,7 @@ async function runNativeSmoke(argv = process.argv.slice(2)) {
     const initialAgentResponse = initialAgent.response
     if (!initialAgentResponse.ok) throw new Error(`could not read initial native agent catalog: HTTP ${initialAgentResponse.status}`)
     if (!routingEval || arm === "tiered") {
-      verifyMaterializedAgents(initialAgent.data?.data ?? [], requiredTierModels)
+      verifyMaterializedAgents(initialAgent.data?.data ?? [], defaultTierModels)
     }
 
     await waitForDeadline(() => existsSync(paths.result) || existsSync(paths.failure), undefined, () => sanitizeDiagnosticText(logs, password), {
@@ -210,7 +210,7 @@ async function runNativeSmoke(argv = process.argv.slice(2)) {
         const beforeEvaluator = snapshotRoutingWorkspace(workspace)
         let evaluatorError
         try {
-          observedReports = verifyRoutingEvaluation(result, arm, requiredTierModels, rootModel, selectedScenarios)
+          observedReports = verifyRoutingEvaluation(result, arm, defaultTierModels, rootModel, selectedScenarios)
         } catch (error) {
           evaluatorError = error
           if (error?.reports !== undefined) observedReports = error.reports
@@ -227,7 +227,7 @@ async function runNativeSmoke(argv = process.argv.slice(2)) {
     writeArtifact(outputPath, makeArtifact({
       arm,
       rootModel,
-      tierModels: requiredTierModels,
+      tierModels: defaultTierModels,
       hostVersion,
       startupMs,
       timeoutMs: nativeOptions.timeoutMs,
@@ -263,7 +263,7 @@ async function runNativeSmoke(argv = process.argv.slice(2)) {
       writeArtifact(diagnosticOutputPath, makeArtifact({
         arm,
         rootModel,
-        tierModels: requiredTierModels,
+        tierModels: defaultTierModels,
         hostVersion,
         startupMs,
         timeoutMs: nativeOptions.timeoutMs,
