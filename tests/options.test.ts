@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest"
 import { modelSelection, parseModelReference, parseOptions } from "../src/options.js"
-import { requiredTierOptions } from "./tier-fixtures.js"
+import { defaultTierOptions } from "./tier-fixtures.js"
 
 const valid = {
-  tiers: requiredTierOptions(),
+  tiers: defaultTierOptions(),
 }
 
 describe("parseOptions", () => {
@@ -12,7 +12,7 @@ describe("parseOptions", () => {
       enabled: true,
       directThreshold: "trivial",
       logging: false,
-      tiers: { medium: { modelRef: parseModelReference(requiredTierOptions().medium.model) } },
+      tiers: { medium: { modelRef: parseModelReference(defaultTierOptions().medium.model) } },
     })
   })
 
@@ -33,23 +33,23 @@ describe("parseOptions", () => {
       .toThrow(/unknown field/)
     expect(() => parseOptions({
       enabled: false,
-      tiers: { fast: { ...requiredTierOptions().fast, cost: 1 } },
+      tiers: { fast: { ...defaultTierOptions().fast, cost: 1 } },
     })).toThrow(/unknown field: cost/)
   })
 
   it("rejects unknown fields", () => {
     expect(() => parseOptions({ ...valid, fallback: true })).toThrow(/unknown field: fallback/)
-    expect(() => parseOptions({ tiers: { ...valid.tiers, fast: { ...requiredTierOptions().fast, cost: 1 } } }))
+    expect(() => parseOptions({ tiers: { ...valid.tiers, fast: { ...defaultTierOptions().fast, cost: 1 } } }))
       .toThrow(/unknown field: cost/)
   })
 
   it("defaults the packaged tier models when tiers are omitted", () => {
     expect(parseOptions({})).toMatchObject({
       enabled: true,
-      tiers: requiredTierOptions(),
+      tiers: defaultTierOptions(),
     })
     expect(parseOptions({ tiers: { medium: { instructions: "Keep the patch small" } } }))
-      .toMatchObject({ tiers: { medium: { instructions: "Keep the patch small", ...requiredTierOptions().medium } } })
+      .toMatchObject({ tiers: { medium: { instructions: "Keep the patch small", ...defaultTierOptions().medium } } })
   })
 
   it("rejects null instead of defaulting directThreshold", () => {
@@ -61,11 +61,41 @@ describe("parseOptions", () => {
     expect(() => parseOptions({ ...valid, taxonomy: { other: ["x"] } })).toThrow(/unknown field/)
   })
 
-  it("requires the configured tier model mapping", () => {
-    expect(() => parseOptions({
+  it("accepts a custom tier model mapping", () => {
+    const parsed = parseOptions({
       ...valid,
-      tiers: { ...valid.tiers, fast: { model: "openai/other" } },
-    })).toThrow(/options\.tiers\.fast must use model/)
+      tiers: {
+        fast: { model: "provider/custom", variant: "deliberate" },
+        medium: { model: "provider/defaulted" },
+        heavy: { variant: "careful" },
+      },
+    })
+    expect(parsed).toMatchObject({
+      tiers: {
+        fast: {
+          model: "provider/custom",
+          modelRef: { providerID: "provider", id: "custom" },
+          variant: "deliberate",
+        },
+        medium: {
+          model: "provider/defaulted",
+          modelRef: { providerID: "provider", id: "defaulted" },
+        },
+        heavy: {
+          model: defaultTierOptions().heavy.model,
+          modelRef: parseModelReference(defaultTierOptions().heavy.model),
+          variant: "careful",
+        },
+      },
+    })
+    expect(parsed.enabled && parsed.tiers.medium.variant).toBeUndefined()
+  })
+
+  it("keeps strict model and variant validation for custom mappings", () => {
+    expect(() => parseOptions({ tiers: { fast: { model: "not-a-model" } } }))
+      .toThrow(/provider\/model/)
+    expect(() => parseOptions({ tiers: { fast: { model: "provider/model", variant: "" } } }))
+      .toThrow(/variant must be a non-empty string/)
   })
 })
 

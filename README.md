@@ -19,8 +19,9 @@ configuration below.
 - OpenCode V2 in the supported range `>=2.0.19 <3`. Hosts specifically tested
   here are `2.0.19` and `2.0.22`; that is not a promise that every future host
   release has been tested.
-- An enabled, tool-capable provider model for every exact model and variant in
-  the [canonical tier table](#canonical-tiers).
+- An enabled, tool-capable provider model for every configured tier mapping. If a
+  tier mapping is omitted, the packaged default in the [default tier table](#default-tiers)
+  is used.
 
 ## Install from this local checkout
 
@@ -70,25 +71,50 @@ opencode debug agents
 
 Confirm that `fast`, `medium`, and `heavy` are present.
 
-The provider must expose each exact model below as enabled and tool-capable.
-Choose a capable primary model in your normal OpenCode configuration. The
-primary/root model remains user-selected; this plugin does not replace it, does
-not require a particular pricey model, and does not guarantee that the primary
-never executes work.
+The provider must expose each packaged default below, or each user-configured
+replacement, as enabled and tool-capable. Choose a capable primary model in your
+normal OpenCode configuration. The primary/root model remains user-selected;
+this plugin does not replace it, does not require a particular pricey model, and
+does not guarantee that the primary never executes work.
 
-## Canonical tiers
+## Default tiers
 
-The defaults are pinned in [`tiers.json`](tiers.json). The provider/model and
-variant must match exactly; the provider also needs to make tools available.
+The packaged defaults are loaded from [`tiers.json`](tiers.json). They are
+fallbacks, not a fixed model policy: configure a tier's `model` and optional
+`variant` to use another active, tool-capable catalog entry.
 
 | Tier | Model and variant | Intended work | Permissions |
 |---|---|---|---|
-| `fast` | `openai/gpt-6-luna#medium` | Discovery, focused reads, search, and research | Read-only |
-| `medium` | `openai/gpt-5.6-luna#max` | Implementation, refactoring, tests, and ordinary fixes | Edits allowed |
-| `heavy` | `openai/gpt-5.6-sol#medium` | Architecture, security, difficult debugging, and high-risk reasoning | Edits allowed |
+| `fast` | `openai/gpt-6-luna-fast#medium` | Discovery, focused reads, search, and research | Read-only |
+| `medium` | `openai/gpt-5.6-luna-fast#max` | Implementation, refactoring, tests, and ordinary fixes | Edits allowed |
+| `heavy` | `openai/gpt-6.1-sol#medium` | Architecture, security, difficult debugging, and high-risk reasoning | Edits allowed |
 
-The plugin validates these references against the active model catalog. It does
-not substitute another model or variant when one is unavailable.
+The plugin validates the resolved references against the active model catalog. It
+does not substitute another model or variant when a configured reference is
+unavailable.
+
+### Migration note
+
+The packaged defaults changed from `fast: openai/gpt-6-luna#medium`,
+`medium: openai/gpt-5.6-luna#max`, and `heavy: openai/gpt-5.6-sol#medium` to
+the mappings in the table above. On startup, the plugin checks every resolved
+mapping against the active catalog and fails fast when a model, capability, or
+variant is unavailable; it does not silently fall back to another default.
+
+To retain the previous mapping, configure it explicitly in `options.tiers` and
+ensure those exact catalog entries remain enabled and tool-capable:
+
+```jsonc
+{
+  "options": {
+    "tiers": {
+      "fast": { "model": "openai/gpt-6-luna", "variant": "medium" },
+      "medium": { "model": "openai/gpt-5.6-luna", "variant": "max" },
+      "heavy": { "model": "openai/gpt-5.6-sol", "variant": "medium" }
+    }
+  }
+}
+```
 
 ## What a normal request looks like
 
@@ -122,8 +148,9 @@ guarantee that every request creates a child session.
 - With `enabled: false`, the plugin is a no-op: it leaves the user's agents and
   their configuration untouched.
 - While enabled, `fast`, `medium`, and `heavy` are reserved names. The plugin
-  applies their canonical hidden/step/request behavior, model, instructions,
-  and permissions, overwriting user values in those behavioral fields.
+  applies their canonical hidden/step/request behavior and permissions, plus the
+  resolved configured model and instructions, overwriting user values in those
+  behavioral fields.
   Cosmetic `color` configuration is preserved.
 - The built-in `Plan` agent receives no execution protocol and can invoke all
   three plugin tiers. A Plan root carries a nonrestrictive origin marker;
@@ -167,8 +194,16 @@ Put options on the plugin object:
     "directThreshold": "trivial",
     "logging": false,
     "tiers": {
+      "fast": {
+        "model": "provider/fast-model",
+        "variant": "balanced"
+      },
       "medium": {
+        "model": "provider/medium-model",
         "instructions": "Prefer the repository's existing validation patterns."
+      },
+      "heavy": {
+        "variant": "max"
       }
     }
   }
@@ -183,13 +218,18 @@ Defaults are:
 | `directThreshold` | `"trivial"` | Permit genuinely trivial one-step work directly; use `"never"` to request delegation for every executable task |
 | `logging` | `false` | Disable plugin diagnostic logging |
 | `taxonomy` | Built-in categories | Add category phrases to the classification guidance |
-| `tiers` | The canonical table above | Add tier instructions |
+| `tiers` | The packaged default mapping for each tier | Override model/variant and add tier instructions |
 
-Tier `instructions` are additive. Keep the canonical `model` and `variant`; the
-plugin validates and owns those values, so changing them is not a supported
-customization. Taxonomy entries extend the defaults and are deduplicated. The
-threshold is model-facing guidance, not a hard block on the primary's native
-tools; the options parser rejects unknown fields.
+Tier mappings are resolved independently. An omitted tier, or a tier containing
+only `instructions`, uses its packaged model and variant. A custom `model` with
+an explicit `variant` uses both custom values. A custom `model` without a
+`variant` leaves the internal variant undefined so the provider selects its
+default. A `variant` without a custom `model` keeps the packaged model and uses
+the supplied variant. Every resolved model must exist in the active catalog, be
+enabled and tool-capable, and expose the configured variant when one is given.
+Tier `instructions` are additive. Taxonomy entries extend the defaults and are
+deduplicated. The threshold is model-facing guidance, not a hard block on the
+primary's native tools; the options parser rejects unknown fields.
 
 ## Lifecycle
 

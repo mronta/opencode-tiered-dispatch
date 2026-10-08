@@ -3,9 +3,9 @@ import { getEncoding } from "js-tiktoken"
 import { TIER_AGENT_DEFINITIONS } from "../src/agents.js"
 import { parseOptions } from "../src/options.js"
 import { buildRoutingProtocol } from "../src/protocol.js"
-import { requiredTierOptions } from "./tier-fixtures.js"
+import { defaultTierOptions } from "./tier-fixtures.js"
 
-const tierConfig = requiredTierOptions()
+const tierConfig = defaultTierOptions()
 
 const options = parseOptions({
   tiers: tierConfig,

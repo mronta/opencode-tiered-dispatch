@@ -9,16 +9,16 @@ export function isTierName(value: unknown): value is TierName {
   return typeof value === "string" && (TIER_NAMES as readonly string[]).includes(value)
 }
 
-export interface RequiredTierModel {
+export interface DefaultTierModel {
   model: string
   variant?: string
 }
 
 const TIER_CONFIG_FIELDS = new Set(["model", "variant"])
 
-export const REQUIRED_TIER_MODELS: Record<TierName, RequiredTierModel> = loadRequiredTierModels()
+export const DEFAULT_TIER_MODELS: Record<TierName, DefaultTierModel> = loadDefaultTierModels()
 
-function loadRequiredTierModels(): Record<TierName, RequiredTierModel> {
+function loadDefaultTierModels(): Record<TierName, DefaultTierModel> {
   let value: unknown
   try {
     value = JSON.parse(readFileSync(new URL("../tiers.json", import.meta.url), "utf8"))
@@ -35,7 +35,7 @@ function loadRequiredTierModels(): Record<TierName, RequiredTierModel> {
     throw new ConfigurationError(`tiers.json contains unknown tier${unknownTiers.length === 1 ? "" : "s"}: ${unknownTiers.join(", ")}`)
   }
 
-  const output = {} as Record<TierName, RequiredTierModel>
+  const output = {} as Record<TierName, DefaultTierModel>
   for (const tier of TIER_NAMES) {
     const entry = input[tier]
     if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
@@ -58,18 +58,4 @@ function loadRequiredTierModels(): Record<TierName, RequiredTierModel> {
     }
   }
   return output
-}
-
-export function assertRequiredTierModel(
-  tier: TierName,
-  model: string,
-  variant: string | undefined,
-  path = `options.tiers.${tier}`,
-): void {
-  const required = REQUIRED_TIER_MODELS[tier]
-  if (model === required.model && variant === required.variant) return
-  const requiredReference = required.variant === undefined
-    ? required.model
-    : `${required.model}#${required.variant}`
-  throw new ConfigurationError(`${path} must use model ${requiredReference}`)
 }

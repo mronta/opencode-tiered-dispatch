@@ -76,11 +76,13 @@ async function runNativeSmoke(argv = process.argv.slice(2)) {
   // CLI-only runtime dependencies are loaded after argument parsing/import of
   // this module.  The pure parser and evidence helpers are also used by the
   // pre-build test suite, where dist/ intentionally does not exist yet.
-  const [{ modelSelection }, { REQUIRED_TIER_MODELS }] = await Promise.all([
-    import("../dist/options.js"),
-    import("../dist/tiers.js"),
-  ])
+  const { modelSelection, parseOptions } = await import("../dist/options.js")
   runtimeModelSelection = modelSelection
+  const suppliedTiers = nativeOptions.tiers === undefined
+    ? undefined
+    : readNativeTierMapping(nativeOptions.tiers)
+  const resolvedOptions = resolveNativeTierOptions(suppliedTiers, parseOptions)
+  const tierModels = serializeNativeTierModels(resolvedOptions)
   const routingEval = nativeOptions.routingEval
   const arm = nativeOptions.arm
   const outputPath = nativeOptions.output
@@ -96,9 +98,8 @@ async function runNativeSmoke(argv = process.argv.slice(2)) {
     controlDirectory: control,
   }
 
-  const requiredTierModels = REQUIRED_TIER_MODELS
   const providerErrorModel = "openai/__tiered_dispatch_missing_model__"
-  const rootModel = runtimeModelSelection(requiredTierModels.medium.model, requiredTierModels.medium.variant)
+  const rootModel = runtimeModelSelection(tierModels.medium.model, tierModels.medium.variant)
   const hostVersion = detectHostVersion()
   let startupMs = null
   let observedResults
@@ -108,10 +109,7 @@ async function runNativeSmoke(argv = process.argv.slice(2)) {
   const nativeHttpTimeoutMs = Math.min(nativeOptions.timeoutMs, 30_000)
 
   mkdirSync(join(workspace, ".opencode", "plugins"), { recursive: true })
-  const pluginEntry = {
-    package: root,
-    ...(routingEval && arm === "direct" ? { options: { enabled: false } } : {}),
-  }
+  const pluginEntry = buildNativePluginEntry(root, { routingEval, arm, tiers: suppliedTiers })
   writeFileSync(join(workspace, "opencode.jsonc"), JSON.stringify({
     $schema: "https://opencode.ai/config.json",
     ...(routingEval ? {} : { agents: nativeAgents(providerErrorModel) }),
@@ -130,7 +128,7 @@ async function runNativeSmoke(argv = process.argv.slice(2)) {
   if (routingEval) seedRoutingFixture(workspace)
   writeFileSync(join(workspace, ".opencode", "plugins", "native-smoke-observer.js"), routingEval
     ? routingObserverSource(paths, rootModel, { nodeBinary: process.execPath, arm, hideRootSubagent: arm === "direct", scenarios: selectedScenarios })
-    : observerSource(paths, rootModel, requiredTierModels, providerErrorModel, runDeadline))
+    : observerSource(paths, rootModel, tierModels, providerErrorModel, runDeadline))
 
   const port = await freePort()
   const password = `native-smoke-${Date.now()}`
@@ -184,7 +182,7 @@ async function runNativeSmoke(argv = process.argv.slice(2)) {
     const initialAgentResponse = initialAgent.response
     if (!initialAgentResponse.ok) throw new Error(`could not read initial native agent catalog: HTTP ${initialAgentResponse.status}`)
     if (!routingEval || arm === "tiered") {
-      verifyMaterializedAgents(initialAgent.data?.data ?? [], requiredTierModels)
+      verifyMaterializedAgents(initialAgent.data?.data ?? [], tierModels)
     }
 
     await waitForDeadline(() => existsSync(paths.result) || existsSync(paths.failure), undefined, () => sanitizeDiagnosticText(logs, password), {
@@ -210,7 +208,7 @@ async function runNativeSmoke(argv = process.argv.slice(2)) {
         const beforeEvaluator = snapshotRoutingWorkspace(workspace)
         let evaluatorError
         try {
-          observedReports = verifyRoutingEvaluation(result, arm, requiredTierModels, rootModel, selectedScenarios)
+          observedReports = verifyRoutingEvaluation(result, arm, tierModels, rootModel, selectedScenarios)
         } catch (error) {
           evaluatorError = error
           if (error?.reports !== undefined) observedReports = error.reports
@@ -227,7 +225,7 @@ async function runNativeSmoke(argv = process.argv.slice(2)) {
     writeArtifact(outputPath, makeArtifact({
       arm,
       rootModel,
-      tierModels: requiredTierModels,
+      tierModels,
       hostVersion,
       startupMs,
       timeoutMs: nativeOptions.timeoutMs,
@@ -263,7 +261,7 @@ async function runNativeSmoke(argv = process.argv.slice(2)) {
       writeArtifact(diagnosticOutputPath, makeArtifact({
         arm,
         rootModel,
-        tierModels: requiredTierModels,
+        tierModels,
         hostVersion,
         startupMs,
         timeoutMs: nativeOptions.timeoutMs,
@@ -328,6 +326,7 @@ export function parseNativeOptions(argv) {
   let routingEval = false
   let arm = "tiered"
   let output
+  let tiers
   let timeoutMs = 600_000
   let scenario
   let armSpecified = false
@@ -337,7 +336,7 @@ export function parseNativeOptions(argv) {
       routingEval = true
       continue
     }
-    if (argument === "--arm" || argument === "--output" || argument === "--timeout-ms" || argument === "--scenario") {
+    if (argument === "--arm" || argument === "--output" || argument === "--tiers" || argument === "--timeout-ms" || argument === "--scenario") {
       const value = argv[++index]
       if (typeof value !== "string" || value.length === 0 || value.startsWith("--")) {
         throw new Error(`${argument} requires a value`)
@@ -347,6 +346,8 @@ export function parseNativeOptions(argv) {
         armSpecified = true
       } else if (argument === "--output") {
         output = resolve(value)
+      } else if (argument === "--tiers") {
+        tiers = resolve(value)
       } else if (argument === "--timeout-ms") {
         timeoutMs = parsePositiveTimeout(value)
       } else {
@@ -354,7 +355,7 @@ export function parseNativeOptions(argv) {
       }
       continue
     }
-    if (argument.startsWith("--arm=") || argument.startsWith("--output=") || argument.startsWith("--timeout-ms=") || argument.startsWith("--scenario=")) {
+    if (argument.startsWith("--arm=") || argument.startsWith("--output=") || argument.startsWith("--tiers=") || argument.startsWith("--timeout-ms=") || argument.startsWith("--scenario=")) {
       const separator = argument.indexOf("=")
       const name = argument.slice(0, separator)
       const value = argument.slice(separator + 1)
@@ -364,6 +365,8 @@ export function parseNativeOptions(argv) {
         armSpecified = true
       } else if (name === "--output") {
         output = resolve(value)
+      } else if (name === "--tiers") {
+        tiers = resolve(value)
       } else if (name === "--timeout-ms") {
         timeoutMs = parsePositiveTimeout(value)
       } else {
@@ -380,7 +383,74 @@ export function parseNativeOptions(argv) {
   if (routingEval && output === undefined) {
     output = join(tmpdir(), "opencode", `routing-eval-${Date.now()}-${process.pid}.json`)
   }
-  return { routingEval, arm, output, timeoutMs, scenario }
+  return {
+    routingEval,
+    arm,
+    output,
+    timeoutMs,
+    scenario,
+    ...(tiers === undefined ? {} : { tiers }),
+  }
+}
+
+export function readNativeTierMapping(filename) {
+  if (typeof filename !== "string" || filename.length === 0) {
+    throw new Error("--tiers requires a file path")
+  }
+  let text
+  try {
+    text = readFileSync(filename, "utf8")
+  } catch (error) {
+    throw new Error(`could not read --tiers file ${filename}: ${error?.message ?? String(error)}`, { cause: error })
+  }
+  let value
+  try {
+    value = JSON.parse(text)
+  } catch (error) {
+    throw new Error(`could not parse --tiers file ${filename} as JSON: ${error?.message ?? String(error)}`, { cause: error })
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(`--tiers file ${filename} must contain a JSON object mapping tier names to options`)
+  }
+  return value
+}
+
+export function resolveNativeTierOptions(tiers, parseOptionsImplementation) {
+  if (typeof parseOptionsImplementation !== "function") {
+    throw new Error("native smoke tier resolution requires the runtime parseOptions implementation")
+  }
+  try {
+    const options = parseOptionsImplementation(tiers === undefined ? {} : { tiers })
+    if (options?.enabled !== true || options.tiers === undefined) {
+      throw new Error("tier mapping did not resolve to enabled tier options")
+    }
+    return options
+  } catch (error) {
+    if (error?.message === "tier mapping did not resolve to enabled tier options") throw error
+    throw new Error(`invalid --tiers mapping: ${error?.message ?? String(error)}`, { cause: error })
+  }
+}
+
+export function serializeNativeTierModels(options) {
+  if (options?.enabled !== true || options.tiers === undefined) {
+    throw new Error("native smoke requires enabled resolved tier options")
+  }
+  return Object.fromEntries(Object.entries(options.tiers).map(([tier, configured]) => [tier, {
+    model: configured.model,
+    ...(configured.variant === undefined ? {} : { variant: configured.variant }),
+    ...(configured.instructions === undefined ? {} : { instructions: configured.instructions }),
+  }]))
+}
+
+export function buildNativePluginEntry(packageRoot, { routingEval = false, arm = "tiered", tiers } = {}) {
+  const disabled = routingEval && arm === "direct"
+  const options = tiers === undefined
+    ? (disabled ? { enabled: false } : undefined)
+    : { ...(disabled ? { enabled: false } : {}), tiers }
+  return {
+    package: packageRoot,
+    ...(options === undefined ? {} : { options }),
+  }
 }
 
 export function parsePositiveTimeout(value) {

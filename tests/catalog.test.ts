@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest"
 import { assertAgentsAvailable, assertModelsAvailable, type AgentCatalogEntry } from "../src/catalog.js"
 import { parseOptions } from "../src/options.js"
-import { modelCatalog, requiredTierOptions, tierModel } from "./tier-fixtures.js"
+import { customModelCatalog, customTierOptions, modelCatalog, defaultTierOptions, tierModel } from "./tier-fixtures.js"
 
 const parsed = parseOptions({
-  tiers: requiredTierOptions(),
+  tiers: defaultTierOptions(),
 })
 if (!parsed.enabled) throw new Error("test setup")
 
@@ -42,7 +42,7 @@ const agents = [
 ]
 
 describe("catalog validation", () => {
-  it("accepts available models and required agents", () => {
+  it("accepts available models and matching agents", () => {
     expect(() => assertModelsAvailable(parsed, models)).not.toThrow()
     expect(() => assertAgentsAvailable([
       { id: "build", mode: "primary" },
@@ -51,10 +51,22 @@ describe("catalog validation", () => {
       { id: "heavy", mode: "subagent" },
     ])).not.toThrow()
     expect(() => assertAgentsAvailable(agents, parsed)).not.toThrow()
+  })
 
-    const nativeDefault = structuredClone(agents) as AgentCatalogEntry[]
-    nativeDefault[0]!.model = { ...tierModel("fast"), variant: "default" }
-    expect(() => assertAgentsAvailable(nativeDefault, parsed)).toThrow(/model does not match/)
+  it("normalizes the provider-default variant only when configuration omits it", () => {
+    const custom = parseOptions({ tiers: { fast: { model: "provider/custom-fast" } } })
+    if (!custom.enabled) throw new Error("test setup")
+    const providerDefault = structuredClone(agents) as AgentCatalogEntry[]
+    providerDefault[0]!.model = {
+      providerID: "provider",
+      id: "custom-fast",
+      variant: "default",
+    }
+    expect(() => assertAgentsAvailable(providerDefault, custom)).not.toThrow()
+
+    const explicit = structuredClone(agents) as AgentCatalogEntry[]
+    explicit[0]!.model = { ...tierModel("fast"), variant: "default" }
+    expect(() => assertAgentsAvailable(explicit, parsed)).toThrow(/model does not match/)
   })
 
   it("rejects a native tier whose model or recursion guard does not match", () => {
@@ -97,7 +109,53 @@ describe("catalog validation", () => {
   it("rejects an unavailable variant", () => {
     const invalid = structuredClone(parsed)
     invalid.tiers.fast.variant = "max"
-    expect(() => assertModelsAvailable(invalid, models)).toThrow(/must use model/)
+    expect(() => assertModelsAvailable(invalid, models)).toThrow(/variant max is unavailable/)
+  })
+
+  it("accepts custom mappings when the active catalog satisfies them", () => {
+    const custom = parseOptions({
+      tiers: customTierOptions(),
+    })
+    if (!custom.enabled) throw new Error("test setup")
+
+    expect(() => assertModelsAvailable(custom, customModelCatalog())).not.toThrow()
+  })
+
+  it("rejects an unavailable variant for an otherwise available custom model", () => {
+    const custom = parseOptions({
+      tiers: customTierOptions("missing"),
+    })
+    if (!custom.enabled) throw new Error("test setup")
+
+    expect(() => assertModelsAvailable(custom, customModelCatalog()))
+      .toThrow(/variant missing is unavailable for provider\/custom-fast/u)
+  })
+
+  it("rejects unavailable, disabled, and non-tool-capable configured models", () => {
+    const custom = parseOptions({ tiers: { fast: { model: "provider/custom" } } })
+    if (!custom.enabled) throw new Error("test setup")
+    const unavailable = structuredClone(models)
+    expect(() => assertModelsAvailable(custom, unavailable)).toThrow(/provider\/custom is not in the active model catalog/)
+
+    const disabled = [
+      {
+        providerID: "provider",
+        id: "custom",
+        enabled: false,
+        capabilities: { tools: true },
+        variants: [],
+      },
+    ]
+    expect(() => assertModelsAvailable(custom, disabled)).toThrow(/provider\/custom is disabled/)
+
+    const noTools = [{
+      providerID: "provider",
+      id: "custom",
+      enabled: true,
+      capabilities: { tools: false },
+      variants: [],
+    }]
+    expect(() => assertModelsAvailable(custom, noTools)).toThrow(/provider\/custom does not support tools/)
   })
 
   it("rejects models without tools", () => {

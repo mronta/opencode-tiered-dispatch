@@ -1,4 +1,6 @@
 import { EventEmitter } from "node:events"
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { join } from "node:path"
 import { describe, expect, it, vi } from "vitest"
 import {
   fetchJsonWithDeadline,
@@ -6,11 +8,18 @@ import {
   waitForDeadline,
 } from "../scripts/native-http.mjs"
 import {
+  buildNativePluginEntry,
   NATIVE_PLAN_POLICY_RULES,
   NATIVE_PLAN_SAFE_TOOLS,
   effectiveNativePermission,
+  parseNativeOptions,
+  readNativeTierMapping,
+  resolveNativeTierOptions,
+  serializeNativeTierModels,
   verifyNativePlanEvidence,
 } from "../scripts/opencode-native-smoke.mjs"
+import { parseOptions } from "../src/options.js"
+import { DEFAULT_TIER_MODELS } from "../src/tiers.js"
 
 describe("native smoke HTTP deadlines", () => {
   it("aborts a fetch that never resolves", async () => {
@@ -98,6 +107,84 @@ describe("native smoke HTTP deadlines", () => {
     expect(failure).toMatchObject({ code: "NATIVE_SMOKE_TIMEOUT", lastPredicateError: original })
     expect(failure.cause).toBe(original)
     expect(failure.message).toContain("captured logs")
+  })
+})
+
+describe("native smoke custom tier mapping", () => {
+  it("uses the runtime parser and preserves custom model variant semantics", () => {
+    const directory = mkdtempSync(join("/tmp", "native-smoke-tier-mapping-"))
+    const filename = join(directory, "tiers.json")
+    const mapping = {
+      fast: { model: "provider/custom-fast", variant: "deliberate" },
+      medium: { model: "provider/custom-medium" },
+    }
+    writeFileSync(filename, JSON.stringify(mapping))
+    try {
+      expect(parseNativeOptions(["--tiers", filename]).tiers).toBe(filename)
+      const supplied = readNativeTierMapping(filename)
+      const resolved = resolveNativeTierOptions(supplied, parseOptions)
+      const effective = serializeNativeTierModels(resolved)
+
+      expect(effective).toMatchObject({
+        fast: { model: "provider/custom-fast", variant: "deliberate" },
+        medium: { model: "provider/custom-medium" },
+        heavy: DEFAULT_TIER_MODELS.heavy,
+      })
+      expect(effective.medium).not.toHaveProperty("variant")
+      expect(buildNativePluginEntry("/checkout", { tiers: supplied })).toEqual({
+        package: "/checkout",
+        options: { tiers: mapping },
+      })
+      expect(buildNativePluginEntry("/checkout", {
+        routingEval: true,
+        arm: "direct",
+        tiers: supplied,
+      })).toEqual({
+        package: "/checkout",
+        options: { enabled: false, tiers: mapping },
+      })
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  it("retains omitted, instructions-only, and variant-only mappings", () => {
+    const resolved = resolveNativeTierOptions({
+      medium: { instructions: "Keep the patch small" },
+      heavy: { variant: "careful" },
+    }, parseOptions)
+    const effective = serializeNativeTierModels(resolved)
+
+    expect(effective.fast).toEqual(DEFAULT_TIER_MODELS.fast)
+    expect(effective.medium).toEqual({
+      ...DEFAULT_TIER_MODELS.medium,
+      instructions: "Keep the patch small",
+    })
+    expect(effective.heavy).toEqual({
+      model: DEFAULT_TIER_MODELS.heavy.model,
+      variant: "careful",
+    })
+  })
+
+  it("rejects missing files, malformed JSON, and invalid tier fields", () => {
+    expect(() => readNativeTierMapping("/tmp/native-smoke-tiers-does-not-exist.json"))
+      .toThrow(/could not read --tiers file/u)
+
+    const directory = mkdtempSync(join("/tmp", "native-smoke-invalid-tiers-"))
+    const malformed = join(directory, "malformed.json")
+    const array = join(directory, "array.json")
+    writeFileSync(malformed, "not json")
+    writeFileSync(array, "[]")
+    try {
+      expect(() => readNativeTierMapping(malformed)).toThrow(/could not parse --tiers file/u)
+      expect(() => readNativeTierMapping(array)).toThrow(/must contain a JSON object/u)
+      expect(() => resolveNativeTierOptions({ fast: { cost: 1 } }, parseOptions))
+        .toThrow(/invalid --tiers mapping: options\.tiers\.fast contains unknown field/u)
+      expect(() => parseNativeOptions(["--tiers"])).toThrow(/requires a value/u)
+      expect(() => parseNativeOptions(["--tiers", "--routing-eval"])).toThrow(/requires a value/u)
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
   })
 })
 

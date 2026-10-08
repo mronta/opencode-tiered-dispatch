@@ -1,7 +1,7 @@
 import { ConfigurationError } from "./errors.js"
 import type { AgentPermissionRule } from "./agents.js"
 import type { EnabledRouterOptions, TierOptions } from "./options.js"
-import { assertRequiredTierModel, TIER_NAMES, type TierName } from "./tiers.js"
+import { TIER_NAMES, type TierName } from "./tiers.js"
 
 const FAST_READ_ACTIONS = new Set(["grep", "glob", "webfetch", "websearch", "read"])
 const IMPLEMENTATION_ACTIONS = ["edit", "write", "shell"] as const
@@ -26,7 +26,6 @@ export function assertModelsAvailable(
   models: readonly ModelCatalogEntry[],
 ): void {
   for (const tier of TIER_NAMES) {
-    assertRequiredTierModel(tier, options.tiers[tier].model, options.tiers[tier].variant)
     assertModelAvailable(tier, options.tiers[tier], models)
   }
 }
@@ -48,7 +47,7 @@ function assertModelAvailable(
   if (!model.capabilities.tools) {
     throw new ConfigurationError(`Tier ${tier} model ${configured.model} does not support tools`)
   }
-  if (configured.variant && !model.variants.some((variant) => variant.id === configured.variant)) {
+  if (configured.variant !== undefined && !model.variants.some((variant) => variant.id === configured.variant)) {
     const available = model.variants.map((variant) => variant.id).join(", ") || "none"
     throw new ConfigurationError(
       `Tier ${tier} variant ${configured.variant} is unavailable for ${configured.model}; available variants: ${available}`,
@@ -95,6 +94,10 @@ function assertAgentModel(agentID: TierName, agent: AgentCatalogEntry, options: 
   }
 }
 
+function normalizedVariant(actual: string | undefined, configured: string | undefined): string | undefined {
+  return configured === undefined && actual === "default" ? undefined : actual
+}
+
 function assertNoAgentRecursion(agentID: TierName, permissions: readonly AgentPermissionRule[]): void {
   const subagentRule = effectivePermission(permissions, "subagent")
   if (subagentRule?.effect !== "deny") {
@@ -137,10 +140,6 @@ function assertImplementationPermissions(
       throw new ConfigurationError(`Tier agent ${agentID} must allow the ${action} permission`)
     }
   }
-}
-
-function normalizedVariant(actual: string | undefined, configured: string | undefined): string | undefined {
-  return configured === undefined && actual === "default" ? undefined : actual
 }
 
 function effectivePermission(
