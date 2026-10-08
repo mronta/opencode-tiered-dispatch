@@ -93,6 +93,29 @@ The plugin validates the resolved references against the active model catalog. I
 does not substitute another model or variant when a configured reference is
 unavailable.
 
+### Migration note
+
+The packaged defaults changed from `fast: openai/gpt-6-luna#medium`,
+`medium: openai/gpt-5.6-luna#max`, and `heavy: openai/gpt-5.6-sol#medium` to
+the mappings in the table above. On startup, the plugin checks every resolved
+mapping against the active catalog and fails fast when a model, capability, or
+variant is unavailable; it does not silently fall back to another default.
+
+To retain the previous mapping, configure it explicitly in `options.tiers` and
+ensure those exact catalog entries remain enabled and tool-capable:
+
+```jsonc
+{
+  "options": {
+    "tiers": {
+      "fast": { "model": "openai/gpt-6-luna", "variant": "medium" },
+      "medium": { "model": "openai/gpt-5.6-luna", "variant": "max" },
+      "heavy": { "model": "openai/gpt-5.6-sol", "variant": "medium" }
+    }
+  }
+}
+```
+
 ## What a normal request looks like
 
 The plugin supplies model-facing guidance to eligible primary sessions. It is an

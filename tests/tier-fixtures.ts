@@ -24,3 +24,38 @@ export function modelCatalog(): ModelCatalogEntry[] {
     }
   })
 }
+
+export function customTierOptions(fastVariant = "deliberate") {
+  return {
+    fast: { model: "provider/custom-fast", variant: fastVariant },
+    medium: { model: "provider/custom-medium" },
+    heavy: { variant: "careful" },
+  }
+}
+
+export function customModelCatalog(fastVariant = "deliberate"): ModelCatalogEntry[] {
+  const heavyDefault = tierModel("heavy")
+  return [
+    {
+      providerID: "provider",
+      id: "custom-fast",
+      enabled: true,
+      capabilities: { tools: true },
+      variants: [{ id: fastVariant }],
+    },
+    {
+      providerID: "provider",
+      id: "custom-medium",
+      enabled: true,
+      capabilities: { tools: true },
+      variants: [],
+    },
+    {
+      providerID: heavyDefault.providerID,
+      id: heavyDefault.id,
+      enabled: true,
+      capabilities: { tools: true },
+      variants: [{ id: "careful" }],
+    },
+  ]
+}

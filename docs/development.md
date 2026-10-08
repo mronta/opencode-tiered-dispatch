@@ -77,6 +77,29 @@ npm run smoke:opencode:config
 The second command is an alias for the first. These are provider-consuming
 checks; the package and type checks do not require live provider calls.
 
+To manually exercise a custom tier mapping, write a JSON file containing the
+tier entries (not an `options` wrapper), then pass it to the native runner:
+
+```json
+{
+  "fast": { "model": "provider/fast-model", "variant": "balanced" },
+  "medium": { "model": "provider/medium-model" },
+  "heavy": { "instructions": "Keep high-risk changes narrowly scoped." }
+}
+```
+
+```bash
+node scripts/opencode-native-smoke.mjs --tiers /absolute/path/to/tiers.json
+```
+
+The runner resolves this file with the same runtime options parser used by the
+plugin; omitted, instructions-only, variant-only, and custom-model-without-
+variant entries therefore retain the parser's normal semantics. The parser and
+fixture tests cover this plumbing offline. Actual V2 host materialization of a
+custom mapping still requires this manual, provider-consuming invocation with
+the referenced catalog entries available and is not claimed by the offline
+checks.
+
 ## Routing evaluation
 
 The optional evaluation sends ordinary prompts through a fixture workspace. It

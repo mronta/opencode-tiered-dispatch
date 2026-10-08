@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { assertAgentsAvailable, assertModelsAvailable, type AgentCatalogEntry } from "../src/catalog.js"
 import { parseOptions } from "../src/options.js"
-import { modelCatalog, defaultTierOptions, tierModel } from "./tier-fixtures.js"
+import { customModelCatalog, customTierOptions, modelCatalog, defaultTierOptions, tierModel } from "./tier-fixtures.js"
 
 const parsed = parseOptions({
   tiers: defaultTierOptions(),
@@ -114,39 +114,21 @@ describe("catalog validation", () => {
 
   it("accepts custom mappings when the active catalog satisfies them", () => {
     const custom = parseOptions({
-      tiers: {
-        fast: { model: "provider/custom-fast", variant: "deliberate" },
-        medium: { model: "provider/custom-medium" },
-        heavy: { variant: "careful" },
-      },
+      tiers: customTierOptions(),
     })
     if (!custom.enabled) throw new Error("test setup")
-    const heavyDefault = tierModel("heavy")
-    const customModels = [
-      {
-        providerID: "provider",
-        id: "custom-fast",
-        enabled: true,
-        capabilities: { tools: true },
-        variants: [{ id: "deliberate" }],
-      },
-      {
-        providerID: "provider",
-        id: "custom-medium",
-        enabled: true,
-        capabilities: { tools: true },
-        variants: [],
-      },
-      {
-        providerID: heavyDefault.providerID,
-        id: heavyDefault.id,
-        enabled: true,
-        capabilities: { tools: true },
-        variants: [{ id: "careful" }],
-      },
-    ]
 
-    expect(() => assertModelsAvailable(custom, customModels)).not.toThrow()
+    expect(() => assertModelsAvailable(custom, customModelCatalog())).not.toThrow()
+  })
+
+  it("rejects an unavailable variant for an otherwise available custom model", () => {
+    const custom = parseOptions({
+      tiers: customTierOptions("missing"),
+    })
+    if (!custom.enabled) throw new Error("test setup")
+
+    expect(() => assertModelsAvailable(custom, customModelCatalog()))
+      .toThrow(/variant missing is unavailable for provider\/custom-fast/u)
   })
 
   it("rejects unavailable, disabled, and non-tool-capable configured models", () => {

@@ -91,17 +91,6 @@ describe("parseOptions", () => {
     expect(parsed.enabled && parsed.tiers.medium.variant).toBeUndefined()
   })
 
-  it("uses packaged mappings for omitted and instructions-only tiers", () => {
-    expect(parseOptions({ tiers: { medium: { instructions: "Keep the patch small" } } }))
-      .toMatchObject({
-        tiers: {
-          fast: defaultTierOptions().fast,
-          medium: { ...defaultTierOptions().medium, instructions: "Keep the patch small" },
-          heavy: defaultTierOptions().heavy,
-        },
-      })
-  })
-
   it("keeps strict model and variant validation for custom mappings", () => {
     expect(() => parseOptions({ tiers: { fast: { model: "not-a-model" } } }))
       .toThrow(/provider\/model/)

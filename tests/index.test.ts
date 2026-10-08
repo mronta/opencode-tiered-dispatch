@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest"
 import type { AgentCatalogEntry } from "../src/catalog.js"
 import plugin from "../src/index.js"
 import { PLAN_READONLY_INSTRUCTION } from "../src/plan-safety.js"
-import { modelCatalog, defaultTierOptions, tierModel } from "./tier-fixtures.js"
+import { customModelCatalog, customTierOptions, modelCatalog, defaultTierOptions, tierModel } from "./tier-fixtures.js"
 
 const models = modelCatalog()
 
@@ -226,36 +226,10 @@ describe("plugin setup", () => {
 
   it("materializes transformed agents with resolved custom mappings", async () => {
     const customOptions = {
-      tiers: {
-        fast: { model: "provider/custom-fast", variant: "balanced" },
-        medium: { model: "provider/custom-medium" },
-        heavy: { variant: "careful" },
-      },
+      tiers: customTierOptions("balanced"),
     }
     const heavyDefault = tierModel("heavy")
-    const customModels = [
-      {
-        providerID: "provider",
-        id: "custom-fast",
-        enabled: true,
-        capabilities: { tools: true },
-        variants: [{ id: "balanced" }],
-      },
-      {
-        providerID: "provider",
-        id: "custom-medium",
-        enabled: true,
-        capabilities: { tools: true },
-        variants: [],
-      },
-      {
-        providerID: heavyDefault.providerID,
-        id: heavyDefault.id,
-        enabled: true,
-        capabilities: { tools: true },
-        variants: [{ id: "careful" }],
-      },
-    ]
+    const customModels = customModelCatalog("balanced")
     const fixture = makeContext(customOptions, {}, customModels)
 
     await plugin.setup(fixture.context)
