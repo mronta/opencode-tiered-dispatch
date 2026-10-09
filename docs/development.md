@@ -36,6 +36,16 @@ temporary archive and installation when it exits. It is distinct from a
 registry publication. Packed source maps must point to source files available in
 the packed artifact (expected to include the relevant `src/` sources).
 
+## Pull request CI
+
+`.github/workflows/ci.yml` runs the typecheck, tests, build, and package smoke
+gates for every pull request and every push to `main`. It uses
+Node.js `22.19.0`, the checked-in lockfile, and `npm ci`.
+
+Native OpenCode smoke and routing evaluation remain separate provider-consuming
+checks and are not run by CI; they may incur provider costs and require the
+credentials and configuration described below.
+
 ## Native OpenCode smoke
 
 The native smoke uses the normal `opencode.jsonc` plugin entry and does not

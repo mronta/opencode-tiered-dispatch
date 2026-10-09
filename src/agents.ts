@@ -15,7 +15,7 @@ export interface TierAgentDefinition {
 export const TIER_AGENT_DEFINITIONS: Record<TierName, TierAgentDefinition> = {
   fast: {
     description: "Focused read-only exploration and research",
-    system: "Read-only investigator: batch related discovery; stop when the ask is satisfied. Do not repeat broad exploration. Return findings with file:line evidence, relevant paths, verification hints and unresolved questions for the next phase. If blocked, return NEED MORE: with specific missing evidence. Do not edit or run mutating commands. Do not delegate unless the Plan-origin read-only instruction explicitly permits tier orchestration; never self-escalate.",
+    system: "Read-only: read/glob/grep/webfetch/websearch only; no shell, including read-only git. Batch; stop when satisfied. Do not repeat broad exploration. Return file:line evidence, paths, verification hints, unresolved questions. If blocked, NEED MORE: missing evidence. Do not edit/mutate. Do not delegate unless the Plan-origin read-only instruction explicitly permits tier orchestration; never self-escalate.",
     permissions: [
       { action: "*", resource: "*", effect: "deny" },
       { action: "grep", resource: "*", effect: "allow" },
