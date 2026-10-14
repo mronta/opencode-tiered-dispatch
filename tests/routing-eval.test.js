@@ -171,10 +171,36 @@ function trace(id, tools, childSpecs = [], options = {}) {
   }
 }
 
-function knownScopeTrace({ command = "node --test test/banner.test.js", cwd, workdir, status } = {}) {
+function knownScopeTrace({ command = "node --test test/banner.test.js", cwd, workdir, status, ...options } = {}) {
   const delegationEvents = delegation("delegate-medium", "medium", "medium-child", 1, "Changed src/banner.js and test/banner.test.js.", { completionSeq: 3 })
   const shellEvents = shellCall(command, 5, { cwd, workdir, status })
-  return trace("known-scope", [...delegationEvents, ...shellEvents], [{ id: "medium-child", agent: "medium", contextSeq: 2 }])
+  return trace("known-scope", [...delegationEvents, ...shellEvents], [{ id: "medium-child", agent: "medium", contextSeq: 2 }], options)
+}
+
+const PROTO_MANIFEST_BUILDERS = [
+  ["JSON.parse", (fingerprint) => JSON.parse(`{"__proto__":${JSON.stringify(fingerprint)}}`)],
+  ["Object.fromEntries", (fingerprint) => Object.fromEntries([["__proto__", fingerprint]])],
+  ["Object.defineProperty", (fingerprint) => {
+    const manifest = {}
+    Object.defineProperty(manifest, "__proto__", { value: fingerprint, enumerable: true, configurable: true, writable: true })
+    return manifest
+  }],
+]
+
+function protoFingerprint(letter) {
+  return `sha256:${letter.repeat(64)}`
+}
+
+function globalSnapshotEvidence(manifest, overrides = {}) {
+  return {
+    baseline: manifest,
+    execution: manifest,
+    postVerifier: manifest,
+    controlBaseline: manifest,
+    controlPostVerifier: manifest,
+    controlUnchanged: true,
+    ...overrides,
+  }
 }
 
 function implementationTrace(options = {}) {
@@ -635,6 +661,21 @@ describe("spontaneous routing assessment", () => {
     expect(assessRouting(missingSnapshots, ["medium"], MODELS).problems).toContain("fixture validation evidence is missing snapshotEvidence")
   })
 
+  it.each([
+    "../outside.js",
+    "src/../../outside.js",
+    "fixture/../outside.js",
+  ])("fails closed for traversal segment %s in global snapshot evidence", (path) => {
+    const result = knownScopeTrace()
+    result.snapshotEvidence.baseline = {
+      [path]: "sha256:" + "a".repeat(64),
+    }
+
+    const report = assessRouting(result, ["medium"], MODELS)
+
+    expect(report.evidenceProblems).toContain(`snapshotEvidence.baseline contains a path traversal segment: ${path}`)
+  })
+
   it("detects verifier mutations from execution and post-verifier fingerprints", () => {
     const result = knownScopeTrace()
     result.snapshotEvidence.postVerifier = {
@@ -691,8 +732,101 @@ describe("spontaneous routing assessment", () => {
     expect(report.problems.some((problem) => problem.includes("snapshot evidence"))).toBe(true)
   })
 
+  it.each([
+    ["before", "../outside.js"],
+    ["before", "src/../../outside.js"],
+    ["after", "../outside.js"],
+    ["after", "src/../../outside.js"],
+  ])("fails closed for traversal segment %s in per-command snapshot evidence (%s)", (phase, path) => {
+    const result = knownScopeTrace()
+    const evidence = result.verificationSnapshots[0]
+    evidence[phase] = { [path]: "sha256:" + "a".repeat(64) }
+
+    const report = assessRouting(result, ["medium"], MODELS)
+    const diagnostic = `verification snapshot ${evidence.identity} ${phase} contains a path traversal segment: ${path}`
+    const expected = `verification command ${JSON.stringify(evidence.command)} has invalid before/after snapshot evidence: ${diagnostic}`
+
+    expect(report.problems).toContain(expected)
+  })
+
   it("accepts a non-empty valid per-command snapshot baseline", () => {
     expect(assessRouting(knownScopeTrace(), ["medium"], MODELS).problems).toEqual([])
+  })
+
+  it("rejects empty global manifests while accepting a non-empty own __proto__ manifest", () => {
+    const empty = knownScopeTrace()
+    empty.snapshotEvidence = globalSnapshotEvidence({})
+    expect(assessRouting(empty, ["medium"], MODELS).problems).toEqual([
+      "snapshotEvidence.baseline fingerprint manifest is empty",
+      "snapshotEvidence.execution fingerprint manifest is empty",
+      "snapshotEvidence.postVerifier fingerprint manifest is empty",
+      "snapshotEvidence.controlBaseline fingerprint manifest is empty",
+      "snapshotEvidence.controlPostVerifier fingerprint manifest is empty",
+    ])
+
+    for (const [_label, buildManifest] of PROTO_MANIFEST_BUILDERS) {
+      const result = knownScopeTrace()
+      result.snapshotEvidence = globalSnapshotEvidence(buildManifest(protoFingerprint("a")))
+      expect(assessRouting(result, ["medium"], MODELS).problems, _label).toEqual([])
+    }
+  })
+
+  it.each(PROTO_MANIFEST_BUILDERS)("detects an own __proto__ execution/post-verifier hash change via %s", (_label, buildManifest) => {
+    const result = knownScopeTrace()
+    result.snapshotEvidence = globalSnapshotEvidence(buildManifest(protoFingerprint("a")), {
+      postVerifier: buildManifest(protoFingerprint("b")),
+    })
+
+    const report = assessRouting(result, ["medium"], MODELS)
+
+    expect(report.problems).toContain("snapshot evidence reports fixture verifier changes: __proto__")
+    expect(report.problems).toContain("fixture verification clean flag disagrees with recorded problems")
+  })
+
+  it.each(PROTO_MANIFEST_BUILDERS)("detects an own __proto__ control hash change via %s", (_label, buildManifest) => {
+    const result = knownScopeTrace()
+    result.snapshotEvidence = globalSnapshotEvidence(buildManifest(protoFingerprint("a")), {
+      controlPostVerifier: buildManifest(protoFingerprint("b")),
+      controlUnchanged: false,
+    })
+
+    const report = assessRouting(result, ["medium"], MODELS)
+
+    expect(report.problems).toContain("snapshot evidence reports changed control files: __proto__")
+    expect(report.problems).toContain("fixture verification controlUnchanged disagrees with snapshot evidence")
+    expect(report.problems).toContain("fixture verification clean flag disagrees with recorded problems")
+  })
+
+  it.each(PROTO_MANIFEST_BUILDERS)("accepts identical and detects changed own __proto__ command snapshots via %s", (_label, buildManifest) => {
+    const result = knownScopeTrace()
+    const evidence = result.verificationSnapshots[0]
+    evidence.before = buildManifest(protoFingerprint("a"))
+    evidence.after = buildManifest(protoFingerprint("a"))
+    evidence.changedFiles = []
+    expect(assessRouting(result, ["medium"], MODELS).problems).toEqual([])
+
+    evidence.after = buildManifest(protoFingerprint("b"))
+    evidence.changedFiles = ["__proto__"]
+    const report = assessRouting(result, ["medium"], MODELS)
+
+    expect(report.problems).toContain('verification command "node --test test/banner.test.js" changed fixture files: __proto__')
+  })
+
+  it("allows dots in a fingerprint name when they are not traversal segments", () => {
+    const result = knownScopeTrace()
+    const fingerprint = { "fixture/name..js": "sha256:" + "a".repeat(64) }
+    result.snapshotEvidence = {
+      baseline: fingerprint,
+      execution: fingerprint,
+      postVerifier: fingerprint,
+      controlBaseline: fingerprint,
+      controlPostVerifier: fingerprint,
+      controlUnchanged: true,
+    }
+    result.verificationSnapshots[0].before = fingerprint
+    result.verificationSnapshots[0].after = fingerprint
+
+    expect(assessRouting(result, ["medium"], MODELS).problems).toEqual([])
   })
 })
 
@@ -797,6 +931,34 @@ describe("routing result and observer seams", () => {
     expect(parseNativeOptions(["--routing-eval", "--scenario", "discover-implement"])).toMatchObject({ scenario: "discover-implement" })
     expect(selectScenarios("discover-implement").map((scenario) => scenario.id)).toEqual(["discover-implement"])
     expect(() => parseNativeOptions(["--routing-eval", "--scenario", "missing"])).toThrow(/existing routing scenario/u)
+  })
+
+  it("captures and compares a physical root-level __proto__ file", () => {
+    const workspace = mkdtempSync(join(tmpdir(), "routing-proto-file-"))
+    try {
+      seedRoutingFixture(workspace)
+      const filename = join(workspace, "__proto__")
+      writeFileSync(filename, "first version\n")
+
+      const before = snapshotRoutingWorkspace(workspace)
+      const beforeFingerprint = fingerprintRoutingWorkspace(workspace)
+      expect(Object.hasOwn(before, "__proto__")).toBe(true)
+      expect(before["__proto__"]).toMatchObject({ type: "file", hash: expect.stringMatching(/^[a-f0-9]{64}$/u) })
+      expect(Object.hasOwn(beforeFingerprint, "__proto__")).toBe(true)
+      expect(beforeFingerprint["__proto__"]).toMatch(/^sha256:[a-f0-9]{64}$/u)
+
+      const serialized = JSON.parse(JSON.stringify(before))
+      expect(Object.hasOwn(serialized, "__proto__")).toBe(true)
+      expect(serialized["__proto__"]).toEqual(before["__proto__"])
+
+      writeFileSync(filename, "second version\n")
+      const after = snapshotRoutingWorkspace(workspace)
+      const afterFingerprint = fingerprintRoutingWorkspace(workspace)
+      expect(diffRoutingSnapshots(before, after)).toEqual(["__proto__"])
+      expect(afterFingerprint["__proto__"]).not.toBe(beforeFingerprint["__proto__"])
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
   })
 
   it("restores the complete fixture while preserving immutable infrastructure", () => {

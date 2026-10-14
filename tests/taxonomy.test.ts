@@ -13,4 +13,11 @@ describe("mergeTaxonomy", () => {
     expect(result.fast.at(-1)).toBe("API lookup")
     expect(result.fast.filter((value) => value.toLowerCase() === "api lookup")).toHaveLength(1)
   })
+
+  it("keeps repository shell inspection out of fast discovery", () => {
+    const result = mergeTaxonomy({})
+    expect(result.fast).toContain("file/search repository mapping")
+    expect(result.fast).not.toContain("fact collection and repository mapping")
+    expect(result.fast.some((entry) => entry.toLowerCase().includes("shell"))).toBe(false)
+  })
 })

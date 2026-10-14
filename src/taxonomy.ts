@@ -2,22 +2,22 @@ import type { TierName } from "./tiers.js"
 
 export const DEFAULT_TAXONOMY: Record<TierName, readonly string[]> = {
   fast: [
-    "search and grep",
-    "file discovery and focused reads",
-    "documentation lookup and web research",
-    "fact collection and repository mapping",
+    "search/grep",
+    "file reads",
+    "docs/research",
+    "file/search repository mapping",
   ],
   medium: [
-    "implementation and refactoring",
-    "tests and ordinary bug fixes",
-    "code review and configuration changes",
-    "build fixes",
+    "implementation",
+    "tests/bug fixes",
+    "review/config",
+    "build",
   ],
   heavy: [
-    "architecture and cross-system trade-offs",
-    "security analysis",
-    "difficult root-cause analysis after repeated failures",
-    "performance strategy and high-risk reasoning",
+    "architecture/trade-offs",
+    "security",
+    "difficult RCA/repeated failures",
+    "performance/high-risk",
   ],
 }
 
