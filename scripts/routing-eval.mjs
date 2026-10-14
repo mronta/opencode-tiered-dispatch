@@ -222,7 +222,7 @@ function isTaskProblem(message) {
 }
 
 function isEvidenceProblem(message) {
-  return /(?:inspection(?:Error| failed)?|fixture validation evidence|fixture verification evidence|fixture verifier (?:changed|control)|immutable infrastructure changed|snapshot evidence|execution context|session (?:evidence|info|metadata)|child session|root session|tool (?:event|completion)|native delegation .*?(?:structured|unobserved|correlated|returned|session)|orphan|synchronous sequence|duplicate observed sequence|routing protocol was not observed|protocol was not observed|result set)/iu.test(message)
+  return /(?:inspection(?:Error| failed)?|fixture validation evidence|fixture verification evidence|fixture verifier (?:changed|control)|immutable infrastructure changed|snapshot evidence|snapshotEvidence|execution context|session (?:evidence|info|metadata)|child session|root session|tool (?:event|completion)|native delegation .*?(?:structured|unobserved|correlated|returned|session)|orphan|synchronous sequence|duplicate observed sequence|routing protocol was not observed|protocol was not observed|result set)/iu.test(message)
 }
 
 /**
@@ -315,7 +315,11 @@ function normalizeFingerprintManifest(value, label, problems) {
   const entries = Object.entries(value)
   if (entries.length === 0) problems.push(`${label} fingerprint manifest is empty`)
   for (const [path, entry] of entries) {
-    if (path.startsWith("/") || path.includes("\\")) problems.push(`${label} contains a non-relative path: ${path}`)
+    if (path.startsWith("/") || path.includes("\\")) {
+      problems.push(`${label} contains a non-relative path: ${path}`)
+    } else if (path.split("/").includes("..")) {
+      problems.push(`${label} contains a path traversal segment: ${path}`)
+    }
     const fingerprint = normalizeFingerprintEntry(entry)
     if (fingerprint === undefined) {
       problems.push(`${label} contains an invalid fingerprint for ${path}`)

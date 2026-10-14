@@ -635,6 +635,21 @@ describe("spontaneous routing assessment", () => {
     expect(assessRouting(missingSnapshots, ["medium"], MODELS).problems).toContain("fixture validation evidence is missing snapshotEvidence")
   })
 
+  it.each([
+    "../outside.js",
+    "src/../../outside.js",
+    "fixture/../outside.js",
+  ])("fails closed for traversal segment %s in global snapshot evidence", (path) => {
+    const result = knownScopeTrace()
+    result.snapshotEvidence.baseline = {
+      [path]: "sha256:" + "a".repeat(64),
+    }
+
+    const report = assessRouting(result, ["medium"], MODELS)
+
+    expect(report.evidenceProblems).toContain(`snapshotEvidence.baseline contains a path traversal segment: ${path}`)
+  })
+
   it("detects verifier mutations from execution and post-verifier fingerprints", () => {
     const result = knownScopeTrace()
     result.snapshotEvidence.postVerifier = {
@@ -691,8 +706,42 @@ describe("spontaneous routing assessment", () => {
     expect(report.problems.some((problem) => problem.includes("snapshot evidence"))).toBe(true)
   })
 
+  it.each([
+    ["before", "../outside.js"],
+    ["before", "src/../../outside.js"],
+    ["after", "../outside.js"],
+    ["after", "src/../../outside.js"],
+  ])("fails closed for traversal segment %s in per-command snapshot evidence (%s)", (phase, path) => {
+    const result = knownScopeTrace()
+    const evidence = result.verificationSnapshots[0]
+    evidence[phase] = { [path]: "sha256:" + "a".repeat(64) }
+
+    const report = assessRouting(result, ["medium"], MODELS)
+    const diagnostic = `verification snapshot ${evidence.identity} ${phase} contains a path traversal segment: ${path}`
+    const expected = `verification command ${JSON.stringify(evidence.command)} has invalid before/after snapshot evidence: ${diagnostic}`
+
+    expect(report.problems).toContain(expected)
+  })
+
   it("accepts a non-empty valid per-command snapshot baseline", () => {
     expect(assessRouting(knownScopeTrace(), ["medium"], MODELS).problems).toEqual([])
+  })
+
+  it("allows dots in a fingerprint name when they are not traversal segments", () => {
+    const result = knownScopeTrace()
+    const fingerprint = { "fixture/name..js": "sha256:" + "a".repeat(64) }
+    result.snapshotEvidence = {
+      baseline: fingerprint,
+      execution: fingerprint,
+      postVerifier: fingerprint,
+      controlBaseline: fingerprint,
+      controlPostVerifier: fingerprint,
+      controlUnchanged: true,
+    }
+    result.verificationSnapshots[0].before = fingerprint
+    result.verificationSnapshots[0].after = fingerprint
+
+    expect(assessRouting(result, ["medium"], MODELS).problems).toEqual([])
   })
 })
 
