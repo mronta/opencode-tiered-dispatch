@@ -40,7 +40,7 @@ export function seedRoutingFixture(workspace) {
  */
 export function snapshotRoutingWorkspace(workspace) {
   const root = resolve(workspace)
-  const files = {}
+  const files = Object.create(null)
 
   function visit(directory) {
     for (const entry of readdirSync(directory, { withFileTypes: true })) {

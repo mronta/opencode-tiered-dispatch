@@ -311,7 +311,7 @@ function normalizeFingerprintManifest(value, label, problems) {
     problems.push(`${label} is missing a fingerprint manifest`)
     return undefined
   }
-  const normalized = {}
+  const normalized = Object.create(null)
   const entries = Object.entries(value)
   if (entries.length === 0) problems.push(`${label} fingerprint manifest is empty`)
   for (const [path, entry] of entries) {
